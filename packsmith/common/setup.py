@@ -28,16 +28,13 @@ class ProjectPaths:
 
     # These are all built dynamically off of config, later.
     mc_root : Path = None
-    mc_probejs : Path = None
+    mc_packsmith_dumps : Path = None
     mc_kubejs_client : Path = None
     mc_kubejs_server : Path = None
     mc_kubejs_startup : Path = None
     mc_config : Path = None
     mc_paxi_data : Path = None
     mc_paxi_resources : Path = None
-
-    glue_mod_data: Path = None
-    glue_mod_assets: Path = None
 
     @staticmethod
     def build():
@@ -60,18 +57,18 @@ class ProjectPaths:
             logs = logs,
             data = data
         )
-PATHS = ProjectPaths.build()
+GLOBAL_PATHS = ProjectPaths.build()
 
 # Build config
-with open(PATHS.config / "main.toml","rb") as f:
+with open(GLOBAL_PATHS.config / "main.toml","rb") as f:
     CONFIG = tomllib.load(f)
 
-# Load all config-dependent paths to the PATHS object.
-# PATHS.mc_root = Path(CONFIG["paths"]["minecraft_instance"])
-# PATHS.mc_probejs = PATHS.mc_root / ".vscode"
-# PATHS.mc_kubejs_client = PATHS.mc_root / "kubejs/client_scripts"
-# PATHS.mc_kubejs_server = PATHS.mc_root / "kubejs/server_scripts"
-# PATHS.mc_kubejs_startup = PATHS.mc_root / "kubejs/startup_scripts"
-# PATHS.mc_config = PATHS.mc_root / "config"
-# PATHS.mc_paxi_data = PATHS.mc_config / "paxi/datapacks"
-# PATHS.mc_paxi_resources = PATHS.mc_config / "paxi/resourcepacks"
+# Load all config-dependent paths to the GLOBAL_PATHS object.
+GLOBAL_PATHS.mc_root = Path(CONFIG["paths"]["minecraft_instance"])
+GLOBAL_PATHS.mc_packsmith_dumps = GLOBAL_PATHS.mc_root / "packsmith" / "dumps"
+#GLOBAL_PATHS.mc_kubejs_client = GLOBAL_PATHS.mc_root / "kubejs/client_scripts"
+#GLOBAL_PATHS.mc_kubejs_server = GLOBAL_PATHS.mc_root / "kubejs/server_scripts"
+#GLOBAL_PATHS.mc_kubejs_startup = GLOBAL_PATHS.mc_root / "kubejs/startup_scripts"
+GLOBAL_PATHS.mc_config = GLOBAL_PATHS.mc_root / "config"
+GLOBAL_PATHS.mc_paxi_data = GLOBAL_PATHS.mc_config / "paxi/datapacks"
+GLOBAL_PATHS.mc_paxi_resources = GLOBAL_PATHS.mc_config / "paxi/resourcepacks"

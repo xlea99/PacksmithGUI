@@ -1,7 +1,7 @@
 import logging
 from pathlib import Path
 from logging.handlers import RotatingFileHandler
-from packsmith.common.setup import PATHS
+from packsmith.common.setup import GLOBAL_PATHS
 from datetime import datetime
 
 # Set up the special "test" log level for specific testing.
@@ -17,7 +17,7 @@ LOG_FORMAT = "%(asctime)s %(levelname)s [%(name)s:%(filename)s:%(lineno)d] %(mes
 LOG_DATE_FORMAT = "%Y-%m-%d %H:%M:%S"
 
 def get_logger(
-        name = "deepend",
+        name = "packsmith",
         level = logging.INFO,
         log_dir: Path | None = None,
         max_bytes = 5 * 1024 * 1024,
@@ -30,7 +30,7 @@ def get_logger(
     logger.setLevel(level)
     logger.propagate = False
 
-    log_dir = log_dir or PATHS.logs
+    log_dir = log_dir or GLOBAL_PATHS.logs
     log_dir.mkdir(parents=True,exist_ok=True)
     log_file_path = log_dir / f"{name}.log"
 
