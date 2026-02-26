@@ -1,7 +1,7 @@
 import json
 from pathlib import Path
 from datetime import datetime, timezone
-from types import MappingProxyType
+#from types import MappingProxyType
 from packsmith.common.setup import GLOBAL_PATHS
 from packsmith.common.logging import log
 from packsmith.util.misc import raise_log
@@ -34,6 +34,48 @@ class Packdump:
 
         # Toggled locale
         self._active_locale = None
+
+    # For true equality, we compare many aspects of the dump to each other.
+    def __eq__(self, other):
+        if type(other) is not type(self):
+            return NotImplemented
+
+        if self._mc_version != other._mc_version:
+            return False
+        if self._loader != other._loader:
+            return False
+        if self._loader_version != other._loader_version:
+            return False
+
+        # Check each mod specifically
+        if len(self.mods) != len(other.mods):
+            return False
+        for mod in self.mods.values():
+            other_mod = other.mods.get(mod['mod_id'],None)
+            if not other_mod:
+                return False
+            if mod['name'] != other_mod['name']:
+                return False
+            if mod['version'] != other_mod['version']:
+                return False
+
+        # Check for each registry key, and that each key has equivalent number of items
+        if set(self._registries.keys()) != set(other._registries.keys()):
+            return False
+        for reg_type in self._registries:
+            if self._registries[reg_type]["count"] != other._registries[reg_type]["count"]:
+                return False
+
+        return True
+    # For comparing GT/LT for packdumps, we simply use its timestamp and assume they're already different
+    def __gt__(self, other):
+        return self._timestamp > other._timestamp
+    def __ge__(self, other):
+        return self._timestamp >= other._timestamp
+    def __lt__(self, other):
+        return self._timestamp < other._timestamp
+    def __le__(self, other):
+        return self._timestamp <= other._timestamp
 
     # Given a full packsmith snapshot, this loads the full registry dump.
     @classmethod
@@ -167,12 +209,19 @@ class Packdump:
         return self._loader_version
 
     # Read only views of the dicts cause we aint about dirty editing
+    #@property
+    #def mods(self) -> MappingProxyType:
+    #    return MappingProxyType(self._mods)
+    #@property
+    #def registry(self) -> MappingProxyType:
+    #    return MappingProxyType(self._registries)
+    # (temp disabling it for ease of debug)
     @property
-    def mods(self) -> MappingProxyType:
-        return MappingProxyType(self._mods)
+    def mods(self) -> dict:
+        return self._mods
     @property
-    def registry(self) -> MappingProxyType:
-        return MappingProxyType(self._registries)
+    def registry(self) -> dict:
+        return self._registries
 
     # Convenience localizations getter
     @property
@@ -192,6 +241,7 @@ class Packdump:
 
 
 r = Packdump.load(GLOBAL_PATHS.mc_root / "packsmith")
+r2 = Packdump.load(GLOBAL_PATHS.mc_root / "packsmith")
 
 
 

@@ -21,10 +21,12 @@ class ProjectPaths:
 
     root: Path
 
+    # User data stuff
+    userdata: Path
     config: Path
+    packdumps: Path
     logs: Path
 
-    data: Path
 
     # These are all built dynamically off of config, later.
     mc_root : Path = None
@@ -46,16 +48,17 @@ class ProjectPaths:
         else:
             root = Path(__file__).resolve().parents[2]
 
-        config = ensure_directory(root / "config", must_exist=True)
-        logs = ensure_directory(root / "logs")
-
-        data = ensure_directory(root / "data", must_exist=True)
+        userdata = ensure_directory(root / "userdata")
+        config = ensure_directory(userdata / "config", must_exist=True)
+        packdumps = ensure_directory(userdata / "packdumps")
+        logs = ensure_directory(userdata / "logs")
 
         return ProjectPaths(
             root = root,
+            userdata = userdata,
             config = config,
-            logs = logs,
-            data = data
+            packdumps = packdumps,
+            logs = logs
         )
 GLOBAL_PATHS = ProjectPaths.build()
 
