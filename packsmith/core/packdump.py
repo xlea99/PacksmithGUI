@@ -1,8 +1,9 @@
 import json
+import shutil
 from pathlib import Path
 from datetime import datetime, timezone
 #from types import MappingProxyType
-from packsmith.common.setup import GLOBAL_PATHS
+from packsmith.common.setup import GLOBAL_PATHS, CONFIG
 from packsmith.common.logging import log
 from packsmith.util.misc import raise_log
 
@@ -34,6 +35,8 @@ class Packdump:
 
         # Toggled locale
         self._active_locale = None
+
+    #region === Comparison ===
 
     # For true equality, we compare many aspects of the dump to each other.
     def __eq__(self, other):
@@ -76,6 +79,121 @@ class Packdump:
         return self._timestamp < other._timestamp
     def __le__(self, other):
         return self._timestamp <= other._timestamp
+
+    # This method generates a dict of inconsistencies between two packdumps.
+    def compare(self,other):
+        diffs = {}
+
+        # Simple scalarish values we just return both
+        if self._mc_version != other._mc_version:
+            diffs["mc_version"] = (self._mc_version,other._mc_version)
+        if self._loader != other._loader:
+            diffs["loader"] = (self._loader,other._loader)
+        if self._loader_version != other._loader_version:
+            diffs["loader_version"] = (self._loader_version,other._loader_version)
+
+        # Diff mods
+        self_mod_ids = set(self.mods.keys())
+        other_mod_ids = set(other.mods.keys())
+        mods_only_in_self = self_mod_ids - other_mod_ids
+        mods_only_in_other = other_mod_ids - self_mod_ids
+        mods_common = self_mod_ids & other_mod_ids
+        mods_changed = {}
+        for common_mod in mods_common:
+            this_diff = {}
+            if self.mods[common_mod]["version"] != other.mods[common_mod]["version"]:
+                this_diff["version"] = (self.mods[common_mod]["version"], other.mods[common_mod]["version"])
+            if self.mods[common_mod]["name"] != other.mods[common_mod]["name"]:
+                this_diff["name"] = (self.mods[common_mod]["name"], other.mods[common_mod]["name"])
+            if this_diff:
+                mods_changed[common_mod] = this_diff
+        if mods_only_in_self:
+            (diffs.setdefault("mods", {}))["only_in_self"] = list(mods_only_in_self)
+        if mods_only_in_other:
+            (diffs.setdefault("mods", {}))["only_in_other"] = list(mods_only_in_other)
+        if mods_changed:
+            (diffs.setdefault("mods", {}))["changed"] = mods_changed
+
+        # Diff registries
+        registry_diffs = {}
+        self_registry_types = set(self.registry.keys())
+        other_registry_types = set(other.registry.keys())
+        registry_types_only_in_self = self_registry_types - other_registry_types
+        registry_types_only_in_other = other_registry_types - self_registry_types
+        if registry_types_only_in_self:
+            registry_diffs["only_in_self"] = list(registry_types_only_in_self)
+        if registry_types_only_in_other:
+            registry_diffs["only_in_other"] = list(registry_types_only_in_other)
+        registry_types_common = self_registry_types & other_registry_types
+        reg_changes = {}
+        for common_reg_type in registry_types_common:
+            this_reg_type_change = {}
+            self_this_reg_type_entries = set(self.registry[common_reg_type]["values"])
+            other_this_reg_type_entries = set(other.registry[common_reg_type]["values"])
+            this_reg_type_only_in_self = self_this_reg_type_entries - other_this_reg_type_entries
+            this_reg_type_only_in_other = other_this_reg_type_entries - self_this_reg_type_entries
+            if this_reg_type_only_in_self:
+                this_reg_type_change["only_in_self"] = list(this_reg_type_only_in_self)
+            if this_reg_type_only_in_other:
+                this_reg_type_change["only_in_other"] = list(this_reg_type_only_in_other)
+            if this_reg_type_change:
+                reg_changes[common_reg_type] = this_reg_type_change
+        if reg_changes:
+            registry_diffs["changed"] = reg_changes
+        if registry_diffs:
+            diffs["registries"] = registry_diffs
+
+        # Diff localizations. Per locale, per registry type, per entry
+        loc_diffs = {}
+        self_locales = set(self._localizations.keys())
+        other_locales = set(other._localizations.keys())
+        if self_locales - other_locales:
+            loc_diffs["only_in_self"] = list(self_locales - other_locales)
+        if other_locales - self_locales:
+            loc_diffs["only_in_other"] = list(other_locales - self_locales)
+        loc_changes = {}
+        for locale in self_locales & other_locales:
+            locale_diff = {}
+            self_reg_types = set(self._localizations[locale].keys())
+            other_reg_types = set(other._localizations[locale].keys())
+            if self_reg_types - other_reg_types:
+                locale_diff["only_in_self"] = list(self_reg_types - other_reg_types)
+            if other_reg_types - self_reg_types:
+                locale_diff["only_in_other"] = list(other_reg_types - self_reg_types)
+            reg_type_changes = {}
+            for reg_type in self_reg_types & other_reg_types:
+                entry_diff = {}
+                self_entries = self._localizations[locale][reg_type]
+                other_entries = other._localizations[locale][reg_type]
+                self_ids = set(self_entries.keys())
+                other_ids = set(other_entries.keys())
+                if self_ids - other_ids:
+                    entry_diff["only_in_self"] = list(self_ids - other_ids)
+                if other_ids - self_ids:
+                    entry_diff["only_in_other"] = list(other_ids - self_ids)
+                changed_names = {eid: (self_entries[eid], other_entries[eid])
+                                 for eid in self_ids & other_ids
+                                 if self_entries[eid] != other_entries[eid]}
+                if changed_names:
+                    entry_diff["changed"] = changed_names
+                if entry_diff:
+                    reg_type_changes[reg_type] = entry_diff
+            if reg_type_changes:
+                locale_diff["changed"] = reg_type_changes
+            if locale_diff:
+                loc_changes[locale] = locale_diff
+        if loc_changes:
+            loc_diffs["changed"] = loc_changes
+        if loc_diffs:
+            diffs["localizations"] = loc_diffs
+
+        return diffs
+
+
+
+    #endregion === Comparison ===
+
+    #region === Serializing ===
 
     # Given a full packsmith snapshot, this loads the full registry dump.
     @classmethod
@@ -141,6 +259,8 @@ class Packdump:
         if self._active_locale is None:
             self._active_locale = locale
 
+    #endregion === Serializing ===
+
     # Saves a snapshot of this Packdump as is to the given path.
     def save(self, snapshot_path: Path):
         reg_dir = snapshot_path / "registries"
@@ -191,6 +311,8 @@ class Packdump:
 
         log.info(f"Packdump saved to {snapshot_path}")
 
+    #region === Getters and Setters ===
+
     # Immutable getters
     @property
     def schema(self) -> int:
@@ -238,10 +360,48 @@ class Packdump:
             raise_log(KeyError,f"Tried to set the active locale to '{locale_str}', but this locale is not present in the localizations dictionary!")
         self._active_locale = locale_str
 
+    #endregion === Getters and Setters ===
 
 
-r = Packdump.load(GLOBAL_PATHS.mc_root / "packsmith")
-r2 = Packdump.load(GLOBAL_PATHS.mc_root / "packsmith")
+# This helper method imports a packdump from the minecraft instance (or a given path) as the local, current
+# packdump snapshot, rotating out previous dumps as specified by the user's `packdump_snapshot_count` in main.toml.
+# This is all skipped if the incoming dump is identical to the current dump
+def import_packdump(source_path: Path = None):
+    source_path = source_path or (GLOBAL_PATHS.mc_root / "packsmith")
+    incoming = Packdump.load(source_path)
 
+    latest_dir = GLOBAL_PATHS.packdumps / "latest"
+    history_dir = GLOBAL_PATHS.packdumps / "history"
+    history_dir.mkdir(parents=True, exist_ok=True)
 
+    # If we already have a latest, check if it's the same dump
+    if (latest_dir / "meta.json").exists():
+        current = Packdump.load(latest_dir)
+        if current == incoming:
+            log.info("Incoming packdump is identical to latest, skipping import")
+            return current
 
+        # This means its a new dump! Archive the current latest before replacing
+        archive_name = current.timestamp.strftime("%Y-%m-%d_%H-%M-%S")
+        archive_path = history_dir / archive_name
+        if archive_path.exists():
+            shutil.rmtree(archive_path)
+        shutil.move(str(latest_dir), str(archive_path))
+        log.info(f"Archived previous packdump to {archive_path}")
+
+        # Prune oldest snapshots
+        max_snapshots = CONFIG.get("general", {}).get("packdump_snapshot_count", 10)
+        snapshots = sorted(history_dir.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True)
+        for old in snapshots[max_snapshots:]:
+            shutil.rmtree(old)
+            log.info(f"Pruned old packdump snapshot: {old.name}")
+
+    # Save the incoming dump as latest
+    latest_dir.mkdir(parents=True, exist_ok=True)
+    incoming.save(latest_dir)
+    log.info(f"Imported new packdump as latest")
+    return incoming
+
+r = import_packdump()
+old = Packdump.load(Path("C:\\Users\\timbe\\IdeaProjects\\PacksmithGUI\\userdata\\packdumps\\history\\2026-02-25_22-11-33"))
+diffs = r.compare(old)
