@@ -14,7 +14,7 @@ def _write_json(path: Path, data: dict):
     with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
 
-# This file handles reading/accessing values from a packdump. Immutable by design (and by gentleman's agreement)...
+# This class handles reading/accessing values from a packdump. Immutable by design (and by gentleman's agreement)
 # if you're trying to edit a packdump you're doing something deeply wrong.
 class Packdump:
 
@@ -189,8 +189,6 @@ class Packdump:
 
         return diffs
 
-
-
     #endregion === Comparison ===
 
     #region === Serializing ===
@@ -259,8 +257,6 @@ class Packdump:
         if self._active_locale is None:
             self._active_locale = locale
 
-    #endregion === Serializing ===
-
     # Saves a snapshot of this Packdump as is to the given path.
     def save(self, snapshot_path: Path):
         reg_dir = snapshot_path / "registries"
@@ -310,6 +306,8 @@ class Packdump:
             _write_json(attr_dir / "localization.json", loc_file)
 
         log.info(f"Packdump saved to {snapshot_path}")
+
+    #endregion === Serializing ===
 
     #region === Getters and Setters ===
 
@@ -362,6 +360,17 @@ class Packdump:
 
     #endregion === Getters and Setters ===
 
+    #region === Helpers ===
+
+    # Simply returns either the localization of the given registry type and registry id. If no localization exists,
+    # simply returns the raw entry_id
+    def display_name(self, registry_type: str, entry_id: str) -> str:
+        if registry_type in self.localization:
+            return self.localization[registry_type].get(entry_id,entry_id)
+        else:
+            return entry_id
+
+    #endregion === Helpers
 
 # This helper method imports a packdump from the minecraft instance (or a given path) as the local, current
 # packdump snapshot, rotating out previous dumps as specified by the user's `packdump_snapshot_count` in main.toml.
@@ -401,6 +410,34 @@ def import_packdump(source_path: Path = None):
     incoming.save(latest_dir)
     log.info(f"Imported new packdump as latest")
     return incoming
+
+# Simply returns a list of snapshot summaries from history, sorted newest first. Each summary contains
+# a timestamp, mc_version, loader, loader_version, mod_count, and path.
+def list_snapshots() -> list[dict]:
+    history_dir = GLOBAL_PATHS.packdumps / "history"
+    if not history_dir.is_dir():
+        return []
+
+    summaries = []
+    for folder in history_dir.iterdir():
+        meta_path = folder / "meta.json"
+        if not meta_path.exists():
+            continue
+        try:
+            with open(meta_path, "r") as f:
+                meta = json.load(f)
+            summaries.append({
+                "path": folder,
+                "timestamp": meta.get("generated_at_utc", ""),
+                "mc_version": meta.get("minecraft_version", ""),
+                "loader": meta.get("loader", ""),
+                "loader_version": meta.get("loader_version", ""),
+                "mod_count": meta.get("mod_count", 0),
+            })
+        except (json.JSONDecodeError, OSError):
+            log.warning(f"Skipping corrupt snapshot: {folder.name}")
+    summaries.sort(key=lambda s: s["timestamp"], reverse=True)
+    return summaries
 
 r = import_packdump()
 old = Packdump.load(Path("C:\\Users\\timbe\\IdeaProjects\\PacksmithGUI\\userdata\\packdumps\\history\\2026-02-25_22-11-33"))
