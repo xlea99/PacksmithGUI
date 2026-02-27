@@ -24,19 +24,9 @@ class ProjectPaths:
     # User data stuff
     userdata: Path
     config: Path
-    packdumps: Path
     logs: Path
+    profiles: Path
 
-
-    # These are all built dynamically off of config, later.
-    mc_root : Path = None
-    mc_packsmith_dumps : Path = None
-    mc_kubejs_client : Path = None
-    mc_kubejs_server : Path = None
-    mc_kubejs_startup : Path = None
-    mc_config : Path = None
-    mc_paxi_data : Path = None
-    mc_paxi_resources : Path = None
 
     @staticmethod
     def build():
@@ -50,28 +40,17 @@ class ProjectPaths:
 
         userdata = ensure_directory(root / "userdata")
         config = ensure_directory(userdata / "config", must_exist=True)
-        packdumps = ensure_directory(userdata / "packdumps")
         logs = ensure_directory(userdata / "logs")
+        profiles = ensure_directory(userdata / "profiles")
 
         return ProjectPaths(
             root = root,
             userdata = userdata,
             config = config,
-            packdumps = packdumps,
-            logs = logs
+            logs = logs,
+            profiles = profiles
         )
 GLOBAL_PATHS = ProjectPaths.build()
-
 # Build config
 with open(GLOBAL_PATHS.config / "main.toml","rb") as f:
     CONFIG = tomllib.load(f)
-
-# Load all config-dependent paths to the GLOBAL_PATHS object.
-GLOBAL_PATHS.mc_root = Path(CONFIG["paths"]["minecraft_instance"])
-GLOBAL_PATHS.mc_packsmith_dumps = GLOBAL_PATHS.mc_root / "packsmith" / "dumps"
-#GLOBAL_PATHS.mc_kubejs_client = GLOBAL_PATHS.mc_root / "kubejs/client_scripts"
-#GLOBAL_PATHS.mc_kubejs_server = GLOBAL_PATHS.mc_root / "kubejs/server_scripts"
-#GLOBAL_PATHS.mc_kubejs_startup = GLOBAL_PATHS.mc_root / "kubejs/startup_scripts"
-GLOBAL_PATHS.mc_config = GLOBAL_PATHS.mc_root / "config"
-GLOBAL_PATHS.mc_paxi_data = GLOBAL_PATHS.mc_config / "paxi/datapacks"
-GLOBAL_PATHS.mc_paxi_resources = GLOBAL_PATHS.mc_config / "paxi/resourcepacks"

@@ -3,16 +3,11 @@ import shutil
 from pathlib import Path
 from datetime import datetime, timezone
 #from types import MappingProxyType
-from packsmith.common.setup import GLOBAL_PATHS, CONFIG
 from packsmith.common.logging import log
-from packsmith.util.misc import raise_log
+from packsmith.util.misc import raise_log, write_json
+from packsmith.core.profile import Profile
 
 _VALID_SCHEMAS = {1}
-
-# lil json writing helper
-def _write_json(path: Path, data: dict):
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
 
 # This class handles reading/accessing values from a packdump. Immutable by design (and by gentleman's agreement)
 # if you're trying to edit a packdump you're doing something deeply wrong.
@@ -273,7 +268,7 @@ class Packdump:
                 "type": reg_type,
                 "values": reg_data["values"],
             }
-            _write_json(reg_dir / filename, reg_file)
+            write_json(reg_dir / filename, reg_file)
             registries_manifest.append({
                 "type": reg_type,
                 "file": filename,
@@ -293,7 +288,7 @@ class Packdump:
             "mods": sorted(self._mods.values(), key=lambda m: m["mod_id"]),
             "registries": registries_manifest,
         }
-        _write_json(snapshot_path / "meta.json", meta)
+        write_json(snapshot_path / "meta.json", meta)
 
         # Write attribute files
         for locale, values in self._localizations.items():
@@ -303,7 +298,7 @@ class Packdump:
                 "locale": locale,
                 "values": values,
             }
-            _write_json(attr_dir / "localization.json", loc_file)
+            write_json(attr_dir / "localization.json", loc_file)
 
         log.info(f"Packdump saved to {snapshot_path}")
 
@@ -375,12 +370,12 @@ class Packdump:
 # This helper method imports a packdump from the minecraft instance (or a given path) as the local, current
 # packdump snapshot, rotating out previous dumps as specified by the user's `packdump_snapshot_count` in main.toml.
 # This is all skipped if the incoming dump is identical to the current dump
-def import_packdump(source_path: Path = None):
-    source_path = source_path or (GLOBAL_PATHS.mc_root / "packsmith")
+def import_packdump(profile: Profile, source_path: Path = None):
+    source_path = source_path or (profile.mc_path / "packsmith")
     incoming = Packdump.load(source_path)
 
-    latest_dir = GLOBAL_PATHS.packdumps / "latest"
-    history_dir = GLOBAL_PATHS.packdumps / "history"
+    latest_dir = profile.packdumps_dir / "latest"
+    history_dir = profile.packdumps_dir / "history"
     history_dir.mkdir(parents=True, exist_ok=True)
 
     # If we already have a latest, check if it's the same dump
@@ -399,7 +394,7 @@ def import_packdump(source_path: Path = None):
         log.info(f"Archived previous packdump to {archive_path}")
 
         # Prune oldest snapshots
-        max_snapshots = CONFIG.get("general", {}).get("packdump_snapshot_count", 10)
+        max_snapshots = profile.settings.get("max_packdump_snapshot_count", 10)
         snapshots = sorted(history_dir.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True)
         for old in snapshots[max_snapshots:]:
             shutil.rmtree(old)
@@ -413,8 +408,8 @@ def import_packdump(source_path: Path = None):
 
 # Simply returns a list of snapshot summaries from history, sorted newest first. Each summary contains
 # a timestamp, mc_version, loader, loader_version, mod_count, and path.
-def list_snapshots() -> list[dict]:
-    history_dir = GLOBAL_PATHS.packdumps / "history"
+def list_snapshots(profile: Profile) -> list[dict]:
+    history_dir = profile.packdumps_dir / "history"
     if not history_dir.is_dir():
         return []
 
@@ -439,6 +434,7 @@ def list_snapshots() -> list[dict]:
     summaries.sort(key=lambda s: s["timestamp"], reverse=True)
     return summaries
 
-r = import_packdump()
+
+r = import_packdump(Profile.load("testicles"))
 old = Packdump.load(Path("C:\\Users\\timbe\\IdeaProjects\\PacksmithGUI\\userdata\\packdumps\\history\\2026-02-25_22-11-33"))
 diffs = r.compare(old)
