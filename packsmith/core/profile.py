@@ -137,6 +137,3 @@ def list_profiles() -> list[str]:
         folder.name for folder in GLOBAL_PATHS.profiles.iterdir()
         if folder.is_dir() and (folder / "profile.json").exists()
     ]
-
-
-test = Profile.create("testicles",mc_path=r"C:\Users\timbe\curseforge\minecraft\Instances\Packsmith Test Pack")

@@ -435,6 +435,3 @@ def list_snapshots(profile: Profile) -> list[dict]:
     return summaries
 
 
-r = import_packdump(Profile.load("testicles"))
-old = Packdump.load(Path("C:\\Users\\timbe\\IdeaProjects\\PacksmithGUI\\userdata\\packdumps\\history\\2026-02-25_22-11-33"))
-diffs = r.compare(old)
