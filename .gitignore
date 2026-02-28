@@ -1,3 +1,4 @@
 /.venv
 /config/main.toml
 /test.py
+/fancy_tests.py

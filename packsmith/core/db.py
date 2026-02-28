@@ -24,6 +24,7 @@ class UserDB:
             CREATE TABLE IF NOT EXISTS tag_definitions (
                 name        TEXT PRIMARY KEY,
                 type        TEXT NOT NULL CHECK(type IN ('bool', 'string', 'enum', 'number')),
+                default_value   TEXT,
                 enum_values TEXT  -- JSON array, only used when type='enum', NULL otherwise
             );
 

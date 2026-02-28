@@ -13,7 +13,7 @@ class TagStore:
 
     # === DEFINITION ===
     # Methods to define and undefine tags. Undefining also deletes all assignments (via CASCADE)
-    def define(self, name: str, tag_type: str, enum_values: list[str] = None):
+    def define(self, name: str, tag_type: str, enum_values: list[str] = None, default=None):
         if tag_type not in ("bool", "string", "enum", "number"):
             raise ValueError(f"Invalid tag type: '{tag_type}'")
         if tag_type == "enum" and not enum_values:
@@ -22,10 +22,23 @@ class TagStore:
             raise ValueError(f"enum_values provided but tag type is '{tag_type}', not 'enum'")
         enum_json = json.dumps(enum_values) if enum_values else None
         try:
-            self._db.execute(
-                "INSERT INTO tag_definitions (name, type, enum_values) VALUES (?, ?, ?)",
-                (name, tag_type, enum_json)
-            )
+            if default is None:
+                self._db.execute(
+                    "INSERT INTO tag_definitions (name, type, enum_values) VALUES (?, ?, ?)",
+                    (name, tag_type, enum_json)
+                )
+            else:
+                # Validate default against the type we're about to insert (can't use _validate_tag_value yet)
+                if tag_type == "bool" and not isinstance(default, bool):
+                    raise ValueError(f"Default for '{name}' expects bool, got {type(default).__name__}")
+                if tag_type == "number" and not isinstance(default, (int, float)):
+                    raise ValueError(f"Default for '{name}' expects number, got {type(default).__name__}")
+                if tag_type == "enum" and str(default) not in enum_values:
+                    raise ValueError(f"Default for '{name}' value '{default}' not in allowed values: {enum_values}")
+                self._db.execute(
+                    "INSERT INTO tag_definitions (name, type, enum_values, default_value) VALUES (?, ?, ?, ?)",
+                    (name, tag_type, enum_json, str(default))
+                )
             # Rebuild cached definitions
             self._build_definitions()
         except sqlite3.IntegrityError:
@@ -47,7 +60,7 @@ class TagStore:
                    ON CONFLICT(registry_type, entry_id, tag_name) DO UPDATE SET value = excluded.value""",
             [(registry_type, eid, tag_name, str(value)) for eid in entry_id]
         )
-    def unassign_tag(self, registry_type: str, entry_id: str | list[str], tag_name: str):
+    def unassign(self, registry_type: str, entry_id: str | list[str], tag_name: str):
         if isinstance(entry_id,str):
             entry_id = [entry_id]
         self._db.execute_many(
@@ -144,9 +157,14 @@ class TagStore:
             "SELECT value FROM tag_assignments WHERE registry_type = ? AND entry_id = ? AND tag_name = ?",
             (registry_type, entry_id, tag_name)
         )
-        if not row:
+        if row:
+            return self._cast_tag_value(tag_name, row["value"])
+        # Check to see if there's a default value to return in cases where the tag isn't explicitly set.
+        definition = self.definition(tag_name)
+        if definition and definition.get("default_value") is not None:
+            return self._cast_tag_value(tag_name, definition["default_value"])
+        else:
             return None
-        return self._cast_tag_value(tag_name, row["value"])
     # Gets ALL tag assignments for a single entry.
     def get_all_tags(self, registry_type: str, entry_id: str) -> dict:
         rows = self._db.fetch_all(
@@ -159,10 +177,11 @@ class TagStore:
 
     # Builds the tag definition cache.
     def _build_definitions(self):
-        rows = self._db.fetch_all("SELECT name, type, enum_values FROM tag_definitions ORDER BY name")
+        rows = self._db.fetch_all("SELECT name, type, enum_values, default_value FROM tag_definitions ORDER BY name")
         definitions = {}
         for row in rows:
-            d = {"name": row["name"], "type": row["type"]}
+            d = {"name": row["name"], "type": row["type"], "default_value": row["default_value"]}
+            # Unpack json of enum vals if needed
             if row["enum_values"]:
                 d["values"] = json.loads(row["enum_values"])
             definitions[row['name']] = d
