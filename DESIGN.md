@@ -482,51 +482,58 @@ managed by PackSmith?")
 
 #### Job Language & API Boundary
 
-The job runtime is deliberately designed as a **language-agnostic API boundary.**
-The API defines a set of capabilities — what a script can read, what it can write, what
-it can query — and any runtime can call into it. This is the load-bearing architectural
-decision: the API is one API, regardless of what language sits on top.
+**Starlark is the official job language**, embedded via
+[`starlark-pyo3`](https://github.com/inducer/starlark-pyo3) (bindings to Meta's
+starlark-rust, the same implementation that powers Buck2). The host defines a fixed
+capability API; jobs can only touch the world through that API. Hermetic by design —
+no ambient filesystem, network, clock, or syscall access.
+
+**Why Starlark:**
+
+- **Capability security by construction.** Nothing is ambient. If the host doesn't
+  register a function, jobs cannot call it. This is exactly the property the community
+  store requires — "safe enough that strangers' scripts can run on a user's dev machine"
+  is the non-negotiable bar, and Starlark meets it by virtue of language design, not by
+  a sandbox configuration you have to maintain.
+- **Python-family syntax.** Pack devs coming from KubeJS, Python, or general scripting
+  experience feel at home immediately. No 1-based arrays, no `nil`-vs-`None`, no
+  alien operators.
+- **Deterministic and terminating.** No `while True`, no unbounded recursion. Jobs halt.
+- **Battle-tested upstream.** Meta's starlark-rust runs Buck2; Bazel's starlark-go runs
+  the Google build infrastructure. The language has been hammered at scale.
+- **Low integration cost.** `pip install starlark-pyo3`; register Python functions as
+  callables; inject data into a module; eval.
 
 **The Job API contract:**
 
 - **Inputs (read-only):** game data (registries, localization, metadata), tags (query
-  with full filter support), blueprint instances and bindings, profile metadata
-- **Outputs (controlled writes):** files within the modpack instance, at paths the host
-  explicitly permits
+  with full filter support), blueprint instances and bindings, profile metadata. All
+  exposed as Starlark-native dicts/lists via host-registered callables.
+- **Outputs (controlled writes):** files within the modpack instance, written through
+  capability functions (`pack.write_file(path, content)` and friends) at paths the host
+  explicitly permits.
 - **Boundary:** the host prepares a context, hands it to the runtime, gets results back.
-  The script never reaches around this boundary.
+  The script never reaches around this boundary — Starlark's hermeticity guarantees it.
 
-**Current approach:**
+**Known constraints to live with:**
 
-- **Development / dogfooding:** Python. No sandboxing needed — the author is the user.
-  Python jobs are local `.py` files that call into the API through Python bindings. This
-  enables immediate, practical use of PackSmith for real modpack development while the
-  broader runtime question is resolved.
+- **No exceptions.** Starlark jobs use sentinel returns (`None`, `(ok, value)` tuples)
+  and `fail("reason")` for fatal errors. Host functions handle recoverable I/O failures
+  behind the API surface. For the shape of PackSmith jobs (data transformation with
+  explicit validation points) this is tolerable, occasionally verbose.
+- **No classes, no `while` loops, no `try`/`except`.** Deliberate restrictions that keep
+  jobs deterministic and readable. Records are modeled as dicts or `struct(...)`.
+- **No Python stdlib.** Jobs cannot `import os`, `import re`, etc. If they need pattern
+  matching, string utilities, or similar, the host exposes those through the capability
+  API.
 
-- **Public release / community store:** Decision deferred. The leading candidate is
-  **Daphnia**, a capability-based secure language being developed in parallel, where
-  scripts physically cannot exceed the capabilities the host grants. This would make the
-  community store safe by construction — no sandboxing hacks, no trust assumptions. The
-  alternative is shipping with Python and accepting Curseforge-style "trust the author"
-  norms, which the Minecraft ecosystem already tolerates.
-
-- **At release, one language only.** If Daphnia: all Python job capability is removed. If
-  Python: Daphnia is not used. There is no dual-runtime, no "Python for local, Daphnia
-  for store," no escape hatches. One language, one surface, period. The indev Python phase
-  is purely scaffolding that gets torn out.
-
-- **If Daphnia ships:** PackSmith ships with a comprehensive set of stock jobs (item
-  removal, recipe generation, EMI/JEI hiding, lang overrides, etc.) pre-written in Daphnia
-  so day-one users never need to write a line of anything. The community store is
-  Daphnia-only from birth with safety guaranteed by construction.
-
-The critical discipline: every job written during indev must go through the API boundary.
-No reaching into Python-specific features (arbitrary pip imports, raw `os` module access,
-metaprogramming) that couldn't survive a runtime swap. If it can't be expressed through
-the capability API, it's a design smell regardless of the final language choice.
-
-> For the full context on why this decision is complicated — including the external
-> project pressures shaping it — see [SHRIMP_GAMBIT.md](SHRIMP_GAMBIT.md).
+**Potential future: Extism + JS (post-MVP, tentative).** WebAssembly via
+[Extism](https://extism.org/) offers capability security by construction with a broader
+expressiveness ceiling and the option for job authors to use JavaScript (or any
+WASM-compilable language). Not part of MVP — the integration cost is roughly 5-10x
+Starlark's and the ergonomic win is marginal for the job shapes we care about. Revisited
+only if Starlark's expressiveness ceiling becomes a real limiter or if demand for
+JS-specifically materializes from the KubeJS crowd.
 
 #### Execution Model
 
@@ -617,9 +624,8 @@ frameworks (KubeJS), guidebook mods (Patchouli), and similar.
 
 Plugins face the same community trust question as jobs. A malicious plugin with arbitrary
 host access is *more* dangerous than a malicious job (full UI access vs. controlled file
-writes). The resolution: **plugins use the same runtime as jobs.** If jobs run in Daphnia,
-plugins run in Daphnia. One runtime, one trust model, no
-contradictions.
+writes). The resolution: **plugins use the same runtime as jobs — Starlark.** One
+runtime, one trust model, no contradictions.
 
 This works because plugins don't need to touch Qt directly. They describe what they want
 through a declarative API — `register_smart_folder()`, `register_context_action()`,
@@ -633,12 +639,12 @@ For MVP, plugin functionality is **hardcoded directly into PackSmith** for the m
 mods (Paxi, KubeJS, OpenLoader, Moonlight). But the internal implementation uses the same
 registration functions that a future plugin API would expose — `register_smart_folder()`,
 `register_context_action()`, etc. The callers are just Python code inside PackSmith
-instead of external scripts.
+instead of external Starlark scripts.
 
-When the plugin system ships post-MVP, those registration functions become Daphnia ops,
-and the hardcoded calls move into `.daph` plugin files. The refactor is mechanical, not
-architectural — the API surface already exists because PackSmith has been using it
-internally.
+When the plugin system ships post-MVP, those registration functions become Starlark host
+callables, and the hardcoded calls move into `.star` plugin files. The refactor is
+mechanical, not architectural — the API surface already exists because PackSmith has been
+using it internally.
 
 ---
 
@@ -1049,12 +1055,6 @@ from the game; the database is truth from the user.
 ---
 
 ## 7. Open Questions
-
-### Job Language (Release-Time Decision)
-Python-only, Daphnia-only, or dual-runtime with separate domains? The API boundary is
-designed to support any of these. The decision point is when a public release with
-community store features is being prepared — not before. See Section 3.3 and
-[SHRIMP_GAMBIT.md](SHRIMP_GAMBIT.md) for the full decision framework.
 
 ### Round-Trip Parser Selection
 Which libraries do we use for comment-preserving round-trip parsing of TOML, JSON5, YAML,
