@@ -2,3 +2,6 @@
 /config/main.toml
 /test.py
 /fancy_tests.py
+/userdata
+__pycache__/
+*.pyc
