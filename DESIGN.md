@@ -2112,3 +2112,19 @@ pre-resolve conflicts, run interactively).
 - **Per-Key Ownership Monaco UX** — The decoration and edit-interception model is sketched
   but the actual user interaction flow (what happens keystroke-by-keystroke when you try to
   edit an action-owned range) needs a concrete decision.
+- **Starlark Capability API (§3.3.1)** — The design doc specifies that actions
+  interact with PackSmith exclusively through a host-registered capability API
+  (the `pack` object), but never defines what that API actually exposes. This is
+  the entire surface area between Layer 3 and the rest of PackSmith — every
+  read, write, query, and log call an action can make flows through it. Needs a
+  full API design pass covering: Layer 1 queries (registry lookups, entry
+  metadata, localization), Layer 2 reads and writes (tag queries, tag
+  assignment, blueprint instance traversal, binding reads/writes), file
+  operations (read, write, path resolution through the semantic file system),
+  structured logging (`pack.log`, `pack.log_section`), and utility functions
+  (string matching, pattern helpers, anything that compensates for Starlark's
+  lack of a standard library). The capability scoping model also needs
+  specification — how does the runtime enforce that a `read`-access mapping
+  actually blocks write calls? Is `pack` a single object with runtime permission
+  checks, or does each action receive a scoped sub-object with only the methods
+  its manifest authorizes?
