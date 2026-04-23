@@ -468,6 +468,24 @@ Default and strictness are preserved; the auto-coerce path exists only when Pack
 can *prove* the coercion is lossless. This keeps the rule predictable ("retype orphans")
 while eliminating friction in cases where orphaning would be pure theater.
 
+##### Mapping Re-Validation on Schema Mutation
+
+When a user confirms a rename, retype, or removal on a blueprint slot, PackSmith
+finds all action mappings (across all installed packages) whose `required_shape`
+references the mutated blueprint schema. Each affected mapping is re-validated
+against the new schema shape.
+
+If validation fails (a rename broke the shape contract, a retype changed a slot's
+kind, a removal deleted a slot the shape requires), every job step currently bound
+to the affected mapping is flagged as needing attention — the step refuses to run
+until the user re-binds or the schema is reverted.
+
+This is surfaced in the pre-mutation confirmation dialog: "This rename will
+invalidate 3 action mappings: `stone_job` step 2 (`removal_suite:nuke`),
+`glue_mod_job` step 1 (`compat:fill_gaps`), `brick_compat` step 4
+(`palette:standardize`). Those steps will need to be rebound." The user makes an
+informed choice before the mutation commits.
+
 ##### Resolving an Orphaned Instance
 
 When an instance is orphaned (via slot removal or retyping), it surfaces in the Errors
@@ -735,7 +753,8 @@ userdata/profiles/<profile>/packages/
 ```
 
 Each package folder is self-contained. PackSmith scans the `packages/` directory,
-reads each `manifest.toml`, and indexes every declared action into the sidebar.
+reads each `manifest.toml`, and indexes every declared action into the Actions
+panel (§4.1).
 
 A package manifest declares package-level metadata and a list of action entry points:
 
@@ -889,7 +908,7 @@ kind = "tag"
 tag_type = "bool"
 registry_type = "minecraft:item"
 access = "read"                # read | write | read_write
-cardinality = "one"             # one | many | at_least_one
+cardinality = "one"             # one | many
 required = true
 likely_name = "remove"          # hint for auto-fill heuristics
 description = "Items marked true here will be added to item_obliterator.json"
@@ -921,7 +940,6 @@ error.
 
 - `one` — exactly one artifact (UI: single-select picker)
 - `many` — zero or more artifacts (UI: multi-select list)
-- `at_least_one` — one or more artifacts (UI: multi-select, validated non-empty)
 
 For `many` on `blueprint_instance`, instances can come from multiple user-schemas as
 long as each satisfies the declared `required_shape` — the action's contract is
@@ -930,6 +948,13 @@ about shape, not schema identity.
 **Required vs. optional** (`required`). Required mappings block execution if unbound.
 Optional mappings allow the action to run with the slot unbound; the action's code
 checks whether the slot is present and adjusts behavior accordingly.
+
+Optional mappings may declare a `default` value in the manifest. When the
+user does not bind an artifact to an optional mapping, the action receives
+the declared default at runtime. If no default is declared and the mapping
+is unbound, the action receives `None` and is responsible for handling the
+absent binding gracefully. Required mappings cannot have defaults — they
+must be explicitly bound or the step refuses to run.
 
 ##### Structural Typing for Blueprints
 
@@ -1004,30 +1029,6 @@ override.
 A step with any unresolved required mapping or required configuration is flagged
 with a warning indicator and blocks execution.
 
-##### Action Output and Return Values
-
-An action's entry-point function may return a value. That value is:
-
-- **Displayed in the run log** as structured output, viewable by the user in the
-  Job Results panel.
-- **Optionally typed and described in the manifest** for documentation purposes:
-
-  ```toml
-  [actions.returns]
-  type = "list[registry_entry]"
-  registry_type = "minecraft:item"
-  description = "Items that matched the configured criteria"
-  ```
-
-- **Never consumed by another action or another step.** There is no inter-action
-  data flow primitive. Actions that need to hand data to other actions do so by
-  writing to a mapped Layer 2 artifact that another action reads from — with the
-  user binding both steps' mappings to the same artifact.
-
-Actions can also emit structured log output during execution via the capability API
-(`pack.log`, `pack.log_section(name)`, etc.) so authors can surface per-phase
-attribution in the run log.
-
 ##### Ownership of Layer 2 Data
 
 See §3.2.1 (tag assignment ownership) and §3.2.2 (blueprint binding ownership) for
@@ -1057,6 +1058,13 @@ breaks the action author's contract and will produce results the author did not
 anticipate. After override, the step shows a persistent indicator next to the
 overridden policy so the user doesn't forget.
 
+##### Structured Logging
+
+Actions emit output during execution via the capability API (`pack.log`,
+`pack.log_section(name)`, etc.). Authors use these to surface per-phase
+attribution and results in the run log. All action output flows through
+structured logging — there is no separate return value mechanism.
+
 #### 3.3.2 Jobs
 
 A **job** is a user-authored, user-owned sequence of steps stored in SQLite. It is
@@ -1073,9 +1081,11 @@ Each step in a job is one of two kinds:
 
 Jobs are **composable.** A "master removal" job can contain a "removal" job and a
 "recipe cleanup" job as steps. At runtime, the entire tree is flattened into a
-sequential list of action steps and executed one by one. The nesting is purely
-organizational — it does not affect execution semantics, transaction boundaries, or
-capability.
+sequential list of action steps and executed one by one. The nesting does not
+introduce new transaction boundaries or capability scope — each action step runs
+with the same semantics whether it was reached directly or via a job-reference
+step. Error propagation does cross job-reference boundaries (see Error Handling
+below), but that is the only execution-level consequence of nesting.
 
 **Cycle detection:** PackSmith rejects job-step references that would create cycles
 at creation time. A job cannot reference itself, directly or transitively.
@@ -1252,7 +1262,7 @@ choice — the policy is `ask`, and no one is here to ask.
 ##### Standalone Runs
 
 Running an action directly (not through a saved job) creates an **ephemeral
-one-step job.** The user hits Run on an action in the sidebar, gets a dialog to
+one-step job.** The user hits Run on an action in the Actions panel, gets a dialog to
 specify bindings and configuration, and runs once. After execution, PackSmith
 prompts: "Save as job?" If accepted, the ephemeral job is persisted to SQLite with
 a user-provided name. If declined, the run appears in history but the job
@@ -1305,13 +1315,38 @@ and can choose to fix and re-run, or roll back step 1 individually via run histo
 an individual step's writes. A full job run appears in history as a sequence of
 step entries, each independently rollback-able.
 
+##### Crash Recovery
+
+"Commit atomically" for file writes is not true OS-level atomicity — there
+is no cross-file transactional filesystem primitive. PackSmith achieves
+practical atomicity through the file versioning system: every file is
+snapshotted before an action step modifies it, and expected post-write
+hashes are stored in the `step_runs` record before writing begins.
+
+If the application crashes mid-write, the step_run record will show status
+`in_progress` with no completion timestamp. On next startup, PackSmith
+detects this and compares actual file contents against the stored expected
+hashes:
+
+- **All hashes match:** The writes completed successfully but the "mark
+  done" DB update didn't land. PackSmith promotes the step to `success`
+  automatically.
+- **Any hash mismatch (or no hashes stored):** The write was partial.
+  PackSmith performs a full rollback of all files for that step using the
+  pre-write snapshots, marks the step as `failed`, and notifies the user.
+
+SQLite handles its own atomicity via WAL (write-ahead logging). The hash-
+based recovery applies only to the filesystem writes that SQLite does not
+govern.
+
 ##### Pre-Run Preview
 
 Before a run commits, the user sees a preview showing the job's effective
 configuration: which Layer 1 data each step will read, which Layer 2 artifacts
 each step will write and with what conflict policies, and which files will be
 modified. If the preview reveals conflicts that would trigger `ask`-policy
-dialogs, they are resolved during the preview phase, not mid-run.
+dialogs, they are resolved during the preview phase, not mid-run — see
+`ask` Policy Resolution above for the dry-run convergence loop that drives this.
 
 ##### Creating Jobs
 
@@ -1329,10 +1364,11 @@ Three paths:
 
 ##### Pinning
 
-Jobs can be **pinned.** A pinned job appears in the sidebar with a play button for
-one-click execution. Unpinned jobs are listed under a "Library" section without a
-direct run button. The flag is purely UX — it does not affect execution semantics.
-Unpinned jobs can still be run via right-click → Run.
+Jobs can be **pinned.** A pinned job appears at the top of the Jobs panel with a
+play button for one-click execution. Unpinned jobs still appear in the panel's
+full list but without a top-level play button. The flag is purely UX — it does
+not affect execution semantics. Unpinned jobs can still be run via right-click →
+Run.
 
 ##### Import/Export
 
@@ -1347,18 +1383,23 @@ Bindings reference artifact names that may not exist in the importing user's
 profile — on import, PackSmith runs the same best-guess fill process as a fresh
 step creation, and flags unresolved required bindings.
 
-##### The Sidebar
+##### The Jobs Panel
 
-The left sidebar's automation panel (icon: J or similar) has two sections:
+The left sidebar's **Jobs** panel (icon: J) is the user's primary automation
+surface. It lists every job the user owns:
 
-- **Pinned** — jobs with play buttons, ordered by user preference. One-click
-  execution.
-- **Library** — all jobs (pinned and unpinned), searchable. Also lists all
-  installed actions for reference and standalone runs.
+- **Pinned jobs** appear at the top with play buttons for one-click execution,
+  ordered by user preference.
+- **All jobs** (pinned and unpinned) are listed below, searchable. Unpinned
+  jobs run via right-click → Run or by opening the job and hitting Run.
 
-Actions appear in the library as reference entries — the user can inspect their
-manifest, read their documentation, and launch standalone runs. But actions are
-not the primary interaction surface; jobs are.
+Right-click actions: edit, create new, pin/unpin, export, delete.
+Double-clicking a job opens its editor tab.
+
+Actions are **not** listed here. They live in the separate **Actions** panel
+(icon: A), which is a reference/browse surface — see §3.3.1 and §4.1. Jobs are
+the primary interaction surface for running anything; actions are declarations
+that jobs (or standalone runs) invoke.
 
 ##### The Action Tab
 
@@ -1368,12 +1409,11 @@ action. One tab type, one action per tab. Sections:
 - **Metadata** — name, description, version, author, package provenance
   (read-only for downloaded packages; editable for authored packages)
 - **Declared Manifest** — mappings with type contracts, configuration keys with
-  types and defaults, conflict policies, return type. All read-only; this is the
-  action's API surface.
+  types and defaults, conflict policies. All read-only; this is the action's
+  API surface.
 - **Documentation** — README from the package, if present.
 - **Run History** — all runs of this action across all jobs, with links to the
-  owning job/step. Expandable to show what was read, written, structured log
-  output, and emitted results.
+  owning job/step. Expandable to show what was read, written, and structured log output.
 
 The Action tab does not hold user bindings, user configuration, or exceptions.
 Those live on job steps.
@@ -1399,6 +1439,16 @@ without a migration hint, or because its old binding is now type-incompatible �
 blocks the step from running until the user resolves it in the step editor. There
 is no orphan state for step mappings; it's a simple "required and unbound = step
 refuses to run."
+
+**Trust model caveat:** Starlark sandboxing prevents filesystem and network
+escape, but it does not prevent social engineering. A malicious action that
+declares "I need `read_write` access to a bool tag on `minecraft:item`" and
+then sets every entry to `true` is operating within its declared capability
+— the sandbox worked correctly, and the action still did something
+destructive. The community store's trust/reputation system, user reviews,
+and the pre-run preview (which shows exactly what each step will read and
+write) are the mitigations. Sandboxing solves the *capability* problem;
+trust solves the *intent* problem.
 
 #### 3.3.3 Database Schema Additions
 
@@ -1430,8 +1480,7 @@ step_runs           — id, job_run_id FK → job_runs.id, step_id FK → job_st
                       action_id, started_at, finished_at,
                       status (success | failed | skipped | rolled_back),
                       staged_writes (JSON — L2 changes + file snapshots),
-                      log_output (JSON — structured log from pack.log calls),
-                      return_value (JSON, nullable)
+                      log_output (JSON — structured log from pack.log calls)
 ```
 
 The `job_mappings` and `job_configuration` tables from previous design iterations
@@ -1537,7 +1586,8 @@ in any panel typically opens a tab in the main workspace.
 | T | **Tags** | All declared tags. Click to edit a definition. Quick-action to spawn a minimal view (registry type + that one editable column). Shortcut into the Views system. |
 | F | **Files** | The semantic file browser. Toggle between **smart mode** (datapacks/assets/configs/scripts organized by purpose, mod-aware path resolution) and **honest mode** (raw directory tree). Same panel, view toggle at the top. |
 | R | **Registry** | Lightweight browse-only registry explorer. For quick lookups without configuring a whole view. |
-| J | **Jobs** | Pinned jobs at the top (with play buttons for one-click execution) and a Library section below listing all jobs (pinned and unpinned) plus all installed actions for reference and standalone runs. Right-click to edit, create new, pin/unpin. See §3.3.2. |
+| J | **Jobs** | The user's primary automation surface. Pinned jobs at the top with play buttons for one-click execution; all jobs (pinned and unpinned) listed below, searchable. Right-click to edit, create new, pin/unpin, export. Double-click opens a job editor tab. See §3.3.2. |
+| A | **Actions** | Reference/browse panel for all installed actions, organized by package. Inspect manifests, read documentation, and launch standalone runs (which create ephemeral one-step jobs with a "Save as job?" prompt). Actions are not pinnable — they are not the primary runnable surface. See §3.3.1. |
 
 More panels can be added later (search/query, etc.) without any architectural changes —
 the sidebar is just a list of panels, adding one is trivial.
