@@ -5,3 +5,4 @@
 /userdata
 __pycache__/
 *.pyc
+/design/merge/merged.md
