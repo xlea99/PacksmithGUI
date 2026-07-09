@@ -2,6 +2,8 @@ from PySide6.QtWidgets import QStyledItemDelegate, QLineEdit, QStyle, QApplicati
 from PySide6.QtCore import Qt, QModelIndex, QSortFilterProxyModel, QRegularExpression
 from PySide6.QtGui import QPainter, QPalette, QColor, QRegularExpressionValidator
 
+from packsmith.gui.table.cells.ownership import paint_ownership_bar
+
 
 class NumCellDelegate(QStyledItemDelegate):
     """Inline text editor delegate for number tag columns.
@@ -29,6 +31,7 @@ class NumCellDelegate(QStyledItemDelegate):
         self.initStyleOption(option, index)
         style = QApplication.style()
         style.drawPrimitive(QStyle.PE_PanelItemViewItem, option, painter)
+        paint_ownership_bar(painter, option, index)
 
         value = index.data(Qt.DisplayRole) or ""
         editing = self._is_editing(index.model(), index)

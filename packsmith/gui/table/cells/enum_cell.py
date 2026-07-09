@@ -2,6 +2,8 @@ from PySide6.QtWidgets import QStyledItemDelegate, QComboBox, QStyle, QApplicati
 from PySide6.QtCore import Qt, QModelIndex, QSortFilterProxyModel, QPointF, QRect, QEvent, QTimer
 from PySide6.QtGui import QPainter, QPalette, QColor, QPolygonF
 
+from packsmith.gui.table.cells.ownership import paint_ownership_bar
+
 
 class EnumCellDelegate(QStyledItemDelegate):
     """Dropdown delegate for enum tag columns.
@@ -42,6 +44,7 @@ class EnumCellDelegate(QStyledItemDelegate):
         self.initStyleOption(option, index)
         style = QApplication.style()
         style.drawPrimitive(QStyle.PE_PanelItemViewItem, option, painter)
+        paint_ownership_bar(painter, option, index)
 
         value = index.data(Qt.DisplayRole) or ""
         editing = self._is_editing(index.model(), index)

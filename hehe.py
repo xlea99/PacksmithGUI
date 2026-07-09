@@ -21,7 +21,7 @@ def generate_loot_table(item_ids: list[str], weight: int = 1) -> dict:
         }]
     }
 
-#I wish there were such a thing as a flounder... ya know???? OH MY FUCKING GOD!!! WAIT.... HTERE IS HOLY SHIT!!!
+#I wish there were such a thing as a flounder... ya know???? OH MY FUCKING GOD!!! WAIT.... HTERE IS SUCH THING AS A FLOUNDER HOLY SHIT!!!
 
 # i like beans... 
 def roll_loot(table: dict, times: int = 1) -> list[str]:

@@ -357,13 +357,17 @@ class Packdump:
 
     #region === Helpers ===
 
-    # Simply returns either the localization of the given registry type and registry id. If no localization exists,
-    # simply returns the raw entry_id
-    def display_name(self, registry_type: str, entry_id: str) -> str:
+    # Reads one L1 attribute of an entry (design 3.1). Attributes are dump-provided,
+    # per-entry data attached to (registry_type, entry_id) — today 'localization' is the
+    # first and only one. Returns None when the attribute is absent: the raw-id fallback is
+    # a renderer convenience, NOT the raw attribute, so callers that want a display string
+    # do `attribute(...) or entry_id` themselves.
+    def attribute(self, registry_type: str, entry_id: str, name: str):
+        if name != "localization":
+            return None
         if registry_type in self.localization:
-            return self.localization[registry_type].get(entry_id,entry_id)
-        else:
-            return entry_id
+            return self.localization[registry_type].get(entry_id)
+        return None
 
     #endregion === Helpers
 

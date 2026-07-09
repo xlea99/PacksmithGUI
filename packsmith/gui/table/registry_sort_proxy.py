@@ -2,15 +2,13 @@ from PySide6.QtCore import Qt, QSortFilterProxyModel
 
 
 class RegistrySortProxy(QSortFilterProxyModel):
-    """Sort proxy that respects tag data types.
-    Strings/enums sort alphabetically, numbers sort numerically,
-    bools sort False before True, and empty values always sink to the bottom."""
+    """Sort proxy that respects a column's data type.
 
-    def __init__(self, tag_store, tag_columns: list[str]):
-        super().__init__()
-        self._tag_store = tag_store
-        self._tag_columns = tag_columns
-        self._fixed_col_count = 2  # ID, Display Name
+    The source model is query-driven, so column types come straight from it
+    (``tag_type_for_column`` — bool/string/enum/number, or None for id/mod/attribute,
+    which sort as strings). Numbers sort numerically, bools False-before-True, everything
+    else alphabetically, and empty values always sink to the bottom.
+    """
 
     def lessThan(self, left, right):
         col = left.column()
@@ -25,28 +23,18 @@ class RegistrySortProxy(QSortFilterProxyModel):
         if right_val == "":
             return self.sortOrder() == Qt.AscendingOrder
 
-        # Fixed columns (ID, Display Name) — always string sort
-        if col < self._fixed_col_count:
-            return left_val.lower() < right_val.lower()
+        col_type = self.sourceModel().tag_type_for_column(col)
 
-        # Tag columns — sort based on tag type
-        tag_name = self._tag_columns[col - self._fixed_col_count]
-        defn = self._tag_store.definition(tag_name)
-        if not defn:
-            return left_val.lower() < right_val.lower()
-
-        tag_type = defn["type"]
-
-        if tag_type == "number":
+        if col_type == "number":
             try:
                 return float(left_val) < float(right_val)
             except ValueError:
                 return left_val.lower() < right_val.lower()
 
-        if tag_type == "bool":
+        if col_type == "bool":
             return left_val.lower() == "false" and right_val.lower() == "true"
 
-        # string and enum — alphabetical
+        # string, enum, and intrinsic (id/mod/attribute) — alphabetical
         return left_val.lower() < right_val.lower()
 
     def headerData(self, section, orientation, role=Qt.DisplayRole):

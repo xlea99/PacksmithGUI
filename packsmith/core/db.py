@@ -14,27 +14,42 @@ class UserDB:
         self._conn.execute("PRAGMA foreign_keys = ON")
         self._conn.row_factory = sqlite3.Row  # rows always behave like dicts cuz this is the 21st century
         self._ensure_tables()
+        self._migrate()
         log.info(f"UserDB connected: {db_path}")
 
     # Creates any/all tables that don't exist. Safe to call repeatedly
     def _ensure_tables(self):
         c = self._conn
         c.executescript("""
-            -- Tag definitions: what tags exist and what type they are
+            -- Tag definitions: what tags exist and what type they are. Definitions are
+            -- STRICTLY scoped to a single registry type (design 3.2.1): a `remove` tag on
+            -- minecraft:item is a wholly separate definition from `remove` on minecraft:block —
+            -- independent type, enum values, and default. Hence the composite (registry_type,
+            -- name) primary key.
             CREATE TABLE IF NOT EXISTS tag_definitions (
-                name        TEXT PRIMARY KEY,
-                type        TEXT NOT NULL CHECK(type IN ('bool', 'string', 'enum', 'number')),
+                registry_type   TEXT NOT NULL,
+                name            TEXT NOT NULL,
+                type            TEXT NOT NULL CHECK(type IN ('bool', 'string', 'enum', 'number')),
                 default_value   TEXT,
-                enum_values TEXT  -- JSON array, only used when type='enum', NULL otherwise
+                enum_values     TEXT,  -- JSON array, only used when type='enum', NULL otherwise
+                PRIMARY KEY (registry_type, name)
             );
 
-            -- Tag assignments: which registry entries have which tag values
+            -- Tag assignments: which registry entries have which tag values.
+            -- Every assignment has exactly one owner (see design 3.2.1). Ownership is a
+            -- property of the row's EXISTENCE, not its value: no row = pristine (nobody
+            -- owns it); a row always has an owner. owner_action_ref is package:action_id
+            -- when owner_kind='action', otherwise NULL.
             CREATE TABLE IF NOT EXISTS tag_assignments (
-                registry_type   TEXT NOT NULL,
-                entry_id        TEXT NOT NULL,
-                tag_name        TEXT NOT NULL REFERENCES tag_definitions(name) ON DELETE CASCADE,
-                value           TEXT NOT NULL,  -- stored as text, cast on read based on tag type
-                PRIMARY KEY (registry_type, entry_id, tag_name)
+                registry_type    TEXT NOT NULL,
+                entry_id         TEXT NOT NULL,
+                tag_name         TEXT NOT NULL,
+                value            TEXT NOT NULL,  -- stored as text, cast on read based on tag type
+                owner_kind       TEXT NOT NULL DEFAULT 'user' CHECK(owner_kind IN ('user', 'action')),
+                owner_action_ref TEXT,
+                PRIMARY KEY (registry_type, entry_id, tag_name),
+                FOREIGN KEY (registry_type, tag_name)
+                    REFERENCES tag_definitions(registry_type, name) ON DELETE CASCADE
             );
 
             -- Blueprint definitions
@@ -80,14 +95,52 @@ class UserDB:
                 config      TEXT NOT NULL  -- JSON blob of filter rules
             );
 
-            -- Flow definitions: in-GUI automation wiring
-            CREATE TABLE IF NOT EXISTS flows (
-                name        TEXT PRIMARY KEY,
-                description TEXT DEFAULT '',
-                config      TEXT NOT NULL  -- JSON blob of steps/script references
+            -- File ownership: the OPEN-WORLD engine (design 6.0/6.1). Whole-file only
+            -- for the MVP. `path` is relative to the instance root. Deliberately its
+            -- own table, separate from L2 ownership — files have an uncontrolled
+            -- external writer (the game, mod updates, the user in another tool), so
+            -- this engine plays conservative.
+            CREATE TABLE IF NOT EXISTS file_ownership (
+                path             TEXT PRIMARY KEY,
+                owner_kind       TEXT NOT NULL CHECK(owner_kind IN ('user', 'action')),
+                owner_action_ref TEXT
+            );
+
+            -- Run history: one row per action step executed. rollback_data holds the
+            -- inverse of everything the step committed (prior L2 values+owners, prior
+            -- file contents+ownership), so a committed step can be reversed. Surfacing
+            -- this in the UI is a later slice; the record is captured now.
+            CREATE TABLE IF NOT EXISTS step_runs (
+                id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                action_ref    TEXT NOT NULL,
+                status        TEXT NOT NULL,   -- success | failed
+                reason        TEXT,
+                started_at    TEXT NOT NULL,
+                finished_at   TEXT NOT NULL,
+                rollback_data TEXT NOT NULL,   -- JSON: {"l2": [...], "files": {...}}
+                log_output    TEXT NOT NULL    -- JSON: [[level, message], ...]
             );
         """)
         c.commit()
+
+    # Idempotent, additive migrations for databases created before a column existed.
+    # There's no migration framework yet (see design 9.2 live question) — for indev this
+    # just brings older tables up to the current column set without destroying data.
+    # New CHECK constraints can't be added via ALTER, so migrated columns rely on the
+    # Python-side validation in the stores; fresh DBs still get the full CREATE constraints.
+    def _migrate(self):
+        self._add_column_if_missing("tag_assignments", "owner_kind", "TEXT NOT NULL DEFAULT 'user'")
+        self._add_column_if_missing("tag_assignments", "owner_action_ref", "TEXT")
+        # `flows` was a dead placeholder table, never used — drop it if an old DB has it.
+        self._conn.execute("DROP TABLE IF EXISTS flows")
+        self._conn.commit()
+
+    def _add_column_if_missing(self, table: str, column: str, definition: str):
+        existing = {row["name"] for row in self._conn.execute(f"PRAGMA table_info({table})")}
+        if column not in existing:
+            self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+            self._conn.commit()
+            log.info(f"Migrated {table}: added column '{column}'")
 
     # Execute a write query (INSERT, UPDATE, DELETE) and commit.
     def execute(self, sql: str, params: tuple = ()) -> sqlite3.Cursor:

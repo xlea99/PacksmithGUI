@@ -2,6 +2,8 @@ from PySide6.QtWidgets import QStyledItemDelegate, QStyle, QStyleOptionButton, Q
 from PySide6.QtCore import Qt, QRect, QModelIndex, QEvent, QSortFilterProxyModel
 from PySide6.QtGui import QPainter
 
+from packsmith.gui.table.cells.ownership import paint_ownership_bar
+
 
 class BoolCellDelegate(QStyledItemDelegate):
     """Checkbox delegate for bool tag columns.
@@ -49,6 +51,7 @@ class BoolCellDelegate(QStyledItemDelegate):
 
         # Draw cell background (selection, alternating rows)
         style.drawPrimitive(QStyle.PE_PanelItemViewItem, option, painter)
+        paint_ownership_bar(painter, option, index)
 
         value = self._get_value(index)
         editing = self._is_editing(index.model(), index)

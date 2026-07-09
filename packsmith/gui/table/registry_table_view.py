@@ -133,7 +133,9 @@ class RegistryTableView(QTableView):
                 continue  # value doesn't fit this column, skip silently
 
             entry_id = source.entry_at_row(src_row)
-            tag_name = source._tag_columns[src_col - len(source._fixed_columns)]
+            tag_name = source.column_tag_name(src_col)
+            if entry_id is None or tag_name is None:
+                continue
             old_value = source._tag_store.get_tag(source._registry_type, entry_id, tag_name)
 
             if old_value == converted:
@@ -212,7 +214,9 @@ class RegistryTableView(QTableView):
             src_row = self._source_row(idx)
             src_col = self._source_col(idx)
             entry_id = source.entry_at_row(src_row)
-            tag_name = source._tag_columns[src_col - len(source._fixed_columns)]
+            tag_name = source.column_tag_name(src_col)
+            if entry_id is None or tag_name is None:
+                continue
             old_value = source._tag_store.get_tag(source._registry_type, entry_id, tag_name)
 
             if old_value == new_value:
@@ -249,7 +253,9 @@ class RegistryTableView(QTableView):
 
             src_row = self._source_row(idx)
             entry_id = source.entry_at_row(src_row)
-            tag_name = source._tag_columns[src_col - len(source._fixed_columns)]
+            tag_name = source.column_tag_name(src_col)
+            if entry_id is None or tag_name is None:
+                continue
             old_value = source._tag_store.get_tag(source._registry_type, entry_id, tag_name)
 
             if old_value is None:

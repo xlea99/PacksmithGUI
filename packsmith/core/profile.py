@@ -24,6 +24,7 @@ class Profile:
 
         # Ensure profile subdirectories exist
         self.packdumps_dir = ensure_directory(root / "packdumps")
+        self.packages_dir = ensure_directory(root / "packages")
 
     # Save and load methods for loading and saving the profile (which is primarily just an organizational json pointing
     # at different things)
