@@ -152,6 +152,8 @@ class RegistryTableView(QTableView):
         if not edits:
             return True  # consumed the event even if nothing changed
 
+        if not source.confirm_takeover_of([(e.entry_id, e.tag_name) for e in edits]):
+            return True
         batch = BatchEditCommand(label=f"Paste '{text}' into {len(edits)} cells", edits=edits)
         source._edit_stack.execute(batch)
         source.emit_all_data_changed()
@@ -233,6 +235,8 @@ class RegistryTableView(QTableView):
         if not edits:
             return True
 
+        if not source.confirm_takeover_of([(e.entry_id, e.tag_name) for e in edits]):
+            return True
         batch = BatchEditCommand(label=f"Toggle {len(edits)} bools", edits=edits)
         source._edit_stack.execute(batch)
         source.emit_all_data_changed()
@@ -272,6 +276,8 @@ class RegistryTableView(QTableView):
         if not edits:
             return False
 
+        if not source.confirm_takeover_of([(e.entry_id, e.tag_name) for e in edits]):
+            return True
         batch = BatchEditCommand(label=f"Clear {len(edits)} tags", edits=edits)
         source._edit_stack.execute(batch)
         source.emit_all_data_changed()

@@ -1,4 +1,6 @@
 """Core tag behaviour: definitions, assignment, retrieval, casting, cascades."""
+import json
+
 import pytest
 
 REG = "minecraft:item"
@@ -128,6 +130,183 @@ def test_undefine_is_registry_scoped(tags):
     tags.undefine(REG, "hidden")
     assert tags.definition(REG, "hidden") is None
     assert tags.definition(BLOCK, "hidden") is not None
+
+
+# --- identity: the id is the tag, the name is a label (design 3.2.1) -------
+
+def test_definition_carries_a_stable_id(tags):
+    tag_id = tags.define(REG, "tier", "enum", ["early", "mid"])
+    assert tags.definition(REG, "tier")["id"] == tag_id
+
+
+def test_same_name_on_two_registries_gets_distinct_ids(tags):
+    item_id = tags.define(REG, "tier", "enum", ["early"])
+    block_id = tags.define("minecraft:block", "tier", "number")
+    assert item_id != block_id
+
+
+def test_assignments_follow_the_id_not_the_name(tags, user_db):
+    """The payoff of id-identity: renaming the definition moves no assignment rows.
+    (The rename *ceremony* isn't built yet, so this writes the label directly — the
+    point is that the data doesn't care.)"""
+    tags.define(REG, "remove", "bool", default=False)
+    tags.assign(REG, "quark:rope", "remove", True, owner="user")
+
+    user_db.execute("UPDATE tag_definitions SET name = 'hide' WHERE registry_type = ? AND name = ?",
+                    (REG, "remove"))
+    tags._build_definitions()
+
+    assert tags.get_tag(REG, "quark:rope", "hide") is True
+    assert tags.get_ownership(REG, "quark:rope", "hide") == {"kind": "user", "action_ref": None}
+    assert tags.definition(REG, "remove") is None
+
+
+# --- orphan detection: two causes, one state (design 3.2.1) ----------------
+
+class _Dump:
+    def __init__(self, entries):
+        self.registry = {REG: {"values": list(entries)}}
+
+
+def test_orphan_when_entry_left_the_packdump(tags):
+    tags.define(REG, "remove", "bool")
+    tags.assign(REG, "quark:rope", "remove", True)
+    tags.assign(REG, "minecraft:diamond", "remove", True)
+    orphans = tags.orphaned_tags(_Dump(["minecraft:diamond"]))
+    assert orphans == {REG: ["quark:rope"]}
+
+
+def test_orphan_when_enum_value_left_the_definition(tags):
+    """The second cause: the entry still exists, but its value no longer does."""
+    tags.define(REG, "tier", "enum", ["early", "mid", "late"])
+    tags.assign(REG, "quark:rope", "tier", "late")
+    tags.assign(REG, "minecraft:diamond", "tier", "mid")
+    dump = _Dump(["quark:rope", "minecraft:diamond"])
+    assert tags.orphaned_tags(dump) == {}          # nothing wrong yet
+
+    tags.set_enum_values(REG, "tier", ["early", "mid"])
+
+    assert tags.orphaned_tags(dump) == {REG: ["quark:rope"]}
+
+
+def test_orphans_carry_their_reason(tags):
+    tags.define(REG, "tier", "enum", ["early", "late"])
+    tags.assign(REG, "quark:rope", "tier", "late")      # will go stale
+    tags.assign(REG, "gone:item", "tier", "early")      # entry not in the dump
+    tags.set_enum_values(REG, "tier", ["early"])
+
+    orphans = {o.entry_id: o for o in tags.find_orphans(_Dump(["quark:rope"]))}
+    assert orphans["quark:rope"].reason == "stale_value"
+    assert orphans["quark:rope"].value == "late"
+    assert orphans["gone:item"].reason == "missing_entry"
+
+
+# --- enum value evolution (design 3.2.1) -----------------------------------
+
+def test_preview_reports_the_blast_radius_without_changing_anything(tags):
+    tags.define(REG, "tier", "enum", ["early", "mid", "late"], default="late")
+    tags.assign(REG, "a", "tier", "late")
+    tags.assign(REG, "b", "tier", "late")
+    tags.assign(REG, "c", "tier", "mid")
+
+    preview = tags.preview_enum_change(REG, "tier", ["early", "mid", "end"])
+    assert preview["removed"] == ["late"]
+    assert preview["added"] == ["end"]
+    assert preview["orphan_count"] == 2
+    assert preview["orphaned"] == {"late": ["a", "b"]}
+    assert preview["default_cleared"] is True
+    # ...and nothing actually moved
+    assert tags.definition(REG, "tier")["values"] == ["early", "mid", "late"]
+    assert tags.get_tag(REG, "a", "tier") == "late"
+
+
+def test_adding_a_value_is_free(tags):
+    tags.define(REG, "tier", "enum", ["early", "late"])
+    tags.assign(REG, "a", "tier", "late")
+    tags.set_enum_values(REG, "tier", ["early", "late", "end"])
+    assert tags.definition(REG, "tier")["values"] == ["early", "late", "end"]
+    assert tags.orphaned_tags(_Dump(["a"])) == {}     # nothing disturbed
+
+
+def test_reordering_preserves_the_new_order(tags):
+    tags.define(REG, "tier", "enum", ["early", "mid", "late"])
+    tags.set_enum_values(REG, "tier", ["late", "mid", "early"])
+    assert tags.definition(REG, "tier")["values"] == ["late", "mid", "early"]
+
+
+def test_removing_a_value_orphans_rather_than_deletes(tags):
+    """The assignment survives — deliberately. The user resolves it, not the system."""
+    tags.define(REG, "tier", "enum", ["early", "late"])
+    tags.assign(REG, "a", "tier", "late", owner="user")
+    tags.set_enum_values(REG, "tier", ["early"])
+    assert tags.get_tag(REG, "a", "tier") == "late"                 # data still there
+    assert tags.get_ownership(REG, "a", "tier") is not None
+    assert len(tags.find_orphans(_Dump(["a"]))) == 1
+
+
+def test_removing_the_default_value_clears_the_default(tags):
+    tags.define(REG, "tier", "enum", ["early", "late"], default="late")
+    tags.set_enum_values(REG, "tier", ["early"])
+    assert tags.definition(REG, "tier")["default_value"] is None
+    assert tags.default_for(REG, "tier") is None
+
+
+def test_enum_values_cannot_be_emptied(tags):
+    tags.define(REG, "tier", "enum", ["early"])
+    with pytest.raises(ValueError):
+        tags.set_enum_values(REG, "tier", [])
+
+
+def test_set_enum_values_rejects_non_enum_tags(tags):
+    tags.define(REG, "notes", "string")
+    with pytest.raises(ValueError):
+        tags.set_enum_values(REG, "notes", ["a", "b"])
+
+
+# --- orphan resolutions ----------------------------------------------------
+
+def test_resolution_clear_deletes_the_orphaned_assignments(tags):
+    tags.define(REG, "tier", "enum", ["early", "late"])
+    tags.assign(REG, ["a", "b"], "tier", "late")
+    tags.assign(REG, "c", "tier", "early")
+    tags.set_enum_values(REG, "tier", ["early"])
+
+    assert tags.clear_value(REG, "tier", "late") == 2
+    assert tags.get_ownership(REG, "a", "tier") is None
+    assert tags.get_tag(REG, "c", "tier") == "early"       # untouched
+    assert tags.find_orphans(_Dump(["a", "b", "c"])) == []
+
+
+def test_resolution_reassign_moves_them_to_a_valid_value(tags):
+    tags.define(REG, "tier", "enum", ["early", "late"])
+    tags.assign(REG, ["a", "b"], "tier", "late", owner="action", owner_action_ref="x:y")
+    tags.set_enum_values(REG, "tier", ["early"])
+
+    assert tags.reassign_value(REG, "tier", "late", "early") == 2
+    assert tags.get_tag(REG, "a", "tier") == "early"
+    # ownership is preserved — reassigning resolves a problem, it doesn't claim the cell
+    assert tags.get_ownership(REG, "a", "tier") == {"kind": "action", "action_ref": "x:y"}
+    assert tags.find_orphans(_Dump(["a", "b"])) == []
+
+
+def test_resolution_reassign_rejects_an_invalid_target(tags):
+    tags.define(REG, "tier", "enum", ["early", "late"])
+    tags.assign(REG, "a", "tier", "late")
+    tags.set_enum_values(REG, "tier", ["early"])
+    with pytest.raises(ValueError):
+        tags.reassign_value(REG, "tier", "late", "nonsense")
+
+
+def test_resolution_restore_un_orphans_everything(tags):
+    """'Restore' is just putting the value back — the assignments were never destroyed."""
+    tags.define(REG, "tier", "enum", ["early", "late"])
+    tags.assign(REG, "a", "tier", "late")
+    tags.set_enum_values(REG, "tier", ["early"])
+    assert len(tags.find_orphans(_Dump(["a"]))) == 1
+
+    tags.set_enum_values(REG, "tier", ["early", "late"])
+    assert tags.find_orphans(_Dump(["a"])) == []
+    assert tags.get_tag(REG, "a", "tier") == "late"
 
 
 def test_same_name_different_registry_is_not_a_duplicate(tags):

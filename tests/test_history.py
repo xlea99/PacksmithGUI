@@ -74,7 +74,9 @@ def test_rollback_undoes_write_to_pristine(env, history):
 def test_rollback_restores_prior_value_and_owner(env, history):
     tags, dump = env
     tags.assign(REG, "quark:rope", "queued", False, owner="user")    # prior: user-owned False
-    result = run_action(_mark, tag_store=tags, packdump=dump, action_ref="demo:mark", history=history)
+    # Taking a user-owned cell requires the action to have declared `overwrite` (design 3.3).
+    result = run_action(_mark, tag_store=tags, packdump=dump, action_ref="demo:mark",
+                        history=history, conflict_policies={"queued": "overwrite"})
     assert tags.get_tag(REG, "quark:rope", "queued") is True         # action took it over
     assert tags.get_ownership(REG, "quark:rope", "queued")["kind"] == "action"
 
@@ -102,9 +104,12 @@ def test_rollback_deletes_a_newly_created_file(user_db, tmp_path, tags, history)
 
 
 def test_rollback_restores_prior_file_content(user_db, tmp_path, tags, history):
+    """The common real case: a vanilla config file nobody has claimed (untouched, so the
+    action may take it), modified by an action, then rolled back to its original bytes."""
     root = tmp_path / "instance"; root.mkdir()
     fs = FileStore(user_db, root)
-    fs.write("config/x.json", "OLD", owner="user")                   # pre-existing, user-owned
+    (root / "config").mkdir()
+    (root / "config" / "x.json").write_text("OLD", encoding="utf-8")   # on disk, untouched
 
     def write_action(pack):
         pack.filesystem.resolve("config/x.json").write("NEW")
@@ -112,10 +117,11 @@ def test_rollback_restores_prior_file_content(user_db, tmp_path, tags, history):
     result = run_action(write_action, tag_store=tags, packdump=FakeDump(),
                         action_ref="removal:nuke", file_store=fs, history=history)
     assert (root / "config" / "x.json").read_text(encoding="utf-8") == "NEW"
+    assert fs.ownership("config/x.json")["kind"] == "action"           # claimed by writing
 
     rollback_step(result.run_id, tag_store=tags, history=history, file_store=fs)
     assert (root / "config" / "x.json").read_text(encoding="utf-8") == "OLD"   # restored
-    assert fs.ownership("config/x.json") == {"kind": "user", "action_ref": None}
+    assert fs.ownership("config/x.json") is None                       # untouched again
 
 
 def test_rollback_needs_file_store_when_files_were_written(user_db, tmp_path, tags, history):

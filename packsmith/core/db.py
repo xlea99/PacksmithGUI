@@ -24,15 +24,19 @@ class UserDB:
             -- Tag definitions: what tags exist and what type they are. Definitions are
             -- STRICTLY scoped to a single registry type (design 3.2.1): a `remove` tag on
             -- minecraft:item is a wholly separate definition from `remove` on minecraft:block —
-            -- independent type, enum values, and default. Hence the composite (registry_type,
-            -- name) primary key.
+            -- independent type, enum values, and default. Hence UNIQUE (registry_type, name).
+            --
+            -- `id` is the IDENTITY; `name` is only a label (design 3.2.1, "Identity, Naming,
+            -- and References"). Everything internal points at the id, so renaming a tag is a
+            -- one-row update that touches no assignment and no binding.
             CREATE TABLE IF NOT EXISTS tag_definitions (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
                 registry_type   TEXT NOT NULL,
                 name            TEXT NOT NULL,
                 type            TEXT NOT NULL CHECK(type IN ('bool', 'string', 'enum', 'number')),
                 default_value   TEXT,
                 enum_values     TEXT,  -- JSON array, only used when type='enum', NULL otherwise
-                PRIMARY KEY (registry_type, name)
+                UNIQUE (registry_type, name)
             );
 
             -- Tag assignments: which registry entries have which tag values.
@@ -40,16 +44,17 @@ class UserDB:
             -- property of the row's EXISTENCE, not its value: no row = pristine (nobody
             -- owns it); a row always has an owner. owner_action_ref is package:action_id
             -- when owner_kind='action', otherwise NULL.
+            -- Assignments reference the definition by ID, never by name — so a rename costs
+            -- zero rows here. registry_type is deliberately absent: tag_id already implies it
+            -- (a definition belongs to exactly one registry), so storing it again would be a
+            -- second source of truth that could disagree.
             CREATE TABLE IF NOT EXISTS tag_assignments (
-                registry_type    TEXT NOT NULL,
+                tag_id           INTEGER NOT NULL REFERENCES tag_definitions(id) ON DELETE CASCADE,
                 entry_id         TEXT NOT NULL,
-                tag_name         TEXT NOT NULL,
                 value            TEXT NOT NULL,  -- stored as text, cast on read based on tag type
                 owner_kind       TEXT NOT NULL DEFAULT 'user' CHECK(owner_kind IN ('user', 'action')),
                 owner_action_ref TEXT,
-                PRIMARY KEY (registry_type, entry_id, tag_name),
-                FOREIGN KEY (registry_type, tag_name)
-                    REFERENCES tag_definitions(registry_type, name) ON DELETE CASCADE
+                PRIMARY KEY (tag_id, entry_id)
             );
 
             -- Blueprint definitions
@@ -89,10 +94,19 @@ class UserDB:
                 PRIMARY KEY (instance_id, slot_name, position)
             );
 
-            -- View definitions: saved filter configurations
+            -- Saved Views (design 3.2.3): a View is a named (query, renderer, renderer
+            -- config) triple. The query is the serialized AST (design 3.2.4) — a query is
+            -- DATA, which is exactly what makes a View storable, forkable, and shareable.
+            -- `id` is a surrogate key so renaming is trivial and identity survives it;
+            -- `renderer` is stored now (only one exists today) so adding the blueprint-node
+            -- renderer later is additive rather than a migration.
             CREATE TABLE IF NOT EXISTS views (
-                name        TEXT PRIMARY KEY,
-                config      TEXT NOT NULL  -- JSON blob of filter rules
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                name            TEXT NOT NULL UNIQUE,
+                query_json      TEXT NOT NULL,
+                renderer        TEXT NOT NULL DEFAULT 'registry_table',
+                renderer_config TEXT,
+                position        INTEGER NOT NULL DEFAULT 0
             );
 
             -- File ownership: the OPEN-WORLD engine (design 6.0/6.1). Whole-file only
@@ -104,6 +118,46 @@ class UserDB:
                 path             TEXT PRIMARY KEY,
                 owner_kind       TEXT NOT NULL CHECK(owner_kind IN ('user', 'action')),
                 owner_action_ref TEXT
+            );
+
+            -- Jobs: a user-authored, user-owned sequence of steps (design 3.3.2). Pure
+            -- Layer 2 data — the same category of artifact as a view or a tag definition.
+            -- Jobs never touch Starlark; they compose actions BY REFERENCE.
+            CREATE TABLE IF NOT EXISTS jobs (
+                id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                name             TEXT NOT NULL UNIQUE,
+                default_on_error TEXT NOT NULL DEFAULT 'halt'
+                                     CHECK(default_on_error IN ('halt', 'skip')),
+                pinned           INTEGER NOT NULL DEFAULT 0,
+                position         INTEGER NOT NULL DEFAULT 0
+            );
+
+            -- Steps carry ALL per-invocation state (design 3.3.2 "Model B"): bindings,
+            -- config, and error policy live on the step, never on the action. One action
+            -- can appear in dozens of steps with independent bindings.
+            -- A step is either an action invocation or a reference to another job.
+            CREATE TABLE IF NOT EXISTS job_steps (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id      INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+                position    INTEGER NOT NULL,
+                kind        TEXT NOT NULL CHECK(kind IN ('action', 'job_ref')),
+                action_ref  TEXT,          -- action steps: package:action_id
+                ref_job_id  INTEGER REFERENCES jobs(id) ON DELETE CASCADE,
+                on_error    TEXT CHECK(on_error IN ('halt', 'skip')),  -- NULL = inherit job default
+                bindings    TEXT,          -- JSON: slot -> tag name
+                config      TEXT           -- JSON: param -> value
+            );
+
+            -- One row per job execution. job_name is denormalized so run history survives
+            -- the job being deleted — history is a record of what happened, not a
+            -- reference to what still exists.
+            CREATE TABLE IF NOT EXISTS job_runs (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                job_id      INTEGER REFERENCES jobs(id) ON DELETE SET NULL,
+                job_name    TEXT NOT NULL,
+                started_at  TEXT NOT NULL,
+                finished_at TEXT,
+                status      TEXT NOT NULL   -- success | partial | failed | running
             );
 
             -- Run history: one row per action step executed. rollback_data holds the
@@ -129,8 +183,11 @@ class UserDB:
     # New CHECK constraints can't be added via ALTER, so migrated columns rely on the
     # Python-side validation in the stores; fresh DBs still get the full CREATE constraints.
     def _migrate(self):
-        self._add_column_if_missing("tag_assignments", "owner_kind", "TEXT NOT NULL DEFAULT 'user'")
-        self._add_column_if_missing("tag_assignments", "owner_action_ref", "TEXT")
+        # Link a recorded step back to the job run it belonged to (design 3.3.3). All
+        # nullable: a standalone run (one action, no job) legitimately has none of them.
+        self._add_column_if_missing("step_runs", "job_run_id", "INTEGER")
+        self._add_column_if_missing("step_runs", "step_id", "INTEGER")
+        self._add_column_if_missing("step_runs", "position_in_run", "INTEGER")
         # `flows` was a dead placeholder table, never used — drop it if an old DB has it.
         self._conn.execute("DROP TABLE IF EXISTS flows")
         self._conn.commit()

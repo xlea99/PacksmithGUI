@@ -1,17 +1,20 @@
 """On-disk action packages and the manifest → callable seam (design 3.3.1, 7.x).
 
 A package is a folder with a ``manifest.toml`` declaring one or more actions, plus the
-``.py`` files their entry points live in. The manifest is the durable, language-agnostic
-part: read identically whether the action body is Python now or Starlark later.
+``.star`` files their entry points live in. The manifest is the durable, language-agnostic
+part: it describes the action without caring what its body is written in.
 
-``PackageIndex.load_callable`` is the ONE Python-specific seam — today it ``importlib``s
-a ``.py`` and grabs the function; later it compiles a ``.star``. Everything above it
-(scanning, indexing, ref resolution, the runner) is unchanged by that swap.
+``PackageIndex.load_callable`` is the ONE language-specific seam: it reads the action's
+``.star`` source and returns a closure that evaluates it. Everything above it (scanning,
+indexing, ref resolution, the runner) never learns what language actions are written in —
+which is exactly what let the Python-callable stand-in be swapped out for real Starlark
+without touching a line of the runner.
 """
-import importlib.util
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
+
+from packsmith.core.starlark_runtime import run_starlark
 
 
 @dataclass
@@ -21,12 +24,16 @@ class MappingSlot:
     name: str
     kind: str = "tag"
     tag_type: str = None          # required kind of tag (bool/string/enum/number/reference)
-    registry_type: str = None     # e.g. minecraft:item (informational for now — see note below)
-    access: str = "read"          # read | write | read_write (stored; enforcement deferred to Phase 4)
+    registry_type: str = None     # e.g. minecraft:item
+    access: str = "read"          # read | write | read_write (stored; write-on-read enforcement deferred)
     cardinality: str = "one"      # one | many (MVP: one)
     required: bool = True
     likely_name: str = None       # hint for best-guess fill
     description: str = ""
+    # Mandatory on write/read_write mappings (design 3.3): what happens when this action
+    # writes a cell someone else already owns. There is deliberately NO default — "the
+    # author must explicitly choose… there is no universally-correct answer."
+    conflict_policy: str = None   # overwrite | skip | fail | ask
 
 
 @dataclass
@@ -66,6 +73,11 @@ class Package:
     author: str = ""
     description: str = ""
     actions: list = field(default_factory=list)   # list[ActionManifest]
+    # Design 3.3.1: purely a provenance label — authored and downloaded packages are
+    # structurally identical. It governs *editability*, not behaviour: you may edit what
+    # you wrote, not what you installed. Absent means authored, because a package you
+    # created by hand has no reason to declare anything.
+    provenance: str = "authored"
 
 
 def load_package(package_dir) -> Package:
@@ -99,10 +111,15 @@ def load_package(package_dir) -> Package:
             config=_parse_config(entry.get("configuration", {})),
         ))
 
+    provenance = meta.get("provenance", "authored")
+    if provenance not in ("authored", "downloaded"):
+        raise ValueError(f"Package '{name}': provenance must be authored or downloaded")
+
     return Package(
         name=name, root=package_dir,
         version=meta.get("version", ""), author=meta.get("author", ""),
         description=meta.get("description", ""), actions=actions,
+        provenance=provenance,
     )
 
 
@@ -134,6 +151,13 @@ class PackageIndex:
     def actions(self) -> dict:
         return dict(self._actions)
 
+    @property
+    def packages(self) -> dict:
+        return dict(self._packages)
+
+    def package(self, name: str):
+        return self._packages.get(name)
+
     def get(self, action_ref: str) -> ActionManifest:
         try:
             return self._actions[action_ref]
@@ -141,37 +165,59 @@ class PackageIndex:
             raise KeyError(f"No action '{action_ref}' in the package index")
 
     def load_callable(self, action_ref: str):
-        """Resolve an action ref to its Python callable — the one Python-specific
-        seam (``importlib`` now, Starlark compile later)."""
+        """Resolve an action ref to something the runner can call with ``pack``.
+
+        This is the language seam. It returns a plain Python closure, so everything above
+        it — ``run_action``, the job runner, the GUI — is unchanged by the fact that the
+        action's body is Starlark rather than Python.
+        """
         manifest = self.get(action_ref)
         pkg = self._packages[manifest.package_name]
-        module = _import_module_from_path(
-            pkg.root / manifest.file,
-            f"packsmith_action_{manifest.package_name}_{manifest.action_id}",
-        )
-        fn = getattr(module, manifest.function, None)
-        if not callable(fn):
-            raise AttributeError(
-                f"Action '{action_ref}' names function '{manifest.function}' in "
-                f"'{manifest.file}', which is missing or not callable")
-        return fn
+        path = pkg.root / manifest.file
+        if not path.is_file():
+            raise FileNotFoundError(f"Action file not found: {path}")
+        source = path.read_text(encoding="utf-8")
+
+        def invoke(pack):
+            return run_starlark(source, pack, function=manifest.function,
+                                filename=manifest.file)
+        invoke.__name__ = f"{manifest.package_name}_{manifest.action_id}"
+        return invoke
+
+
+CONFLICT_POLICIES = ("overwrite", "skip", "fail", "ask")
+WRITE_ACCESS = ("write", "read_write")
 
 
 def _parse_mappings(raw: dict) -> dict:
-    return {
-        name: MappingSlot(
+    mappings = {}
+    for name, spec in raw.items():
+        access = spec.get("access", "read")
+        policy = spec.get("conflict_policy")
+        # Design 3.3: conflict policy is a MANDATORY per-write-mapping declaration with no
+        # default. Refusing the package at load time is the only way that stays true — a
+        # default applied quietly here would be exactly the silent choice the rule forbids.
+        if access in WRITE_ACCESS and policy is None:
+            raise ValueError(
+                f"mapping '{name}' has access='{access}' but declares no conflict_policy; "
+                f"one of {', '.join(CONFLICT_POLICIES)} is required")
+        if policy is not None and policy not in CONFLICT_POLICIES:
+            raise ValueError(
+                f"mapping '{name}': invalid conflict_policy '{policy}' "
+                f"(expected one of {', '.join(CONFLICT_POLICIES)})")
+        mappings[name] = MappingSlot(
             name=name,
             kind=spec.get("kind", "tag"),
             tag_type=spec.get("tag_type"),
             registry_type=spec.get("registry_type"),
-            access=spec.get("access", "read"),
+            access=access,
             cardinality=spec.get("cardinality", "one"),
             required=spec.get("required", True),
             likely_name=spec.get("likely_name"),
             description=spec.get("description", ""),
+            conflict_policy=policy,
         )
-        for name, spec in raw.items()
-    }
+    return mappings
 
 
 def _parse_config(raw: dict) -> dict:
@@ -187,11 +233,3 @@ def _parse_config(raw: dict) -> dict:
     }
 
 
-def _import_module_from_path(file_path, module_name):
-    file_path = Path(file_path)
-    if not file_path.is_file():
-        raise FileNotFoundError(f"Action file not found: {file_path}")
-    spec = importlib.util.spec_from_file_location(module_name, file_path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module

@@ -13,6 +13,16 @@ writes are plain UTF-8 text within the instance root; paths are stored relative 
 from pathlib import Path
 
 
+class FileOwnershipError(Exception):
+    """An action tried to write a file the user owns (design 6.1).
+
+    The open-world engine does not negotiate: user-owned files are **hard-blocked**, not
+    resolved by policy. The write raises, which fails the step and discards everything it
+    staged — a clean stop the user can fix by releasing ownership, rather than a partially
+    applied action that silently skipped a file it believed it had written.
+    """
+
+
 class FileStore:
     """Reads/writes files under the instance root and tracks whole-file ownership.
 
@@ -48,6 +58,45 @@ class FileStore:
         if not row:
             return None  # untouched — no ownership record
         return {"kind": row["owner_kind"], "action_ref": row["owner_action_ref"]}
+
+    @property
+    def root(self) -> Path:
+        return self._root
+
+    def all_ownership(self) -> dict:
+        """Every ownership record, keyed by path. The file browser needs the whole set at
+        once — asking per file while walking a tree of thousands would be absurd."""
+        return {
+            row["path"]: {"kind": row["owner_kind"], "action_ref": row["owner_action_ref"]}
+            for row in self._db.fetch_all(
+                "SELECT path, owner_kind, owner_action_ref FROM file_ownership")
+        }
+
+    # --- ownership without writing (design 6.1) ---
+    # §6.1 allows a file to become user-owned "either manually in the Text Editor or
+    # through an explicit claim". These are that explicit path: they move a file between
+    # untouched / user-owned / action-owned without touching its bytes.
+
+    def claim(self, rel_path: str, *, owner: str = "user", owner_action_ref: str = None):
+        """Record ownership of a file without modifying it."""
+        if owner not in ("user", "action"):
+            raise ValueError(f"Invalid owner: '{owner}'")
+        if owner == "action" and not owner_action_ref:
+            raise ValueError("Action ownership requires an owner_action_ref")
+        self._abs(rel_path)      # keep the escape check honest even when not writing
+        self._db.execute(
+            """INSERT INTO file_ownership (path, owner_kind, owner_action_ref)
+               VALUES (?, ?, ?)
+                   ON CONFLICT(path) DO UPDATE SET
+                       owner_kind = excluded.owner_kind,
+                       owner_action_ref = excluded.owner_action_ref""",
+            (rel_path, owner, owner_action_ref),
+        )
+
+    def release(self, rel_path: str):
+        """Drop the ownership record, returning the file to **untouched** — anyone may
+        claim it again. The file on disk is untouched; only the claim goes away."""
+        self._db.execute("DELETE FROM file_ownership WHERE path = ?", (rel_path,))
 
     # --- write (called at commit; captures prior bytes for store-by-path rollback) ---
 
@@ -118,6 +167,15 @@ class FileStaging:
         self.snapshots = {}  # rel_path -> prior content (or None), populated at commit
 
     def write(self, rel_path, content, *, owner, owner_action_ref=None, file_must_exist=False):
+        # Hard-block user-owned files (design 6.1) at STAGING time rather than commit, so
+        # the failure points at the line that attempted it instead of surfacing later.
+        if owner == "action":
+            current = self._store.ownership(rel_path)
+            if current is not None and current["kind"] == "user":
+                raise FileOwnershipError(
+                    f"'{rel_path}' is owned by you — actions are blocked from writing it. "
+                    f"Release ownership in the Files panel to let '{owner_action_ref}' "
+                    f"write it.")
         self._pending[rel_path] = {
             "content": content, "owner": owner, "owner_action_ref": owner_action_ref,
             "file_must_exist": file_must_exist,

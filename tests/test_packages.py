@@ -15,7 +15,7 @@ description = "a demo package"
 
 [[actions]]
 id = "mark_queued"
-file = "actions.py"
+file = "actions.star"
 function = "mark_queued"
 name = "Mark Queued"
 description = "marks remove items as queued"
@@ -36,7 +36,7 @@ type = "string"
 default = "minecraft:item"
 """
 
-ACTION_PY = '''
+ACTION_STAR = '''
 def mark_queued(pack):
     reg = pack.step.config.get("registry_type", "minecraft:item")
     for eid in pack.tags.query(reg, pack.step.mappings["source"], True):
@@ -58,7 +58,7 @@ def package_root(tmp_path):
     pkg = tmp_path / "packages" / "demo_suite"
     pkg.mkdir(parents=True)
     (pkg / "manifest.toml").write_text(MANIFEST, encoding="utf-8")
-    (pkg / "actions.py").write_text(ACTION_PY, encoding="utf-8")
+    (pkg / "actions.star").write_text(ACTION_STAR, encoding="utf-8")
     return tmp_path / "packages"
 
 
@@ -68,7 +68,7 @@ def test_load_package_parses_manifest(package_root):
     assert len(pkg.actions) == 1
     a = pkg.actions[0]
     assert a.ref == "demo_suite:mark_queued"
-    assert a.file == "actions.py" and a.function == "mark_queued"
+    assert a.file == "actions.star" and a.function == "mark_queued"
     assert a.name == "Mark Queued"
     # mappings + config are parsed into typed slots
     assert a.mappings["source"].tag_type == "bool"
@@ -146,3 +146,37 @@ def test_scan_ignores_non_package_dirs(tmp_path):
     (tmp_path / "packages" / "loose.txt").write_text("x", encoding="utf-8")
     index = PackageIndex(tmp_path / "packages")
     assert index.actions == {}
+
+
+# --- provenance (design 3.3.1) ---------------------------------------------
+# "Purely a provenance label — structurally, authored and downloaded packages are
+# identical." It governs EDITABILITY, not behaviour: you may edit what you wrote, not
+# what you installed (design 6.3).
+
+def test_packages_are_authored_unless_they_say_otherwise(package_root):
+    pkg = load_package(package_root / "demo_suite")
+    assert pkg.provenance == "authored"
+
+
+def test_downloaded_provenance_is_parsed(tmp_path):
+    pkg = tmp_path / "vendored"
+    pkg.mkdir()
+    (pkg / "manifest.toml").write_text(
+        '[package]\nname = "vendored"\nprovenance = "downloaded"\n', encoding="utf-8")
+    assert load_package(pkg).provenance == "downloaded"
+
+
+def test_unknown_provenance_is_rejected(tmp_path):
+    pkg = tmp_path / "weird"
+    pkg.mkdir()
+    (pkg / "manifest.toml").write_text(
+        '[package]\nname = "weird"\nprovenance = "borrowed"\n', encoding="utf-8")
+    with pytest.raises(ValueError, match="provenance"):
+        load_package(pkg)
+
+
+def test_index_exposes_packages_by_name(package_root):
+    index = PackageIndex(package_root)
+    assert index.package("demo_suite").name == "demo_suite"
+    assert index.package("nope") is None
+    assert "demo_suite" in index.packages

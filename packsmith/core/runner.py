@@ -8,8 +8,8 @@ builds a fresh per-step staging buffer and a `pack`, calls the action, and then:
   * any other exception  -> discard the staging, report it as a failure
 
 Resolving an `action_ref` to a callable lives in `packages.PackageIndex.load_callable`
-(the one Python-specific seam — importlib now, Starlark later). The runner takes an
-already-loaded callable, so it's unchanged by that swap.
+(the one language-specific seam — it returns a closure that evaluates the action's
+Starlark). The runner takes an already-loaded callable, so it never sees the language.
 """
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -38,7 +38,8 @@ def _now() -> str:
 
 
 def run_action(action_fn, *, tag_store, packdump, action_ref,
-               mappings=None, config=None, file_store=None, history=None) -> StepResult:
+               mappings=None, config=None, file_store=None, history=None,
+               history_context=None, conflict_policies=None) -> StepResult:
     """Run a single action callable through the staging lifecycle. Returns a
     StepResult; never raises for a failing action — failures are captured.
 
@@ -50,7 +51,8 @@ def run_action(action_fn, *, tag_store, packdump, action_ref,
     l2 = L2Staging(tag_store)
     files = FileStaging(file_store) if file_store is not None else None
     pack = Pack(staging=l2, file_staging=files, tag_store=tag_store, packdump=packdump,
-                action_ref=action_ref, mappings=mappings, config=config)
+                action_ref=action_ref, mappings=mappings, config=config,
+                conflict_policies=conflict_policies)
 
     def _discard():
         l2.discard()
@@ -88,5 +90,6 @@ def run_action(action_fn, *, tag_store, packdump, action_ref,
             action_ref=action_ref, status=status, reason=reason,
             started_at=started_at, finished_at=_now(),
             rollback_data=rollback_data, log_output=pack.log_lines,
+            **(history_context or {}),
         )
     return StepResult(action_ref, status, reason=reason, log_lines=pack.log_lines, run_id=run_id)

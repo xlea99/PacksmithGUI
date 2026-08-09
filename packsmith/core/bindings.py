@@ -60,6 +60,21 @@ def resolve_step(manifest, *, bindings: dict, config: dict, tag_store):
     return resolved_mappings, resolved_config
 
 
+def conflict_policies_for(manifest, mappings: dict) -> dict:
+    """Map each bound tag name to the conflict policy its slot declared (design 3.3).
+
+    The runtime enforces policy per *tag*, because that's what an action names when it
+    writes (``pack.tags.write(..., tag_name, ...)``), while the declaration lives on the
+    *slot*. This is the translation between the two.
+    """
+    policies = {}
+    for name, slot in manifest.mappings.items():
+        bound = mappings.get(name)
+        if bound and slot.conflict_policy:
+            policies[bound] = slot.conflict_policy
+    return policies
+
+
 def best_guess_bindings(manifest, tag_store) -> dict:
     """Suggest a binding per mapping slot from the user's existing tags: prefer an
     exact ``likely_name`` match that's type-compatible, else the first type-compatible

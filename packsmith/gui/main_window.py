@@ -1,8 +1,16 @@
+"""The main window — composes the shell (design 4.1) and hosts view tabs.
+
+Layout, per §4.1: a fixed icon strip pinned to the left edge, a resizable panel stack
+beside it, the workspace taking the bulk of the area, and a collapsible bottom panel
+whose bottom-most strip is the status bar. The window itself stays thin: it wires
+services to the shell and owns the actions that span tabs (run an action, author a view,
+undo/redo).
+"""
 from pathlib import Path
 
 from PySide6.QtWidgets import (
-    QMainWindow, QVBoxLayout, QWidget,
-    QLabel, QHBoxLayout, QHeaderView, QPushButton, QTabWidget
+    QMainWindow, QVBoxLayout, QHBoxLayout, QWidget, QLabel, QPushButton,
+    QHeaderView, QSplitter, QInputDialog, QMessageBox,
 )
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QShortcut, QKeySequence
@@ -11,7 +19,35 @@ from packsmith.core.profile import Profile, list_profiles
 from packsmith.core.packdump import import_packdump
 from packsmith.core.db import UserDB
 from packsmith.core.tags import TagStore
+from packsmith.core.runner import run_action
+from packsmith.core.packages import PackageIndex
+from packsmith.core.bindings import best_guess_bindings, resolve_step
+from packsmith.core.files import FileStore
+from packsmith.core.history import StepRunStore, JobRunStore
+from packsmith.core.views import ViewStore
+from packsmith.core.jobs import JobStore
+from packsmith.core.job_runner import run_job
+
 from packsmith.gui.demo_views import demo_views
+from packsmith.gui.queries import browse_query, tag_query
+from packsmith.gui.query_constructor import QueryConstructorDialog
+from packsmith.gui.tag_editor import TagCreateDialog, EnumValuesDialog
+from packsmith.gui.shell import style
+from packsmith.gui.shell.sidebar import Sidebar, PanelStack
+from packsmith.gui.shell.workspace import Workspace
+from packsmith.gui.shell.bottom_panel import BottomPanel
+from packsmith.gui.shell.bottom_views import JobResultsView, ErrorsView
+from packsmith.gui.shell.panels import PANEL_SPECS
+from packsmith.gui.shell.panels.base import StubPanel
+from packsmith.gui.shell.panels.registry_panel import RegistryPanel
+from packsmith.gui.shell.panels.views_panel import ViewsPanel
+from packsmith.gui.shell.panels.tags_panel import TagsPanel
+from packsmith.gui.shell.panels.jobs_panel import JobsPanel
+from packsmith.gui.shell.panels.files_panel import FilesPanel
+from packsmith.gui.editor.host import EditorHost, EditorTab
+from packsmith.gui.editor.sources import InstanceFileSource, PackageFileSource
+from packsmith.gui.shell.panels.actions_panel import ActionsPanel
+from packsmith.gui.job_editor import JobEditorTab
 from packsmith.gui.table.registry_table_model import RegistryTableModel
 from packsmith.gui.table.registry_sort_proxy import RegistrySortProxy
 from packsmith.gui.table.registry_table_view import RegistryTableView
@@ -19,12 +55,6 @@ from packsmith.gui.table.cells.bool_cell import BoolCellDelegate
 from packsmith.gui.table.cells.enum_cell import EnumCellDelegate
 from packsmith.gui.table.cells.num_cell import NumCellDelegate
 from packsmith.gui.table.cells.str_cell import StrCellDelegate
-from packsmith.gui.editor.editor_widget import MonacoEditor
-from packsmith.core.runner import run_action
-from packsmith.core.packages import PackageIndex
-from packsmith.core.bindings import best_guess_bindings, resolve_step
-from packsmith.core.files import FileStore
-from packsmith.core.history import StepRunStore
 
 _DELEGATES = {
     "bool": BoolCellDelegate,
@@ -41,115 +71,285 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("PackSmith")
         self.setMinimumSize(1200, 700)
 
-        # Load data — TEMP: hardcoded dev profile against a small dedicated test pack.
-        # (Real profile create/switch UI is a later slice.)
-        _PROFILE = "packsmith_test"
-        if _PROFILE not in list_profiles():
+        self._load_profile()
+        self._seed_tags()
+        self._seed_views()
+        self._seed_jobs()
+
+        self._tab_models = {}     # tab widget -> RegistryTableModel
+        self._tab_views = {}      # tab widget -> the saved View it renders (if any)
+        self._open_tabs = {}      # open-key -> tab widget (so we focus, not duplicate)
+        self._delegates = []      # keep delegate refs alive
+
+        self._build_menu_bar()
+        self._build_shell()
+
+        items = len(self._packdump.registry.get("minecraft:item", {}).get("values", []))
+        self._bottom.set_status(f"{items} items in minecraft:item")
+
+    # --- services ----------------------------------------------------------
+
+    def _load_profile(self):
+        # TEMP: hardcoded dev profile against a small dedicated test pack.
+        # (Real profile create/switch UI is a later slice — the Profiles menu.)
+        name = "packsmith_test"
+        if name not in list_profiles():
             self._profile = Profile.create(
-                _PROFILE,
+                name,
                 mc_path=r"C:\Users\timbe\curseforge\minecraft\Instances\Packsmith Test",
                 loader="forge", loader_version="47.4.10", mc_version="1.20.1",
             )
         else:
-            self._profile = Profile.load(_PROFILE)
+            self._profile = Profile.load(name)
         self._packdump = import_packdump(self._profile)
         self._db = UserDB(self._profile.root / "profile.db")
         self._tags = TagStore(self._db)
-
-        # Layer 3 services: installed action packages, the real file store (writes to
-        # the actual instance on disk), and run history.
         self._packages = PackageIndex(self._profile.packages_dir)
         self._file_store = FileStore(self._db, self._profile.mc_path)
         self._history = StepRunStore(self._db)
+        self._job_history = JobRunStore(self._db)
+        self._views = ViewStore(self._db)
+        self._jobs = JobStore(self._db)
 
-        # TEMP dev seed: ensure a few tags exist to work with (idempotent).
-        self._seed_tags()
+    # --- shell -------------------------------------------------------------
 
-        # Per-tab query models (for undo/redo + refresh coordination)
-        self._tab_models = {}     # tab widget -> RegistryTableModel
-        self._all_models = []     # every query model, for reevaluate-all
-        self._delegates = []      # keep delegate refs alive
-
-        # Build UI
+    def _build_shell(self):
         central = QWidget()
         self.setCentralWidget(central)
-        main_layout = QVBoxLayout(central)
-        main_layout.setContentsMargins(8, 8, 8, 8)
-        main_layout.setSpacing(6)
+        root = QVBoxLayout(central)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
 
-        # Header bar
-        header = QHBoxLayout()
-        profile_label = QLabel(f"Profile: {self._profile.name}")
-        profile_label.setStyleSheet("font-size: 14px; font-weight: bold; color: #d0d0d0;")
+        root.addWidget(self._build_header())
 
-        mods_count = len(self._packdump.mods)
-        info_label = QLabel(f"{self._packdump.mc_version}  {self._profile.loader}  {self._profile.loader_version}  |  {mods_count} mods")
-        info_label.setStyleSheet("font-size: 12px; color: #888888;")
+        content = QHBoxLayout()
+        content.setContentsMargins(0, 0, 0, 0)
+        content.setSpacing(0)
 
-        # Run the REAL removal action — syncs remove-tagged items into the actual
-        # item_obliterator.json5 on disk, then refreshes every view.
-        obliterate_btn = QPushButton("▶  Run: removal:obliterate")
-        obliterate_btn.setFixedHeight(24)
-        obliterate_btn.setStyleSheet("""
-            QPushButton {
-                background-color: #3a2020; color: #d07070;
-                border: 1px solid #c05050; padding: 2px 12px;
-                font-size: 12px; font-weight: bold;
-            }
-            QPushButton:hover { background-color: #4a2828; }
-        """)
-        obliterate_btn.clicked.connect(self._run_removal)
+        # Icon strip: fixed furniture at the window edge, always visible.
+        self._sidebar = Sidebar()
+        self._sidebar.panel_selected.connect(self._show_panel)
+        self._sidebar.collapsed.connect(self._collapse_panel)
+        content.addWidget(self._sidebar)
 
-        header.addWidget(profile_label)
-        header.addStretch()
-        header.addWidget(info_label)
-        header.addWidget(obliterate_btn)
-        main_layout.addLayout(header)
+        # Three panels are live on backend we already have; the rest are honest stubs.
+        self._views_panel = ViewsPanel(self._views.all())
+        self._views_panel.view_activated.connect(self._open_view)
+        self._views_panel.new_view_requested.connect(self._new_view)
+        self._views_panel.rename_requested.connect(self._rename_view)
+        self._views_panel.delete_requested.connect(self._delete_view)
 
-        # Tab widget
-        self._tabs = QTabWidget()
-        self._tabs.setStyleSheet("""
-            QTabWidget::pane { border: 1px solid #3a3a3a; }
-            QTabBar::tab {
-                background: #2d2d2d; color: #888888;
-                border: 1px solid #3a3a3a; padding: 6px 16px;
-            }
-            QTabBar::tab:selected {
-                background: #1e1e1e; color: #d0d0d0;
-                border-bottom: 1px solid #1e1e1e;
-            }
-        """)
-        main_layout.addWidget(self._tabs)
+        self._registry_panel = RegistryPanel(self._packdump)
+        self._registry_panel.registry_activated.connect(self._open_browse)
 
-        # --- one tab per demo View (each is a raw query, rendered) ---
-        for title, query in demo_views():
-            self._tabs.addTab(self._build_view_tab(query), title)
+        self._tags_panel = TagsPanel(self._tags)
+        self._tags_panel.tag_activated.connect(self._open_tag_view)
+        self._tags_panel.new_tag_requested.connect(self._new_tag)
+        self._tags_panel.delete_tag_requested.connect(self._delete_tag)
+        self._tags_panel.edit_values_requested.connect(self._edit_enum_values)
 
-        # --- Editor tab ---
-        editor_tab = QWidget()
-        editor_layout = QVBoxLayout(editor_tab)
-        editor_layout.setContentsMargins(0, 0, 0, 0)
-        self._editor = MonacoEditor()
-        editor_layout.addWidget(self._editor)
-        self._tabs.addTab(editor_tab, "Editor")
+        self._jobs_panel = JobsPanel(self._jobs.all())
+        self._jobs_panel.job_activated.connect(self._open_job_editor)
+        self._jobs_panel.run_requested.connect(self._run_job)
+        self._jobs_panel.new_job_requested.connect(self._new_job)
+        self._jobs_panel.rename_requested.connect(self._rename_job)
+        self._jobs_panel.delete_requested.connect(self._delete_job)
+        self._jobs_panel.pin_toggled.connect(self._toggle_pin)
 
-        test_file = Path(__file__).resolve().parent.parent.parent / "hehe.py"
-        if test_file.exists():
-            self._editor.load_file(str(test_file))
+        self._files_panel = FilesPanel(self._file_store)
+        self._files_panel.ownership_changed.connect(self._set_status)
+        self._files_panel.file_activated.connect(self._open_file)
 
-        # Undo / Redo — dispatch to whichever query tab is active.
+        self._actions_panel = ActionsPanel(self._packages)
+        self._actions_panel.document_activated.connect(self._open_package_document)
+
+        live = {
+            "views": self._views_panel,
+            "registry": self._registry_panel,
+            "tags": self._tags_panel,
+            "jobs": self._jobs_panel,
+            "files": self._files_panel,
+            "actions": self._actions_panel,
+        }
+        panels = {
+            spec.key: live.get(spec.key) or StubPanel(spec.title, spec.description)
+            for spec in PANEL_SPECS
+        }
+        # How each live panel reloads itself from its store (see _show_panel).
+        self._panel_reloaders = {
+            "views": self._reload_views,
+            "jobs": self._reload_jobs,
+            "tags": self._tags_panel.refresh,
+            "files": self._files_panel.refresh,
+            "registry": self._registry_panel.refresh,
+            "actions": self._actions_panel.refresh,
+        }
+
+        self._panel_stack = PanelStack(panels)
+        self._panel_stack.setMinimumWidth(160)
+
+        self._workspace = Workspace()
+        self._workspace.tab_closed.connect(self._on_tab_closed)
+        self._workspace.tab_activated.connect(self._on_tab_activated)
+        self._workspace.close_guard = self._may_close_tab
+
+        # One Monaco for every editor tab (design 4.2 — measured: per-tab views cost a
+        # Chromium process and ~119MB each).
+        self._editor_host = EditorHost(
+            {
+                # Instance files answer to §6.1 ownership; package sources answer to
+                # provenance. Different worlds, deliberately different rules.
+                "instance": InstanceFileSource(self._file_store, on_claim=self._on_file_claimed),
+                "package": PackageFileSource(self._packages, self._profile.packages_dir),
+            },
+            container=self)
+        self._editor_host.dirty_changed.connect(self._on_editor_dirty)
+        self._editor_host.file_saved.connect(self._on_document_saved)
+        self._editor_host.save_failed.connect(
+            lambda key, why: QMessageBox.warning(self, "Couldn't save", f"{key}\n\n{why}"))
+        self._editor_host.edit_blocked.connect(self._offer_unlock)
+        self._editor_host.unlocked.connect(self._on_unlocked)
+
+        self._bottom = BottomPanel()
+        results = JobResultsView(self._history, self._job_history,
+                                 tag_store=self._tags, file_store=self._file_store)
+        results.rolled_back.connect(self._on_rolled_back)
+        self._bottom.set_panel("job_results", results)
+        errors = ErrorsView(self._tags, self._packdump)
+        errors.resolved.connect(self._on_orphans_resolved)
+        self._bottom.set_panel("errors", errors)
+
+        vertical = QSplitter(Qt.Vertical)
+        vertical.addWidget(self._workspace)
+        vertical.addWidget(self._bottom)
+        vertical.setStretchFactor(0, 1)
+        vertical.setStretchFactor(1, 0)
+        vertical.setCollapsible(1, False)
+        vertical.setSizes([1000, self._bottom.collapsed_height()])
+
+        horizontal = QSplitter(Qt.Horizontal)
+        horizontal.addWidget(self._panel_stack)
+        horizontal.addWidget(vertical)
+        horizontal.setStretchFactor(0, 0)
+        horizontal.setStretchFactor(1, 1)
+        horizontal.setSizes([style.SIDEBAR_PANEL_WIDTH, 1000])
+        self._h_split = horizontal
+
+        content.addWidget(horizontal)
+        root.addLayout(content)
+
+        self._sidebar.select("views")
+
         QShortcut(QKeySequence.Undo, self).activated.connect(self._undo)
         QShortcut(QKeySequence.Redo, self).activated.connect(self._redo)
+        QShortcut(QKeySequence("Ctrl+`"), self).activated.connect(self._bottom.toggle)
 
-        # Status bar
-        items_count = len(self._packdump.registry.get("minecraft:item", {}).get("values", []))
-        self.statusBar().showMessage(f"Loaded {items_count} items from minecraft:item")
-        self.statusBar().setStyleSheet("color: #888888;")
+    def _build_header(self) -> QWidget:
+        header = QWidget()
+        header.setStyleSheet(
+            f"background: {style.BG_PANEL}; border-bottom: 1px solid {style.BORDER};")
+        lay = QHBoxLayout(header)
+        lay.setContentsMargins(10, 6, 10, 6)
 
-    def _build_view_tab(self, query) -> QWidget:
-        """Build one tab that renders a query: model -> sort proxy -> table, with
-        type-aware cell delegates and per-tag edit-mode toggles."""
-        model = RegistryTableModel(query, self._packdump, self._tags)
+        name = QLabel(f"{self._profile.name}")
+        name.setStyleSheet(f"font-size: 14px; font-weight: bold; color: {style.TEXT};")
+
+        info = QLabel(
+            f"{self._packdump.mc_version}  {self._profile.loader} "
+            f"{self._profile.loader_version}  |  {len(self._packdump.mods)} mods")
+        info.setStyleSheet(f"font-size: 12px; color: {style.TEXT_MUTED};")
+
+        lay.addWidget(name)
+        lay.addStretch()
+        lay.addWidget(info)
+        return header
+
+    def _set_status(self, message):
+        """Bound indirection: panels are built before the bottom panel exists, so they
+        connect here rather than straight to it."""
+        self._bottom.set_status(message)
+
+    def _show_panel(self, key):
+        # Reload from source on the way in. A panel that only refreshes when it *itself*
+        # changes something goes stale behind your back — an action run claims a file, or
+        # something outside PackSmith edits the instance, and the panel keeps showing the
+        # world as it was when you last looked at it.
+        reload_panel = self._panel_reloaders.get(key)
+        if reload_panel is not None:
+            reload_panel()
+        self._panel_stack.show_panel(key)
+        if self._h_split.sizes()[0] == 0:
+            self._h_split.setSizes([style.SIDEBAR_PANEL_WIDTH, 1000])
+
+    def _collapse_panel(self):
+        self._panel_stack.hide()
+
+    # --- menu bar ----------------------------------------------------------
+
+    def _build_menu_bar(self):
+        """Mostly placeholders for the eventual shell (§4.1). Live today: New View,
+        opening a demo view, undo/redo, and the window toggles."""
+        bar = self.menuBar()
+
+        file_menu = bar.addMenu("File")
+        for label in ("New Profile…", "Open Profile…", "Import Packdump…"):
+            file_menu.addAction(label).setEnabled(False)
+        file_menu.addSeparator()
+        file_menu.addAction("Exit", self.close)
+
+        edit_menu = bar.addMenu("Edit")
+        edit_menu.addAction("Undo", self._undo)
+        edit_menu.addAction("Redo", self._redo)
+
+        window_menu = bar.addMenu("Window")
+        window_menu.addAction("Toggle Bottom Panel\tCtrl+`", lambda: self._bottom.toggle())
+
+        views_menu = bar.addMenu("Views")
+        views_menu.addAction("New View…", self._new_view)
+        views_menu.addSeparator()
+        for label in ("Manage Views…", "Import View…"):
+            views_menu.addAction(label).setEnabled(False)
+
+        profiles_menu = bar.addMenu("Profiles")
+        profiles_menu.addAction("Switch Profile…").setEnabled(False)
+
+        help_menu = bar.addMenu("Help")
+        help_menu.addAction("About PackSmith").setEnabled(False)
+
+    # --- view tabs ---------------------------------------------------------
+
+    def _open_tab_for(self, key, title, query, view=None):
+        """Open a query as a tab — or focus it if that same thing is already open, so
+        clicking around the sidebar doesn't pile up duplicate tabs."""
+        existing = self._open_tabs.get(key)
+        if existing is not None and self._workspace.focus_widget(existing):
+            return existing
+        tab = self._build_view_tab(query, view=view)
+        self._workspace.add_tab(tab, title)
+        self._open_tabs[key] = tab
+        self._bottom.set_status(f"{title} — {self._tab_models[tab].rowCount():,} rows")
+        return tab
+
+    def _open_view(self, view):
+        """Open a saved View (from the Views panel). The tab remembers which View it
+        renders, so constructor edits can be written back to it."""
+        return self._open_tab_for(("view", view.id), view.name, view.query, view=view)
+
+    def _open_browse(self, registry_type):
+        """Open a zero-tag browse table for a registry type (from the Registry panel)."""
+        return self._open_tab_for(("browse", registry_type), registry_type,
+                                  browse_query(registry_type))
+
+    def _open_tag_view(self, registry_type, tag_name):
+        """Open a minimal one-tag view (the Tags panel quick-action)."""
+        return self._open_tab_for(("tag", registry_type, tag_name), tag_name,
+                                  tag_query(registry_type, tag_name))
+
+    def _build_view_tab(self, query, view=None) -> QWidget:
+        """One tab rendering a query: model -> sort proxy -> table, with type-aware cell
+        delegates and per-tag edit-mode toggles."""
+        model = RegistryTableModel(query, self._packdump, self._tags,
+                                   confirm_takeover=self._confirm_tag_takeover)
         proxy = RegistrySortProxy()
         proxy.setSourceModel(model)
 
@@ -161,20 +361,20 @@ class MainWindow(QMainWindow):
         table.setSortingEnabled(True)
         table.sortByColumn(0, Qt.AscendingOrder)
 
-        # Row numbers
         vh = table.verticalHeader()
         vh.setDefaultSectionSize(24)
         vh.setSectionsClickable(True)
         vh.setDefaultAlignment(Qt.AlignCenter)
-        vh.setStyleSheet("""
-            QHeaderView::section {
-                background-color: #252525; color: #666666;
-                border: 1px solid #3a3a3a; padding: 0 6px; font-size: 11px;
-            }
-            QHeaderView::section:checked { background-color: #3a5070; color: #d0d0d0; }
+        vh.setStyleSheet(f"""
+            QHeaderView::section {{
+                background-color: {style.BG_PANEL}; color: {style.TEXT_FAINT};
+                border: 1px solid {style.BORDER}; padding: 0 6px; font-size: 11px;
+            }}
+            QHeaderView::section:checked {{
+                background-color: {style.ACCENT}; color: {style.TEXT};
+            }}
         """)
 
-        # Column sizing + delegates, keyed off each column's kind
         h = table.horizontalHeader()
         for col in range(model.columnCount()):
             h.setSectionResizeMode(col, QHeaderView.Interactive)
@@ -191,47 +391,327 @@ class MainWindow(QMainWindow):
                 table.setColumnWidth(col, 240)
         h.setStretchLastSection(True)
 
-        # Container: edit-toggle bar (only for tag columns) + the table
         tab = QWidget()
         layout = QVBoxLayout(tab)
         layout.setContentsMargins(4, 4, 4, 4)
         layout.setSpacing(6)
 
+        control_row = QHBoxLayout()
+
+        # ⚙ — edit this view's query. The query is the view's stable identity, so editing
+        # it is a deliberate act behind the gear, not an always-on filter bar.
+        gear = QPushButton("⚙")
+        gear.setFixedSize(28, 24)
+        gear.setToolTip("Edit this view's query")
+        gear.setStyleSheet(f"""
+            QPushButton {{
+                background-color: {style.BG_CHROME}; color: #b0b0b0;
+                border: 1px solid {style.BORDER}; font-size: 14px;
+            }}
+            QPushButton:hover {{ background-color: {style.BORDER}; color: {style.TEXT}; }}
+        """)
+        gear.clicked.connect(lambda _=False, t=tab: self._edit_view_query(t))
+        control_row.addWidget(gear)
+
         tag_cols = [c for c in range(model.columnCount()) if model.is_tag_column(c)]
         if tag_cols:
-            edit_bar = QHBoxLayout()
-            edit_bar.addWidget(QLabel("Edit:"))
+            control_row.addSpacing(8)
+            control_row.addWidget(QLabel("Edit:"))
             for col in tag_cols:
                 btn = QPushButton(model.column_tag_name(col))
                 btn.setCheckable(True)
                 btn.setFixedHeight(24)
-                btn.setStyleSheet("""
-                    QPushButton {
-                        background-color: #2d2d2d; color: #888888;
-                        border: 1px solid #3a3a3a; padding: 2px 10px; font-size: 12px;
-                    }
-                    QPushButton:checked {
-                        background-color: #3a5070; color: #d0d0d0; border: 1px solid #5080b0;
-                    }
+                btn.setStyleSheet(f"""
+                    QPushButton {{
+                        background-color: {style.BG_CHROME}; color: {style.TEXT_MUTED};
+                        border: 1px solid {style.BORDER}; padding: 2px 10px; font-size: 12px;
+                    }}
+                    QPushButton:checked {{
+                        background-color: {style.ACCENT}; color: {style.TEXT};
+                        border: 1px solid {style.ACCENT_EDGE};
+                    }}
                 """)
                 btn.toggled.connect(
                     lambda checked, m=model, t=table, c=col: self._toggle_edit_mode(m, t, c, checked))
-                edit_bar.addWidget(btn)
-            edit_bar.addStretch()
-            layout.addLayout(edit_bar)
-
+                control_row.addWidget(btn)
+        control_row.addStretch()
+        layout.addLayout(control_row)
         layout.addWidget(table)
 
         self._tab_models[tab] = model
-        self._all_models.append(model)
+        if view is not None:
+            self._tab_views[tab] = view
         return tab
+
+    # --- text editor (design 6.3) ------------------------------------------
+
+    def _open_file(self, rel_path):
+        """A file from the Files panel — an instance file, governed by ownership."""
+        return self._open_document("instance", rel_path)
+
+    def _open_package_document(self, path):
+        """A package source or manifest from the Actions panel — governed by provenance.
+        These deliberately never appear in the Files panel: they're PackSmith's own
+        userdata, not game files."""
+        return self._open_document("package", path)
+
+    def _open_document(self, source, path):
+        key = self._editor_host.key_for(source, path)
+        existing = self._open_tabs.get(("doc", key))
+        if existing is not None and self._workspace.focus_widget(existing):
+            return existing
+        tab = EditorTab(self._editor_host, source, path)
+        tab.unlock_requested.connect(self._request_unlock)
+        self._workspace.add_tab(tab, Path(path).name)
+        self._open_tabs[("doc", key)] = tab
+        tab.activate()
+        return tab
+
+    def _request_unlock(self, key):
+        reason = self._editor_host.lock_reason(key)
+        if reason:
+            self._offer_unlock(key, reason)
+
+    def _offer_unlock(self, key, reason):
+        """The Rust move (design 6.1): the destructive act stays available, but you have to
+        name it. Fires the instant they type into a locked buffer, so the consequence lands
+        beside the intent instead of days later when the job fails."""
+        source, path = self._editor_host.split_key(key)
+        if not self._editor_host.can_unlock(key):
+            # Nothing to release — a downloaded package isn't locked by a claim, it's
+            # locked by what it *is*. Editing it would silently fork upstream.
+            QMessageBox.information(
+                self, "Read-only", f"{path}\n\nThis document is {reason} and can't be "
+                                   f"edited here.")
+            return
+        if QMessageBox.question(
+                self, "Take ownership",
+                f"{path}\n\nThis file is {reason}.\n\n"
+                f"Taking ownership lets you edit it, and blocks that action from writing "
+                f"it until you release it again in the Files panel.\n\nTake ownership?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
+            return
+        self._editor_host.unlock(key)
+
+    def _on_unlocked(self, key):
+        tab = self._open_tabs.get(("doc", key))
+        if tab is not None:
+            tab.sync_lock()
+        self._files_panel.refresh()
+        self._set_status(f"You now own {self._editor_host.split_key(key)[1]}")
+
+    def _on_file_claimed(self, rel_path):
+        self._set_status(f"You now own {rel_path} — actions are blocked from writing it.")
+
+    def _on_tab_activated(self, widget):
+        """Hand the shared web view to whichever editor tab is now in front."""
+        if isinstance(widget, EditorTab):
+            widget.activate()
+
+    def _on_editor_dirty(self, key, is_dirty):
+        tab = self._open_tabs.get(("doc", key))
+        if tab is None:
+            return
+        tab.set_dirty(is_dirty)
+        name = Path(tab.path).name
+        self._workspace.set_tab_title(tab, f"● {name}" if is_dirty else name)
+
+    def _on_document_saved(self, key):
+        source, path = self._editor_host.split_key(key)
+        self._set_status(f"Saved {path}")
+        if source == "instance":
+            self._files_panel.refresh()      # the save may have claimed ownership
+
+    def _may_close_tab(self, widget) -> bool:
+        """Veto closing an editor tab with unsaved changes unless the user insists."""
+        if not isinstance(widget, EditorTab) or not widget.is_dirty:
+            return True
+        answer = QMessageBox.question(
+            self, "Unsaved changes",
+            f"{widget.path} has unsaved changes.\n\nSave before closing?",
+            QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel, QMessageBox.Save)
+        if answer == QMessageBox.Cancel:
+            return False
+        if answer == QMessageBox.Save:
+            self._editor_host.request_save(widget.key)
+        return True
+
+    def _on_tab_closed(self, widget):
+        """Closing a tab closes a *window onto* a View — the View itself lives in the
+        Views panel and is untouched."""
+        self._tab_models.pop(widget, None)
+        self._tab_views.pop(widget, None)
+        if isinstance(widget, EditorTab):
+            # Reclaim the shared view BEFORE the tab is destroyed, or it takes the editor
+            # with it as a child.
+            widget.detach()
+            self._editor_host.close_document(widget.key)
+        for key, tab in list(self._open_tabs.items()):
+            if tab is widget:
+                del self._open_tabs[key]
 
     def _toggle_edit_mode(self, model, table, col, enabled):
         model.set_editing(col, enabled)
         table.viewport().update()
 
+    def _edit_view_query(self, tab):
+        """Edit the query behind a tab. If the tab renders a saved View, the change is
+        persisted — editing the query IS editing the View."""
+        model = self._tab_models.get(tab)
+        if model is None:
+            return
+        dlg = QueryConstructorDialog(self._tags, model._registry_type,
+                                     query=model._query, parent=self)
+        if not dlg.exec():
+            return
+        model.set_filter(dlg.result_filter)
+        view = self._tab_views.get(tab)
+        if view is not None:
+            self._views.update_query(view.id, model._query)
+            self._reload_views()
+        self._bottom.set_status(f"{model.rowCount():,} rows")
+
+    def _new_view(self):
+        """Author a new View: saved to the database, filed in the Views panel, opened."""
+        dlg = QueryConstructorDialog(self._tags, "minecraft:item", new_view=True,
+                                     view_store=self._views, parent=self)
+        if not dlg.exec():
+            return
+        try:
+            view = self._views.create(dlg.result_name, dlg.result_query)
+        except ValueError as e:
+            QMessageBox.warning(self, "Can't save view", str(e))
+            return
+        self._reload_views()
+        self._open_view(view)
+
+    def _rename_view(self, view):
+        name, ok = QInputDialog.getText(self, "Rename View", "Name:", text=view.name)
+        if not ok or not name.strip():
+            return
+        try:
+            self._views.rename(view.id, name)
+        except ValueError as e:
+            QMessageBox.warning(self, "Can't rename view", str(e))
+            return
+        self._reload_views()
+        tab = self._open_tabs.get(("view", view.id))
+        if tab is not None:
+            self._workspace.set_tab_title(tab, name.strip())
+            self._tab_views[tab] = self._views.get(view.id)
+
+    def _delete_view(self, view):
+        """Delete is explicit and permanent — unlike closing a tab, which only closes a
+        window onto the View."""
+        confirm = QMessageBox.question(
+            self, "Delete View",
+            f"Delete the view '{view.name}'?\n\nThis removes the saved view itself, "
+            f"not just its tab.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if confirm != QMessageBox.Yes:
+            return
+        self._views.delete(view.id)
+        tab = self._open_tabs.get(("view", view.id))
+        if tab is not None:
+            idx = self._workspace._tabs.indexOf(tab)
+            if idx >= 0:
+                self._workspace._close_tab(idx)
+        self._reload_views()
+        self._bottom.set_status(f"Deleted view '{view.name}'")
+
+    def _reload_views(self):
+        self._views_panel.set_views(self._views.all())
+
+    # --- tags --------------------------------------------------------------
+
+    def _new_tag(self):
+        """Create a tag definition — the user's vocabulary (§3.2.1). Creation only:
+        rename and retype are governed by rules whose ceremony isn't built yet."""
+        registries = sorted(self._packdump.registry.keys())
+        dlg = TagCreateDialog(registries, tag_store=self._tags,
+                              preferred_registry="minecraft:item", parent=self)
+        if not dlg.exec():
+            return
+        try:
+            self._tags.define(dlg.result_registry, dlg.result_name, dlg.result_type,
+                              enum_values=dlg.result_enum_values, default=dlg.result_default)
+        except ValueError as e:
+            QMessageBox.warning(self, "Can't create tag", str(e))
+            return
+        self._tags_panel.refresh()
+        self._bottom.set_status(
+            f"Created tag '{dlg.result_name}' ({dlg.result_type}) on {dlg.result_registry}")
+
+    def _edit_enum_values(self, registry_type, tag_name):
+        """Add / remove / reorder an enum tag's values (§3.2.1). The dialog owns the
+        blast-radius confirmation; removed values leave orphans, not deleted data."""
+        dlg = EnumValuesDialog(self._tags, registry_type, tag_name, parent=self)
+        if not dlg.exec():
+            return
+        self._tags_panel.refresh()
+        self._refresh_after_tag_change()
+        values = self._tags.definition(registry_type, tag_name).get("values", [])
+        self._bottom.set_status(f"'{tag_name}' values: {', '.join(values)}")
+
+    def _confirm_tag_takeover(self, cells) -> bool:
+        """Design 3.2.1: taking a cell an action manages is loud. `cells` is
+        [(entry_id, tag_name, action_ref), ...] — confirmed once, however many."""
+        if len(cells) == 1:
+            entry_id, tag_name, action_ref = cells[0]
+            text = (f"'{tag_name}' on {entry_id} is managed by '{action_ref}'.\n\n"
+                    f"Taking ownership will prevent that action from updating it on "
+                    f"future runs.\n\nContinue?")
+        else:
+            refs = ", ".join(sorted({f"'{c[2]}'" for c in cells}))
+            text = (f"{len(cells)} of the cells you're editing are managed by {refs}.\n\n"
+                    f"Taking ownership will prevent those actions from updating them on "
+                    f"future runs.\n\nContinue?")
+        return QMessageBox.question(self, "Take ownership", text,
+                                    QMessageBox.Yes | QMessageBox.No,
+                                    QMessageBox.No) == QMessageBox.Yes
+
+    def _on_rolled_back(self):
+        self._bottom.set_status("Step rolled back")
+        self._refresh_after_run()      # rollback restores file ownership too
+
+    def _on_orphans_resolved(self):
+        """An orphan resolution changed assignments — refresh everything that reads them."""
+        self._refresh_after_tag_change()
+
+    def _refresh_after_tag_change(self):
+        for model in self._tab_models.values():
+            model.reevaluate()
+        self._bottom.refresh_panels()
+
+    def _refresh_after_run(self):
+        """An action run can touch both engines — L2 cells AND file ownership — so the
+        Files panel has to refresh too, not just the views and the bottom panels."""
+        self._refresh_after_tag_change()
+        self._files_panel.refresh()
+
+    def _delete_tag(self, registry_type, tag_name):
+        """Undefine a tag. §3.2.1: this cascades to every assignment, so the confirmation
+        names the count being destroyed."""
+        assigned = self._tags.query(
+            registry_type, filters=[{"tag": tag_name, "op": "exists"}])
+        detail = (f"\n\n{len(assigned)} assignment(s) will be permanently deleted."
+                  if assigned else "\n\nIt has no assignments.")
+        confirm = QMessageBox.question(
+            self, "Delete Tag",
+            f"Delete the tag '{tag_name}' on {registry_type}?{detail}",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if confirm != QMessageBox.Yes:
+            return
+        self._tags.undefine(registry_type, tag_name)
+        self._tags_panel.refresh()
+        # Any open view selecting that tag now has a stale column set — re-evaluate all.
+        for model in self._tab_models.values():
+            model.reevaluate()
+        self._bottom.refresh_panels()
+        self._bottom.set_status(f"Deleted tag '{tag_name}' and {len(assigned)} assignment(s)")
+
     def _active_model(self):
-        return self._tab_models.get(self._tabs.currentWidget())
+        return self._tab_models.get(self._workspace.current_widget())
 
     def _undo(self):
         model = self._active_model()
@@ -243,38 +723,106 @@ class MainWindow(QMainWindow):
         if model:
             model.redo()
 
-    # Runs the real removal:obliterate action against the actual instance file store —
-    # writes item_obliterator.json5 on disk, records the run to history — then re-runs
-    # every view's query so all tabs reflect the new state.
-    def _run_removal(self):
-        ref = "removal:obliterate"
-        try:
-            manifest = self._packages.get(ref)
-            fn = self._packages.load_callable(ref)
-        except (KeyError, AttributeError, FileNotFoundError) as e:
-            self.statusBar().showMessage(f"[{ref}] could not load: {e}")
-            return
-        guesses = best_guess_bindings(manifest, self._tags)
-        try:
-            mappings, config = resolve_step(manifest, bindings=guesses, config={}, tag_store=self._tags)
-        except ValueError as e:
-            self.statusBar().showMessage(f"[{ref}] binding error: {e}")
-            return
-        result = run_action(fn, tag_store=self._tags, packdump=self._packdump,
-                            action_ref=ref, mappings=mappings, config=config,
-                            file_store=self._file_store, history=self._history)
-        for model in self._all_models:
-            model.reevaluate()
-        msg = f"[{ref}] {result.status}"
-        if result.log_lines:
-            msg += " — " + result.log_lines[-1][1]
-        if result.reason:
-            msg += f" — {result.reason}"
-        self.statusBar().showMessage(msg)
+    # --- actions -----------------------------------------------------------
 
-    # TEMP dev seed — ensures a handful of tags exist to work with (idempotent). Real
-    # tag creation is a user action via the UI; this just gives the dev build columns.
+    def _open_job_editor(self, job):
+        """Open (or focus) a job's editor tab."""
+        key = ("job", job.id)
+        existing = self._open_tabs.get(key)
+        if existing is not None and self._workspace.focus_widget(existing):
+            return existing
+        tab = JobEditorTab(job, job_store=self._jobs, package_index=self._packages,
+                           tag_store=self._tags, parent=self)
+        tab.changed.connect(self._reload_jobs)
+        tab.run_requested.connect(self._run_job)
+        self._workspace.add_tab(tab, f"Job: {job.name}")
+        self._open_tabs[key] = tab
+        return tab
+
+    def _run_job(self, job):
+        """Execute a job: every step in order, each its own transaction (design 3.3.2)."""
+        job = self._jobs.get(job.id)
+        if job is None:
+            return
+        if not job.steps:
+            self._bottom.set_status(f"[{job.name}] has no steps")
+            return
+
+        self._bottom.log(f"=== running job '{job.name}' ===")
+        result = run_job(job, job_store=self._jobs, package_index=self._packages,
+                         tag_store=self._tags, packdump=self._packdump,
+                         file_store=self._file_store, history=self._history,
+                         job_history=self._job_history)
+
+        for step in result.step_results:
+            for level, message in step.log_lines:
+                self._bottom.log(f"  [{level}] {message}")
+            if not step.ok:
+                self._bottom.log(f"  [error] {step.action_ref}: {step.reason}")
+
+        summary = (f"[{job.name}] {result.status} — {len(result.step_results)} step(s) run"
+                   + (f", {result.not_run} not reached" if result.not_run else ""))
+        self._bottom.log(summary)
+        self._bottom.set_status(summary)
+        if result.status != "success":
+            self._bottom.expand(1)      # surface Job Results when something went wrong
+
+        self._refresh_after_run()
+
+    def _new_job(self):
+        name, ok = QInputDialog.getText(self, "New Job", "Name:")
+        if not ok or not name.strip():
+            return
+        try:
+            job = self._jobs.create(name)
+        except ValueError as e:
+            QMessageBox.warning(self, "Can't create job", str(e))
+            return
+        self._reload_jobs()
+        self._open_job_editor(job)
+
+    def _rename_job(self, job):
+        name, ok = QInputDialog.getText(self, "Rename Job", "Name:", text=job.name)
+        if not ok or not name.strip():
+            return
+        try:
+            self._jobs.rename(job.id, name)
+        except ValueError as e:
+            QMessageBox.warning(self, "Can't rename job", str(e))
+            return
+        self._reload_jobs()
+        tab = self._open_tabs.get(("job", job.id))
+        if tab is not None:
+            self._workspace.set_tab_title(tab, f"Job: {name.strip()}")
+            tab.refresh()
+
+    def _delete_job(self, job):
+        if QMessageBox.question(
+                self, "Delete Job",
+                f"Delete the job '{job.name}' and its {len(job.steps)} step(s)?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
+            return
+        self._jobs.delete(job.id)
+        tab = self._open_tabs.get(("job", job.id))
+        if tab is not None:
+            index = self._workspace._tabs.indexOf(tab)
+            if index >= 0:
+                self._workspace._close_tab(index)
+        self._reload_jobs()
+        self._bottom.set_status(f"Deleted job '{job.name}'")
+
+    def _toggle_pin(self, job):
+        self._jobs.set_pinned(job.id, not job.pinned)
+        self._reload_jobs()
+
+    def _reload_jobs(self):
+        self._jobs_panel.set_jobs(self._jobs.all())
+
+    # --- dev seed ----------------------------------------------------------
+
     def _seed_tags(self):
+        """TEMP dev seed — ensures a handful of tags exist to work with (idempotent).
+        Real tag creation is a user action via the Tags panel, which doesn't exist yet."""
         reg = "minecraft:item"
         if not self._tags.definition(reg, "tier"):
             self._tags.define(reg, "tier", "enum", ["early", "mid", "late", "oh my jesus christ wow"])
@@ -286,6 +834,28 @@ class MainWindow(QMainWindow):
             self._tags.define(reg, "weight", "number")
         if not self._tags.definition(reg, "remove"):
             self._tags.define(reg, "remove", "bool", default=False)
+
+    def _seed_jobs(self):
+        """A fresh profile gets a job for each installed action, best-guess bound — the
+        successor to the hardcoded run button. Like views, there are no built-in jobs,
+        only saved ones."""
+        if self._jobs.count:
+            return
+        for ref, manifest in sorted(self._packages.actions.items()):
+            try:
+                bindings = best_guess_bindings(manifest, self._tags)
+                job = self._jobs.create(manifest.name or ref)
+            except ValueError:
+                continue
+            self._jobs.add_action_step(job.id, ref, bindings=bindings)
+            self._jobs.set_pinned(job.id, True)
+
+    def _seed_views(self):
+        """A fresh profile ships with sensible default Views (§4.1). They're saved as
+        ordinary rows — there's no such thing as a built-in View, only saved ones."""
+        if self._views.count == 0:
+            for title, query in demo_views():
+                self._views.create(title, query)
 
     def closeEvent(self, event):
         self._db.close()

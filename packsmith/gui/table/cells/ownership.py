@@ -1,6 +1,7 @@
 from PySide6.QtCore import QRect
 from PySide6.QtGui import QColor
 
+from packsmith.gui.shell import style
 from packsmith.gui.table.registry_table_model import OwnershipRole
 
 # Per-cell ownership indicator: a subtle vertical bar on the cell's left edge
@@ -10,8 +11,8 @@ from packsmith.gui.table.registry_table_model import OwnershipRole
 #                   (matches the loud-transfer philosophy — action ownership is notable)
 #   pristine     -> no bar
 _OWNER_COLORS = {
-    "user": QColor("#4a5568"),
-    "action": QColor("#c8963c"),
+    "user": QColor(style.OWNER_USER),
+    "action": QColor(style.OWNER_ACTION),
 }
 
 _BAR_WIDTH = 3

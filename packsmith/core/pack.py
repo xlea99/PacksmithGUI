@@ -1,8 +1,8 @@
 """The ``pack`` object — the capability surface an action's code calls (design 7.x).
 
-For the MVP the action body is plain Python (the honest-gentleman rule), but this
-object is the real, durable host-side surface: identical whether the body is Python
-now or Starlark later. Every write routes through per-step staging (design 1.1) and
+Action bodies are Starlark (design 7.6), which cannot reach anything this object does
+not expose — the old honest-gentleman rule is now enforced by the language rather than
+trusted. Every write routes through per-step staging (design 1.1) and
 is stamped with the *calling action's own identity*, so ownership is correct by
 construction — an action cannot forge a different owner.
 
@@ -63,12 +63,19 @@ class _Tags:
     writes. Writes (``write``/``clear``) are staged and stamped with the calling
     action as owner. ``query`` reads the committed store; it does not yet reflect
     this step's own staged writes (fine for the common read-then-write pattern).
+
+    Writing a cell **someone else already owns** is a conflict, resolved by the action's
+    declared per-mapping conflict policy (design 3.3). Re-writing a cell this same action
+    already owns is not a conflict — an action is the authoritative producer of its own
+    state and is expected to re-assert it on every run.
     """
 
-    def __init__(self, staging, tag_store, action_ref):
+    def __init__(self, staging, tag_store, action_ref, conflict_policies=None, log=None):
         self._staging = staging
         self._store = tag_store
         self._action_ref = action_ref
+        self._policies = dict(conflict_policies or {})
+        self._log = log or (lambda level, message: None)
 
     def query(self, registry_type, tag_name, value):
         """Entry IDs whose ``tag_name`` equals ``value`` in the committed store."""
@@ -81,8 +88,42 @@ class _Tags:
         return self._staging.read_ownership(registry_type, entry_id, tag_name)
 
     def write(self, registry_type, entry_id, tag_name, value):
+        if not self._may_write(registry_type, entry_id, tag_name):
+            return
         self._staging.write(registry_type, entry_id, tag_name, value,
                             owner="action", owner_action_ref=self._action_ref)
+
+    def _may_write(self, registry_type, entry_id, tag_name) -> bool:
+        """Resolve a write against the current owner. Returns False for `skip`; raises
+        ActionFailure for `fail` (which discards the whole step)."""
+        current = self._staging.read_ownership(registry_type, entry_id, tag_name)
+        if current is None:
+            return True                                   # pristine — claiming it is free
+        if current["kind"] == "action" and current["action_ref"] == self._action_ref:
+            return True                                   # already ours; re-asserting is not a conflict
+
+        who = "the user" if current["kind"] == "user" else f"'{current['action_ref']}'"
+        cell = f"{tag_name} on {entry_id}"
+        policy = self._policies.get(tag_name)
+
+        if policy == "overwrite":
+            self._log("info", f"took {cell} from {who} (conflict policy: overwrite)")
+            return True
+        if policy == "skip":
+            self._log("info", f"left {cell} alone — owned by {who} (conflict policy: skip)")
+            return False
+        if policy == "ask":
+            raise ActionFailure(
+                f"{cell} is owned by {who} and this mapping's conflict policy is 'ask', "
+                f"which PackSmith does not support yet — choose overwrite, skip, or fail.")
+        if policy == "fail":
+            raise ActionFailure(
+                f"{cell} is owned by {who} and this mapping's conflict policy is 'fail'.")
+        # No declared policy: the action is writing outside its declared contract, onto
+        # data it doesn't own. Design 3.3 has no default for a reason — refuse, loudly.
+        raise ActionFailure(
+            f"{cell} is owned by {who}, and this action declares no conflict policy for "
+            f"'{tag_name}'. Declare one on the mapping that binds it.")
 
     def clear(self, registry_type, entry_id, tag_name):
         self._staging.delete(registry_type, entry_id, tag_name)
@@ -150,18 +191,30 @@ class Pack:
     """The capability object injected into an action for a single step invocation."""
 
     def __init__(self, *, staging, tag_store, packdump, action_ref,
-                 file_staging=None, mappings=None, config=None):
+                 file_staging=None, mappings=None, config=None, conflict_policies=None):
         self.action_ref = action_ref
+        self._log = []
+        # Set by fail(); None means "no deliberate failure was requested".
+        self.failure_reason = None
         self.registry = _Registry(packdump)
-        self.tags = _Tags(staging, tag_store, action_ref)
+        self.tags = _Tags(staging, tag_store, action_ref,
+                          conflict_policies=conflict_policies, log=self.log)
         self.filesystem = _Filesystem(file_staging, action_ref)
         self.step = _Step(mappings, config)
-        self._log = []
 
     def log(self, level, message):
         self._log.append((level, message))
 
     def fail(self, reason):
+        """Halt the step deliberately (design 3.3 — Starlark has no exceptions, so this is
+        the only way an author signals failure).
+
+        The reason is recorded on the Pack *before* raising, because the exception itself
+        does not survive the Starlark boundary: starlark-pyo3 wraps any host exception in
+        a ``StarlarkError``, which makes a deliberate ``fail()`` indistinguishable from a
+        genuine bug by type alone. This flag is how the runtime tells them apart.
+        """
+        self.failure_reason = reason
         raise ActionFailure(reason)
 
     @property

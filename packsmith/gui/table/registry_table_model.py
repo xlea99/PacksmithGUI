@@ -1,3 +1,5 @@
+import dataclasses
+
 from PySide6.QtCore import Qt, QAbstractTableModel
 
 from packsmith.gui.table.edit_commands import EditStack, TagEditCommand
@@ -25,11 +27,15 @@ class RegistryTableModel(QAbstractTableModel):
     is called after a discrete external change such as an action run.
     """
 
-    def __init__(self, query, packdump, tag_store):
+    def __init__(self, query, packdump, tag_store, confirm_takeover=None):
         super().__init__()
         self._query = query
         self._packdump = packdump
         self._tag_store = tag_store
+        # Called with [(entry_id, tag_name, action_ref), ...] before the user takes cells
+        # an action manages (design 3.2.1: transfers are loud). Returns True to proceed.
+        # None = no confirmation (headless use).
+        self._confirm_takeover = confirm_takeover
         self._registry_type = query.scope.type
         self._select = list(query.select)
         self._edit_stack = EditStack(tag_store)
@@ -48,6 +54,13 @@ class RegistryTableModel(QAbstractTableModel):
         self.beginResetModel()
         self._evaluate()
         self.endResetModel()
+
+    def set_filter(self, filter_node):
+        """Replace the query's filter and re-evaluate. The view's scope + columns are
+        unchanged, so column layout / delegates / edit toggles stay valid. This is the
+        constructor's write path — a deliberate query edit, not an in-table cell edit."""
+        self._query = dataclasses.replace(self._query, filter=filter_node)
+        self.reevaluate()
 
     # --- column helpers ----------------------------------------------------
 
@@ -146,6 +159,8 @@ class RegistryTableModel(QAbstractTableModel):
         old_value = self._tag_store.get_tag(self._registry_type, row.entry_id, tag_name)
         if old_value == value:
             return False
+        if not self.confirm_takeover_of([(row.entry_id, tag_name)]):
+            return False
 
         command = TagEditCommand(
             registry_type=self._registry_type,
@@ -161,6 +176,23 @@ class RegistryTableModel(QAbstractTableModel):
             self._registry_type, row.entry_id, tag_name)
         self.dataChanged.emit(index, index, [Qt.DisplayRole, OwnershipRole])
         return True
+
+    def confirm_takeover_of(self, cells) -> bool:
+        """Gate an edit that would take cells away from an action (design 3.2.1).
+
+        ``cells`` is a list of ``(entry_id, tag_name)``. Cells that are pristine or already
+        the user's need no confirmation; only action-owned ones do, and they're confirmed
+        **once for the whole batch** — a dialog per cell during a bulk edit would be
+        unusable. Returns True when the edit may proceed.
+        """
+        if self._confirm_takeover is None:
+            return True
+        owned = []
+        for entry_id, tag_name in cells:
+            ownership = self._tag_store.get_ownership(self._registry_type, entry_id, tag_name)
+            if ownership and ownership["kind"] == "action":
+                owned.append((entry_id, tag_name, ownership["action_ref"]))
+        return True if not owned else bool(self._confirm_takeover(owned))
 
     def emit_all_data_changed(self):
         """Re-sync every tag cell's value from the store (row membership unchanged) and

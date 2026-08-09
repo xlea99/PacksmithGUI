@@ -34,7 +34,17 @@ class RegistrySortProxy(QSortFilterProxyModel):
         if col_type == "bool":
             return left_val.lower() == "false" and right_val.lower() == "true"
 
-        # string, enum, and intrinsic (id/mod/attribute) — alphabetical
+        if col_type == "enum":
+            # Enum values carry a DECLARATION order that is semantic — `tier` means
+            # early < mid < late < end, which alphabetical sorting mangles into
+            # early/end/late/mid. Sort by position in the definition instead.
+            defn = self.sourceModel().tag_definition_for_column(col)
+            values = defn.get("values", []) if defn else []
+            if left_val in values and right_val in values:
+                return values.index(left_val) < values.index(right_val)
+            # A value outside the definition (an orphaned assignment) — fall through.
+
+        # string and intrinsic (id/mod/attribute) — alphabetical
         return left_val.lower() < right_val.lower()
 
     def headerData(self, section, orientation, role=Qt.DisplayRole):

@@ -87,12 +87,13 @@ def test_staging_discard_writes_nothing(store):
 
 def test_staging_captures_prior_snapshot_on_commit(store):
     fs, root = store
-    fs.write("f.txt", "old", owner="user")
+    fs.write("f.txt", "old", owner="action", owner_action_ref="other:act")
     st = FileStaging(fs)
     st.write("f.txt", "new", owner="action", owner_action_ref="x:y")
     st.commit()
     # prior content AND ownership captured for rollback
-    assert st.snapshots["f.txt"] == {"content": "old", "ownership": {"kind": "user", "action_ref": None}}
+    assert st.snapshots["f.txt"] == {
+        "content": "old", "ownership": {"kind": "action", "action_ref": "other:act"}}
 
 
 # --- end-to-end through the runner -----------------------------------------
@@ -176,3 +177,62 @@ def test_write_json_edits_one_key_and_preserves_the_rest(store):
     assert reread["configVersion"] == 2                          # other keys preserved
     assert reread["use_hashmap_optimizations"] is False
     assert fs.ownership("config/c.json5") == {"kind": "action", "action_ref": "removal:nuke"}
+
+
+# --- explicit claim / release (design 6.1) ---------------------------------
+# §6.1's three states are untouched / user-owned / action-owned. `claim` and `release`
+# move a file between them WITHOUT touching its bytes — the "explicit claim" path, as
+# opposed to ownership acquired by writing.
+
+def test_claim_marks_a_file_without_writing_it(store):
+    fs, root = store
+    (root / "a.txt").write_text("original", encoding="utf-8")
+    assert fs.ownership("a.txt") is None            # untouched
+
+    fs.claim("a.txt")
+    assert fs.ownership("a.txt") == {"kind": "user", "action_ref": None}
+    assert (root / "a.txt").read_text(encoding="utf-8") == "original"   # bytes untouched
+
+
+def test_release_returns_a_file_to_untouched(store):
+    fs, root = store
+    (root / "a.txt").write_text("x", encoding="utf-8")
+    fs.claim("a.txt")
+    fs.release("a.txt")
+    assert fs.ownership("a.txt") is None            # anyone may claim it again
+    assert (root / "a.txt").is_file()               # the file itself survives
+
+
+def test_claim_can_transfer_a_file_from_an_action_to_the_user(store):
+    fs, root = store
+    staging = FileStaging(fs)
+    _FileHandle(staging, "gen.json", "removal:nuke").write("{}")
+    staging.commit()
+    assert fs.ownership("gen.json")["kind"] == "action"
+
+    fs.claim("gen.json")                            # user takes it
+    assert fs.ownership("gen.json") == {"kind": "user", "action_ref": None}
+
+
+def test_action_claim_requires_an_action_ref(store):
+    fs, _ = store
+    with pytest.raises(ValueError):
+        fs.claim("a.txt", owner="action")
+
+
+def test_claim_rejects_paths_outside_the_instance_root(store):
+    fs, _ = store
+    with pytest.raises(ValueError):
+        fs.claim("../escape.txt")
+
+
+def test_all_ownership_returns_every_record(store):
+    fs, root = store
+    (root / "a.txt").write_text("x", encoding="utf-8")
+    (root / "b.txt").write_text("y", encoding="utf-8")
+    fs.claim("a.txt")
+    fs.claim("b.txt", owner="action", owner_action_ref="pkg:act")
+    assert fs.all_ownership() == {
+        "a.txt": {"kind": "user", "action_ref": None},
+        "b.txt": {"kind": "action", "action_ref": "pkg:act"},
+    }

@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<!--
+  The single Monaco instance that serves every Text Editor tab (design 4.2).
+
+  One editor, many MODELS. A model is a lightweight buffer that owns its own content,
+  undo history, cursor, and view state — switching tabs is `setModel`, which is why it
+  costs ~4ms and loses nothing. The alternative (one editor per tab) was measured at a
+  whole Chromium process and ~119MB per open file.
+
+  Dirty state uses `getAlternativeVersionId()` rather than a boolean: undoing back to the
+  saved state correctly reports clean again, which a flag gets wrong.
+-->
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+    html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: #1e1e1e; }
+    #editor { width: 100%; height: 100%; }
+    #loading { color: #666; font-family: monospace; padding: 20px; }
+</style>
+</head>
+<body>
+<div id="loading">Loading editor…</div>
+<div id="editor"></div>
+
+<script src="qrc:///qtwebchannel/qwebchannel.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/monaco-editor/0.52.2/min/vs/loader.min.js"></script>
+<script>
+    require.config({ paths: { vs: 'https://cdnjs.cloudflare.com/ajax/libs/monaco-editor/0.52.2/min/vs' } });
+
+    let editor = null;
+    const models = {};        // key -> { model, baseline, listener }
+    let current = null;
+
+    function bridgeCall(name, ...args) {
+        if (window.bridge && window.bridge[name]) window.bridge[name](...args);
+    }
+
+    function initBridge(done) {
+        if (window.qt && window.qt.webChannelTransport) {
+            new QWebChannel(qt.webChannelTransport, function (channel) {
+                window.bridge = channel.objects.bridge;
+                done();
+            });
+        } else { done(); }
+    }
+
+    initBridge(function () {
+        require(['vs/editor/editor.main'], function () {
+            document.getElementById('loading').style.display = 'none';
+            editor = monaco.editor.create(document.getElementById('editor'), {
+                value: '', theme: 'vs-dark', automaticLayout: true,
+                minimap: { enabled: true }, fontSize: 14, lineNumbers: 'on',
+                scrollBeyondLastLine: false, cursorBlinking: 'smooth', smoothScrolling: true,
+            });
+            editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, function () {
+                if (current) bridgeCall('saveRequested', current, models[current].model.getValue());
+            });
+            // The teaching moment: a file an action manages opens locked, and the instant
+            // the user tries to type we ask whether they mean to take it. Cause and effect
+            // land in the same second, instead of the job failing days later.
+            if (typeof editor.onDidAttemptReadOnlyEdit === 'function') {
+                editor.onDidAttemptReadOnlyEdit(function () {
+                    if (current) bridgeCall('readOnlyEditAttempted', current);
+                });
+            }
+            bridgeCall('editorReady');
+        });
+    });
+
+    function reportDirty(key) {
+        const entry = models[key];
+        if (!entry) return;
+        const dirty = entry.model.getAlternativeVersionId() !== entry.baseline;
+        if (dirty !== entry.wasDirty) {
+            entry.wasDirty = dirty;
+            bridgeCall('dirtyChanged', key, dirty);
+        }
+    }
+
+    function openModel(key, text, language, readOnly) {
+        if (!editor) return false;
+        if (!models[key]) {
+            const model = monaco.editor.createModel(text, language || 'plaintext');
+            const entry = { model: model, baseline: model.getAlternativeVersionId(),
+                            wasDirty: false, readOnly: !!readOnly, viewState: null };
+            models[key] = entry;
+            model.onDidChangeContent(function () { reportDirty(key); });
+        }
+        showModel(key);
+        return true;
+    }
+
+    function showModel(key) {
+        if (!editor || !models[key]) return false;
+        if (current && models[current]) models[current].viewState = editor.saveViewState();
+        current = key;
+        const entry = models[key];
+        editor.setModel(entry.model);
+        editor.updateOptions({ readOnly: entry.readOnly });
+        if (entry.viewState) editor.restoreViewState(entry.viewState);
+        editor.focus();
+        return true;
+    }
+
+    function closeModel(key) {
+        const entry = models[key];
+        if (!entry) return false;
+        if (current === key) { current = null; editor.setModel(null); }
+        entry.model.dispose();
+        delete models[key];
+        return true;
+    }
+
+    function setReadOnly(key, flag) {
+        const entry = models[key];
+        if (!entry) return false;
+        entry.readOnly = !!flag;
+        if (current === key) editor.updateOptions({ readOnly: entry.readOnly });
+        return true;
+    }
+
+    function valueOf(key) { return models[key] ? models[key].model.getValue() : null; }
+
+    function markSaved(key) {
+        const entry = models[key];
+        if (!entry) return false;
+        entry.baseline = entry.model.getAlternativeVersionId();
+        reportDirty(key);
+        return true;
+    }
+
+    function isDirty(key) {
+        const entry = models[key];
+        return entry ? entry.model.getAlternativeVersionId() !== entry.baseline : false;
+    }
+
+    function openKeys() { return Object.keys(models).join(','); }
+</script>
+</body>
+</html>
