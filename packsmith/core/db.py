@@ -17,6 +17,13 @@ class UserDB:
         self._migrate()
         log.info(f"UserDB connected: {db_path}")
 
+    # Releases the sqlite connection. Needed when switching profiles: on Windows an open
+    # connection holds a file lock, so a profile you're still connected to can't be deleted
+    # and its db can't be replaced.
+    def close(self):
+        self._conn.close()
+        log.info(f"UserDB closed: {self._path}")
+
     # Creates any/all tables that don't exist. Safe to call repeatedly
     def _ensure_tables(self):
         c = self._conn

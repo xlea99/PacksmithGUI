@@ -24,9 +24,31 @@
 <div id="editor"></div>
 
 <script src="qrc:///qtwebchannel/qwebchannel.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/monaco-editor/0.52.2/min/vs/loader.min.js"></script>
+<script src="./vendor/monaco/vs/loader.js"></script>
 <script>
-    require.config({ paths: { vs: 'https://cdnjs.cloudflare.com/ajax/libs/monaco-editor/0.52.2/min/vs' } });
+    // Monaco is vendored (tools/vendor_monaco.py), so this page is fully offline. That
+    // matters beyond convenience: a CDN dependency meant no internet = no editor at all,
+    // and a frozen build betting on cdnjs serving one pinned version forever.
+    //
+    // The path has to be ABSOLUTE, resolved from this document rather than written down.
+    // Relative paths work for the page but not for Monaco's web workers, which resolve
+    // against the ORIGIN root — on file:// that's the drive root, so './vendor/...'
+    // silently 404s and the editor comes up looking fine with its background services
+    // dead. Deriving it from baseURI also means the frozen build needs no path handling:
+    // wherever this file lands, vendor/ is beside it.
+    const VS = new URL('./vendor/monaco/vs', document.baseURI).href;
+    require.config({ paths: { vs: VS } });
+
+    // Workers can't inherit the document's base, so hand them one that carries the
+    // absolute path with it. This shim is Monaco's own documented recipe.
+    window.MonacoEnvironment = {
+        getWorkerUrl: function () {
+            return URL.createObjectURL(new Blob([
+                'self.MonacoEnvironment = { baseUrl: ' + JSON.stringify(VS + '/..') + ' };',
+                'importScripts(' + JSON.stringify(VS + '/base/worker/workerMain.js') + ');'
+            ], { type: 'text/javascript' }));
+        }
+    };
 
     let editor = null;
     const models = {};        // key -> { model, baseline, listener }

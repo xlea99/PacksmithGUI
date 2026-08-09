@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (
 )
 
 from packsmith.gui.shell import style
+from packsmith.gui.shell.tree import PanelTree
 from packsmith.gui.shell.panels.base import Panel
 
 _ROLE_JOB = Qt.UserRole
@@ -63,7 +64,7 @@ class JobsPanel(Panel):
         self._search.textChanged.connect(self.refresh)
         self.body().addWidget(self._search)
 
-        self._tree = QTreeWidget()
+        self._tree = PanelTree()
         self._tree.setColumnCount(2)
         self._tree.setHeaderHidden(True)
         self._tree.setRootIsDecorated(False)

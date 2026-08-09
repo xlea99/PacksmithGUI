@@ -6,21 +6,30 @@ whose bottom-most strip is the status bar. The window itself stays thin: it wire
 services to the shell and owns the actions that span tabs (run an action, author a view,
 undo/redo).
 """
+import re
 from pathlib import Path
 
 from PySide6.QtWidgets import (
     QMainWindow, QVBoxLayout, QHBoxLayout, QWidget, QLabel, QPushButton,
     QHeaderView, QSplitter, QInputDialog, QMessageBox,
 )
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QEvent
 from PySide6.QtGui import QShortcut, QKeySequence
 
 from packsmith.core.profile import Profile, list_profiles
-from packsmith.core.packdump import import_packdump
+from packsmith.core.packdump import check_packdump, current_packdump, import_packdump
+from packsmith.common.logging import log
+from packsmith.gui.profile_editor import (
+    NewProfileDialog, OpenProfileDialog, confirm_force_import,
+)
+from packsmith.gui.shell.packdump_banner import PackdumpBanner
 from packsmith.core.db import UserDB
 from packsmith.core.tags import TagStore
 from packsmith.core.runner import run_action
-from packsmith.core.packages import PackageIndex
+from packsmith.core.packages import (
+    PackageIndex, create_package, add_action, remove_action, create_file, delete_file,
+    rename_file, create_folder, delete_folder, rename_folder, source_files,
+)
 from packsmith.core.bindings import best_guess_bindings, resolve_step
 from packsmith.core.files import FileStore
 from packsmith.core.history import StepRunStore, JobRunStore
@@ -47,6 +56,9 @@ from packsmith.gui.shell.panels.files_panel import FilesPanel
 from packsmith.gui.editor.host import EditorHost, EditorTab
 from packsmith.gui.editor.sources import InstanceFileSource, PackageFileSource
 from packsmith.gui.shell.panels.actions_panel import ActionsPanel
+from packsmith.gui.action_editor import (
+    NewActionDialog, NewFileDialog, NewFolderDialog, RenameFileDialog,
+)
 from packsmith.gui.job_editor import JobEditorTab
 from packsmith.gui.table.registry_table_model import RegistryTableModel
 from packsmith.gui.table.registry_sort_proxy import RegistrySortProxy
@@ -66,42 +78,63 @@ _DELEGATES = {
 
 class MainWindow(QMainWindow):
 
-    def __init__(self):
+    def __init__(self, profile_name: str = None):
         super().__init__()
         self.setWindowTitle("PackSmith")
         self.setMinimumSize(1200, 700)
-
-        self._load_profile()
-        self._seed_tags()
-        self._seed_views()
-        self._seed_jobs()
 
         self._tab_models = {}     # tab widget -> RegistryTableModel
         self._tab_views = {}      # tab widget -> the saved View it renders (if any)
         self._open_tabs = {}      # open-key -> tab widget (so we focus, not duplicate)
         self._delegates = []      # keep delegate refs alive
+        self._editor_host = None  # survives profile switches; see _switch_profile
+        self._shortcuts = []      # ditto — parented to the window, not the central widget
+        self._import_result = None
+        self._last_focus_check = None
 
         self._build_menu_bar()
-        self._build_shell()
-
-        items = len(self._packdump.registry.get("minecraft:item", {}).get("values", []))
-        self._bottom.set_status(f"{items} items in minecraft:item")
+        self._enter_profile(profile_name or self._default_profile())
 
     # --- services ----------------------------------------------------------
 
-    def _load_profile(self):
-        # TEMP: hardcoded dev profile against a small dedicated test pack.
-        # (Real profile create/switch UI is a later slice — the Profiles menu.)
-        name = "packsmith_test"
-        if name not in list_profiles():
+    @staticmethod
+    def _default_profile() -> str:
+        """Which profile to open at launch. Falls back to creating the dev one so a fresh
+        checkout still starts; once profiles are switchable this is only a first-run path."""
+        existing = list_profiles()
+        if "packsmith_test" in existing:
+            return "packsmith_test"
+        return existing[0] if existing else ""
+
+    def _enter_profile(self, name: str):
+        """Open a profile and build the window around it."""
+        self._load_profile(name)
+        self._seed_tags()
+        self._seed_views()
+        self._seed_packages()
+        self._seed_jobs()
+        self._build_shell()
+        self._report_import(self._import_result, initial=True)
+
+    def _load_profile(self, name: str):
+        if not name:
             self._profile = Profile.create(
-                name,
+                "packsmith_test",
                 mc_path=r"C:\Users\timbe\curseforge\minecraft\Instances\Packsmith Test",
                 loader="forge", loader_version="47.4.10", mc_version="1.20.1",
             )
         else:
             self._profile = Profile.load(name)
-        self._packdump = import_packdump(self._profile)
+        # Auto-import, always — a stale registry is the worse failure, because it produces
+        # confidently wrong output that looks fine, while an unwanted import announces
+        # itself the moment you look at anything. What is *not* automatic is adopting a
+        # dump that fails the profile's contract; see _report_import.
+        self._import_result = import_packdump(self._profile)
+        self._packdump = self._import_result.packdump or current_packdump(self._profile)
+        if self._packdump is None:
+            raise RuntimeError(
+                f"Profile '{self._profile.name}' has no packdump and none could be "
+                f"imported from {self._profile.mc_path}: {self._import_result.reason}")
         self._db = UserDB(self._profile.root / "profile.db")
         self._tags = TagStore(self._db)
         self._packages = PackageIndex(self._profile.packages_dir)
@@ -121,6 +154,10 @@ class MainWindow(QMainWindow):
         root.setSpacing(0)
 
         root.addWidget(self._build_header())
+
+        self._banner = PackdumpBanner()
+        self._banner.force_requested.connect(self._force_import)
+        root.addWidget(self._banner)
 
         content = QHBoxLayout()
         content.setContentsMargins(0, 0, 0, 0)
@@ -162,6 +199,14 @@ class MainWindow(QMainWindow):
 
         self._actions_panel = ActionsPanel(self._packages)
         self._actions_panel.document_activated.connect(self._open_package_document)
+        self._actions_panel.new_action_requested.connect(self._new_action)
+        self._actions_panel.new_file_requested.connect(self._new_package_file)
+        self._actions_panel.new_folder_requested.connect(self._new_package_folder)
+        self._actions_panel.remove_action_requested.connect(self._remove_action)
+        self._actions_panel.rename_file_requested.connect(self._rename_package_file)
+        self._actions_panel.delete_file_requested.connect(self._delete_package_file)
+        self._actions_panel.rename_folder_requested.connect(self._rename_package_folder)
+        self._actions_panel.delete_folder_requested.connect(self._delete_package_folder)
 
         live = {
             "views": self._views_panel,
@@ -194,21 +239,27 @@ class MainWindow(QMainWindow):
         self._workspace.close_guard = self._may_close_tab
 
         # One Monaco for every editor tab (design 4.2 — measured: per-tab views cost a
-        # Chromium process and ~119MB each).
-        self._editor_host = EditorHost(
-            {
-                # Instance files answer to §6.1 ownership; package sources answer to
-                # provenance. Different worlds, deliberately different rules.
-                "instance": InstanceFileSource(self._file_store, on_claim=self._on_file_claimed),
-                "package": PackageFileSource(self._packages, self._profile.packages_dir),
-            },
-            container=self)
-        self._editor_host.dirty_changed.connect(self._on_editor_dirty)
-        self._editor_host.file_saved.connect(self._on_document_saved)
-        self._editor_host.save_failed.connect(
-            lambda key, why: QMessageBox.warning(self, "Couldn't save", f"{key}\n\n{why}"))
-        self._editor_host.edit_blocked.connect(self._offer_unlock)
-        self._editor_host.unlocked.connect(self._on_unlocked)
+        # Chromium process and ~119MB each). It also OUTLIVES a profile switch: recreating
+        # a QWebEngineView means paying Chromium startup again and re-entering the
+        # widget-lifetime problems the shared-view design already solved, so a switch
+        # rebinds its sources instead of rebuilding it.
+        sources = {
+            # Instance files answer to §6.1 ownership; package sources answer to
+            # provenance. Different worlds, deliberately different rules.
+            "instance": InstanceFileSource(self._file_store, on_claim=self._on_file_claimed),
+            "package": PackageFileSource(self._packages, self._profile.packages_dir),
+        }
+        if self._editor_host is None:
+            self._editor_host = EditorHost(sources, container=self)
+            self._editor_host.dirty_changed.connect(self._on_editor_dirty)
+            self._editor_host.file_saved.connect(self._on_document_saved)
+            self._editor_host.save_failed.connect(
+                lambda key, why: QMessageBox.warning(self, "Couldn't save",
+                                                     f"{key}\n\n{why}"))
+            self._editor_host.edit_blocked.connect(self._offer_unlock)
+            self._editor_host.unlocked.connect(self._on_unlocked)
+        else:
+            self._editor_host.rebind(sources)
 
         self._bottom = BottomPanel()
         results = JobResultsView(self._history, self._job_history,
@@ -240,9 +291,15 @@ class MainWindow(QMainWindow):
 
         self._sidebar.select("views")
 
-        QShortcut(QKeySequence.Undo, self).activated.connect(self._undo)
-        QShortcut(QKeySequence.Redo, self).activated.connect(self._redo)
-        QShortcut(QKeySequence("Ctrl+`"), self).activated.connect(self._bottom.toggle)
+        # Once only: shortcuts are parented to the window, not the central widget, so a
+        # rebuild on profile switch would stack duplicates and make each one ambiguous.
+        if not self._shortcuts:
+            self._shortcuts = [
+                QShortcut(QKeySequence.Undo, self, activated=self._undo),
+                QShortcut(QKeySequence.Redo, self, activated=self._redo),
+                QShortcut(QKeySequence("Ctrl+`"), self,
+                          activated=lambda: self._bottom.toggle()),
+            ]
 
     def _build_header(self) -> QWidget:
         header = QWidget()
@@ -263,6 +320,168 @@ class MainWindow(QMainWindow):
         lay.addStretch()
         lay.addWidget(info)
         return header
+
+    # --- profiles ----------------------------------------------------------
+    #
+    # A profile is a different world, not a filter: every service, panel and open tab is
+    # scoped to one. So switching REBUILDS the window rather than re-pointing nine services
+    # through seven panels and N tabs — which would leave stale references to be found one
+    # at a time, in use, for weeks. The single exception is the Monaco host (see
+    # _build_shell).
+
+    def _switch_profile(self, name: str):
+        if name == self._profile.name:
+            return
+        if not self._close_all_tabs():
+            return                              # a dirty buffer said no
+        try:
+            self._db.close()
+        except Exception:                       # closing is best-effort; the switch isn't
+            log.warning("Could not close the previous profile's database", exc_info=True)
+        try:
+            self._enter_profile(name)
+        except Exception as e:
+            QMessageBox.critical(self, "Couldn't open profile",
+                                 f"{name}\n\n{e}\n\nStaying where we were.")
+            self._enter_profile(self._profile.name)
+            return
+        self.setWindowTitle(f"PackSmith — {name}")
+
+    def _close_all_tabs(self) -> bool:
+        """Close every open tab, honouring the unsaved-changes guard. False if cancelled."""
+        tabs = self._workspace._tabs
+        while tabs.count():
+            before = tabs.count()
+            self._workspace._close_tab(0)
+            if tabs.count() == before:
+                return False
+        return True
+
+    def _open_profile(self):
+        dialog = OpenProfileDialog(current=self._profile.name, parent=self)
+        dialog.exec()
+        if dialog.result_name:
+            self._switch_profile(dialog.result_name)
+        elif dialog.result_deleted:
+            self._set_status(f"Deleted {', '.join(dialog.result_deleted)}")
+
+    def _new_profile(self):
+        dialog = NewProfileDialog(parent=self)
+        if not dialog.exec():
+            return
+        try:
+            Profile.create(
+                dialog.result_name, mc_path=dialog.result_mc_path,
+                mc_version=dialog.result_mc_version or None,
+                loader=dialog.result_loader or None,
+                loader_version=dialog.result_loader_version or None,
+                mc_version_policy=dialog.result_policy,
+            )
+        except Exception as e:
+            QMessageBox.warning(self, "Couldn't create profile", str(e))
+            return
+        self._switch_profile(dialog.result_name)
+
+    # --- packdump ----------------------------------------------------------
+
+    def _report_import(self, result, *, initial=False):
+        """Be loud in proportion to what the import did to the user's DATA.
+
+        Importing itself is never the risky part — Layer 1 is read-only, so adopting a dump
+        modifies nothing the user owns. What changes is how their Layer 2 data reads
+        against it, so that is what decides the volume.
+        """
+        self._banner.show_result(result)
+        if result is None:
+            return
+
+        if result.status == "refused":
+            self._set_status("A newer packdump was refused — see the banner")
+            return
+        if result.status == "unreadable":
+            self._set_status(f"Packdump unreadable: {result.reason}")
+            return
+        if result.status == "missing":
+            self._set_status(f"No packdump at {self._profile.mc_path}")
+            return
+        if result.status == "unchanged":
+            if initial:
+                items = len(self._packdump.registry.get("minecraft:item", {})
+                            .get("values", []))
+                self._set_status(f"{items} items in minecraft:item")
+            return
+
+        added, removed = result.registry_delta()
+        mods_added, mods_removed = result.mod_delta()
+        summary = (f"Packdump updated — {added:+d}/{-removed:+d} entries, "
+                   f"{mods_added:+d}/{-mods_removed:+d} mods")
+        if result.adopted:
+            summary += f" (adopted {', '.join(sorted(result.adopted))})"
+        if result.forced:
+            summary = "FORCED — " + summary
+        self._bottom.log(summary)
+        self._set_status(summary)
+
+        # Fallout, not the fact of the import, is what earns an interruption. Orphans mean
+        # assignments now point at entries this pack no longer has.
+        errors = self._bottom.panel("errors")
+        if errors is not None:
+            errors.refresh()
+            if errors.has_problems():
+                self._bottom.show_panel("errors")
+                self._bottom.expand(1)
+
+    def _force_import(self):
+        result = self._import_result
+        if result is None or not result.errors:
+            return
+        actual = result.errors.get("mc_version", {}).get("actual") \
+            or result.errors.get("loader", {}).get("actual", "")
+        expected = result.errors.get("mc_version", {}).get("expected", "")
+        if not confirm_force_import(self, expected, actual, result.errors):
+            return
+        self._import_result = import_packdump(self._profile, force=True)
+        if self._import_result.status != "imported":
+            self._report_import(self._import_result)
+            return
+        # The registry underneath everything just changed; nothing that reads it can stay.
+        self._switch_profile_in_place()
+
+    def _switch_profile_in_place(self):
+        """Rebuild against the same profile — used after a forced import, where the
+        packdump changed but the profile didn't."""
+        if not self._close_all_tabs():
+            return
+        try:
+            self._db.close()
+        except Exception:
+            log.warning("Could not close the database before rebuilding", exc_info=True)
+        self._enter_profile(self._profile.name)
+
+    def _check_for_new_packdump(self):
+        """Poll on window focus. The mental model is that the packdump is a LIVE snapshot,
+        and you generate a new one by leaving PackSmith to run the game — so coming back is
+        exactly the moment to look. Cheap: a load and a comparison, no watcher."""
+        try:
+            checked = check_packdump(self._profile)
+        except Exception:
+            log.warning("Packdump check failed", exc_info=True)
+            return
+        if checked.status in ("unchanged", "missing"):
+            return
+        if checked.status == "imported":
+            self._import_result = import_packdump(self._profile)
+            if self._import_result.status == "imported":
+                self._switch_profile_in_place()
+                return
+        self._import_result = checked
+        self._report_import(checked)
+
+    def changeEvent(self, event):
+        super().changeEvent(event)
+        if (event.type() == QEvent.ActivationChange and self.isActiveWindow()
+                and getattr(self, "_profile", None) is not None):
+            self._check_for_new_packdump()
 
     def _set_status(self, message):
         """Bound indirection: panels are built before the bottom panel exists, so they
@@ -292,8 +511,10 @@ class MainWindow(QMainWindow):
         bar = self.menuBar()
 
         file_menu = bar.addMenu("File")
-        for label in ("New Profile…", "Open Profile…", "Import Packdump…"):
-            file_menu.addAction(label).setEnabled(False)
+        file_menu.addAction("New Profile…", self._new_profile)
+        file_menu.addAction("Open Profile…", self._open_profile)
+        file_menu.addSeparator()
+        file_menu.addAction("Check for New Packdump", self._check_for_new_packdump)
         file_menu.addSeparator()
         file_menu.addAction("Exit", self.close)
 
@@ -311,7 +532,8 @@ class MainWindow(QMainWindow):
             views_menu.addAction(label).setEnabled(False)
 
         profiles_menu = bar.addMenu("Profiles")
-        profiles_menu.addAction("Switch Profile…").setEnabled(False)
+        profiles_menu.addAction("Switch Profile…", self._open_profile)
+        profiles_menu.addAction("New Profile…", self._new_profile)
 
         help_menu = bar.addMenu("Help")
         help_menu.addAction("About PackSmith").setEnabled(False)
@@ -466,6 +688,214 @@ class MainWindow(QMainWindow):
         self._open_tabs[("doc", key)] = tab
         tab.activate()
         return tab
+
+    # --- packages: the declaration layer and the file layer ------------------
+    #
+    # A package has two layers and they get separate operations, because "stop calling
+    # this file an action" and "destroy this file" are different things to want.
+
+    def _target_package(self, dlg):
+        """Resolve the package half of a dialog, creating it if that's what was asked."""
+        if dlg.result_new_package:
+            return create_package(self._packages.directory, dlg.result_new_package,
+                                  author=self._profile.name)
+        return self._packages.package(dlg.result_package)
+
+    def _after_package_change(self, status):
+        # Manifests are only parsed on scan, so any structural change needs a reload
+        # before anything can bind, run, or even list it.
+        self._packages.reload()
+        self._actions_panel.refresh()
+        self._set_status(status)
+
+    def _new_action(self, package_name=""):
+        """Declare an action, creating its package and/or file first if needed (§3.3.1)."""
+        dlg = NewActionDialog(self._packages, package=package_name or None, parent=self)
+        if not dlg.exec():
+            return
+        try:
+            package = self._target_package(dlg)
+            source = add_action(package, dlg.result_action_id, file=dlg.result_file,
+                                function=dlg.result_function, name=dlg.result_name,
+                                description=dlg.result_description)
+        except ValueError as e:
+            QMessageBox.warning(self, "Can't create action", str(e))
+            return
+        self._after_package_change(f"Declared {package.name}:{dlg.result_action_id}")
+        self._open_package_document(f"{package.name}/{source.name}")
+
+    def _new_package_file(self, package_name="", folder=""):
+        """Add a source file with no declaration — a helper, a library, a scratch file."""
+        dlg = NewFileDialog(self._packages, package=package_name or None, folder=folder,
+                            parent=self)
+        if not dlg.exec():
+            return
+        try:
+            package = self._target_package(dlg)
+            create_file(package, dlg.result_file)
+        except ValueError as e:
+            QMessageBox.warning(self, "Can't create file", str(e))
+            return
+        self._after_package_change(f"Created {package.name}/{dlg.result_file}")
+        self._open_package_document(f"{package.name}/{dlg.result_file}")
+
+    def _new_package_folder(self, package_name="", folder=""):
+        """Folders are organisation and nothing else: an action's file is a relative path,
+        so the shape of the tree never changes what a package means."""
+        dlg = NewFolderDialog(self._packages, package=package_name or None, folder=folder,
+                              parent=self)
+        if not dlg.exec():
+            return
+        try:
+            package = self._target_package(dlg)
+            create_folder(package, dlg.result_folder)
+        except ValueError as e:
+            QMessageBox.warning(self, "Can't create folder", str(e))
+            return
+        self._after_package_change(f"Created {package.name}/{dlg.result_folder}/")
+
+    def _remove_action(self, action_ref):
+        """Undeclare. The file stays — that's the whole point of the two layers."""
+        try:
+            manifest = self._packages.get(action_ref)
+        except KeyError:
+            return
+        package = self._packages.package(manifest.package_name)
+        confirm = QMessageBox.question(
+            self, "Remove declaration",
+            f"Stop declaring '{action_ref}'?\n\n"
+            f"{manifest.file} is kept and {manifest.function}() stays in it — it just "
+            f"becomes an ordinary function that nothing can run directly.\n\n"
+            f"Jobs with steps bound to this action will fail to resolve it.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if confirm != QMessageBox.Yes:
+            return
+        try:
+            remove_action(package, manifest.action_id)
+        except ValueError as e:
+            QMessageBox.warning(self, "Can't remove declaration", str(e))
+            return
+        self._after_package_change(f"Removed the declaration for {action_ref}")
+
+    def _rename_package_file(self, package_name, file_name):
+        package = self._packages.package(package_name)
+        if package is None:
+            return
+        dlg = RenameFileDialog(package_name, file_name, parent=self)
+        if not dlg.exec() or dlg.result_name == file_name:
+            return
+        # Close the old tab first: its key is the path, and renaming underneath it would
+        # leave a buffer that saves to a file that no longer exists.
+        if not self._close_package_tab(f"{package_name}/{file_name}"):
+            return
+        try:
+            rename_file(package, file_name, dlg.result_name)
+        except ValueError as e:
+            QMessageBox.warning(self, "Can't rename", str(e))
+            return
+        self._after_package_change(f"Renamed to {package_name}/{dlg.result_name}")
+
+    def _delete_package_file(self, package_name, file_name):
+        package = self._packages.package(package_name)
+        if package is None:
+            return
+        users = sorted(a.action_id for a in package.actions if a.file == file_name)
+        if users:
+            # Refused, not confirmed-around: the declaration has to come off first so the
+            # destructive step is the one actually asked for.
+            QMessageBox.warning(
+                self, "Still declared",
+                f"{package_name}/{file_name} implements {', '.join(users)}.\n\n"
+                f"Remove {'those declarations' if len(users) > 1 else 'that declaration'} "
+                f"first, then delete the file.")
+            return
+        confirm = QMessageBox.question(
+            self, "Delete file",
+            f"Delete {package_name}/{file_name}?\n\nThis removes the file from disk.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if confirm != QMessageBox.Yes:
+            return
+        self._close_package_tab(f"{package_name}/{file_name}", force=True)
+        try:
+            delete_file(package, file_name)
+        except ValueError as e:
+            QMessageBox.warning(self, "Can't delete", str(e))
+            return
+        self._after_package_change(f"Deleted {package_name}/{file_name}")
+
+    def _rename_package_folder(self, package_name, folder):
+        package = self._packages.package(package_name)
+        if package is None:
+            return
+        dlg = RenameFileDialog(package_name, folder, is_folder=True, parent=self)
+        if not dlg.exec() or dlg.result_name == folder:
+            return
+        inside = [f for f in source_files(package) if f.startswith(f"{folder}/")]
+        for path in inside:
+            if not self._close_package_tab(f"{package_name}/{path}"):
+                return
+        try:
+            rename_folder(package, folder, dlg.result_name)
+        except ValueError as e:
+            QMessageBox.warning(self, "Can't rename", str(e))
+            return
+        self._after_package_change(f"Renamed to {package_name}/{dlg.result_name}/")
+
+    def _delete_package_folder(self, package_name, folder):
+        package = self._packages.package(package_name)
+        if package is None:
+            return
+        inside = [f for f in source_files(package) if f.startswith(f"{folder}/")]
+        declared = sorted(a.action_id for a in package.actions
+                          if a.file.startswith(f"{folder}/"))
+        if declared:
+            QMessageBox.warning(
+                self, "Still declared",
+                f"{package_name}/{folder}/ holds the source for "
+                f"{', '.join(declared)}.\n\nRemove "
+                f"{'those declarations' if len(declared) > 1 else 'that declaration'} "
+                f"first, then delete the folder.")
+            return
+        # Say how much is about to go. A folder delete is the one operation here that can
+        # destroy code the user never named.
+        detail = (f"\n\nThis deletes {len(inside)} file"
+                  f"{'s' if len(inside) != 1 else ''} inside it:\n  "
+                  + "\n  ".join(inside)) if inside else "\n\nIt's empty."
+        confirm = QMessageBox.question(
+            self, "Delete folder", f"Delete {package_name}/{folder}/?{detail}",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if confirm != QMessageBox.Yes:
+            return
+        for path in inside:
+            self._close_package_tab(f"{package_name}/{path}", force=True)
+        try:
+            delete_folder(package, folder)
+        except ValueError as e:
+            QMessageBox.warning(self, "Can't delete", str(e))
+            return
+        self._after_package_change(f"Deleted {package_name}/{folder}/")
+
+    def _close_package_tab(self, path, *, force=False) -> bool:
+        """Close an open editor onto a package file. Returns False if the user cancelled.
+
+        ``force`` skips the unsaved-changes prompt, which is right for deletion — offering
+        to save a file you just agreed to destroy is nonsense.
+        """
+        key = self._editor_host.key_for("package", path)
+        tab = self._open_tabs.get(("doc", key))
+        if tab is None:
+            return True
+        index = self._workspace._tabs.indexOf(tab)
+        if index < 0:
+            return True
+        guard = self._workspace.close_guard
+        if force:
+            self._workspace.close_guard = None
+        try:
+            self._workspace._close_tab(index)
+        finally:
+            self._workspace.close_guard = guard
+        return ("doc", key) not in self._open_tabs
 
     def _request_unlock(self, key):
         reason = self._editor_host.lock_reason(key)
@@ -834,6 +1264,26 @@ class MainWindow(QMainWindow):
             self._tags.define(reg, "weight", "number")
         if not self._tags.definition(reg, "remove"):
             self._tags.define(reg, "remove", "bool", default=False)
+
+    def _seed_packages(self):
+        """A fresh profile gets one ordinary authored package to put actions in.
+
+        Nothing about it is privileged — §3.3.1 rules out a "magic default bucket", and
+        this isn't one: it is a perfectly normal package that happens to be pre-created,
+        deletable and renameable and publishable like any other. Same move as seeding
+        views and jobs; it just means the New Action dialog has somewhere to go on day one.
+        """
+        if self._packages.packages:
+            return
+        slug = re.sub(r"[^a-z0-9_]+", "_", self._profile.name.lower()).strip("_")
+        if not slug or not slug[0].isalpha():
+            slug = f"pack_{slug}" if slug else "my_pack"
+        try:
+            create_package(self._packages.directory, slug, author=self._profile.name,
+                           description=f"Actions authored for {self._profile.name}.")
+        except ValueError:
+            return
+        self._packages.reload()
 
     def _seed_jobs(self):
         """A fresh profile gets a job for each installed action, best-guess bound — the

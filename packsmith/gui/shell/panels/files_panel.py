@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
 )
 
 from packsmith.gui.shell import style
+from packsmith.gui.shell.tree import PanelTree
 from packsmith.gui.shell.panels.base import Panel
 
 _DOT_CACHE = {}
@@ -87,7 +88,7 @@ class FilesPanel(Panel):
         legend.setStyleSheet(f"font-size: 10px; padding: 0 8px 4px 8px;")
         self.body().addWidget(legend)
 
-        self._tree = QTreeWidget()
+        self._tree = PanelTree()
         self._tree.setHeaderHidden(True)
         self._tree.setSelectionMode(QAbstractItemView.SingleSelection)
         self._tree.setStyleSheet(style.LIST_QSS)

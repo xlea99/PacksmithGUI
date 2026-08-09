@@ -178,6 +178,13 @@ class BottomPanel(QWidget):
     def panel(self, key):
         return self._panels.get(key)
 
+    def show_panel(self, key):
+        """Bring one bottom tab to the front and open the panel. Used when something needs
+        the user's attention rather than when the user asked for it."""
+        index = self._tab_index.get(key)
+        if index is not None:
+            self.expand(index)
+
     def refresh_panels(self):
         """Ask every bottom panel that can refresh itself to do so (after an action run,
         a packdump change, etc.)."""

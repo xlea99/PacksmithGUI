@@ -180,3 +180,361 @@ def test_index_exposes_packages_by_name(package_root):
     assert index.package("demo_suite").name == "demo_suite"
     assert index.package("nope") is None
     assert "demo_suite" in index.packages
+
+
+# --- authoring packages and actions (design 3.3.1) -------------------------
+
+def test_create_package_writes_a_loadable_manifest(tmp_path):
+    from packsmith.core.packages import create_package
+    pkg = create_package(tmp_path, "my_pack", description="mine")
+    assert pkg.name == "my_pack" and pkg.provenance == "authored"
+    assert (tmp_path / "my_pack" / "manifest.toml").is_file()
+    assert load_package(tmp_path / "my_pack").description == "mine"
+
+
+def test_create_package_rejects_bad_names(tmp_path):
+    from packsmith.core.packages import create_package
+    for bad in ("Has Space", "../escape", "9lives", "UPPER", ""):
+        with pytest.raises(ValueError):
+            create_package(tmp_path, bad)
+
+
+def test_create_package_rejects_duplicates(tmp_path):
+    from packsmith.core.packages import create_package
+    create_package(tmp_path, "twice")
+    with pytest.raises(ValueError):
+        create_package(tmp_path, "twice")
+
+
+def test_add_action_appends_and_writes_a_stub(tmp_path):
+    from packsmith.core.packages import create_package, add_action
+    pkg = create_package(tmp_path, "mine")
+    source = add_action(pkg, "do_thing", name="Do Thing", description="does the thing")
+    assert source.name == "do_thing.star" and source.is_file()
+    assert "def run(pack):" in source.read_text(encoding="utf-8")
+
+    reloaded = load_package(pkg.root)
+    action = reloaded.actions[0]
+    assert action.ref == "mine:do_thing"
+    assert action.file == "do_thing.star" and action.function == "run"
+    assert action.name == "Do Thing"
+
+
+def test_add_action_preserves_handwritten_manifest_content(tmp_path):
+    """The manifest is appended to as text, never regenerated — a TOML round-trip would
+    silently eat the user's comments."""
+    from packsmith.core.packages import create_package, add_action
+    pkg = create_package(tmp_path, "mine")
+    manifest = pkg.root / "manifest.toml"
+    manifest.write_text(manifest.read_text(encoding="utf-8")
+                        + "\n# a comment the user wrote\n", encoding="utf-8")
+    add_action(pkg, "thing")
+    after = manifest.read_text(encoding="utf-8")
+    assert "# a comment the user wrote" in after
+    assert load_package(pkg.root).actions[0].action_id == "thing"
+
+
+def test_add_action_rejects_duplicate_ids(tmp_path):
+    from packsmith.core.packages import create_package, add_action
+    pkg = create_package(tmp_path, "mine")
+    add_action(pkg, "thing")
+    with pytest.raises(ValueError):
+        add_action(load_package(pkg.root), "thing")
+
+
+def test_cannot_add_an_action_to_a_downloaded_package(tmp_path):
+    from packsmith.core.packages import add_action
+    root = tmp_path / "vendored"; root.mkdir()
+    (root / "manifest.toml").write_text(
+        '[package]\nname = "vendored"\nprovenance = "downloaded"\n', encoding="utf-8")
+    with pytest.raises(ValueError, match="downloaded"):
+        add_action(load_package(root), "thing")
+
+
+def test_index_reload_picks_up_a_new_package(tmp_path):
+    from packsmith.core.packages import create_package, add_action
+    packages = tmp_path / "packages"; packages.mkdir()
+    index = PackageIndex(packages)
+    assert index.actions == {}
+    add_action(create_package(packages, "fresh"), "go")
+    index.reload()
+    assert "fresh:go" in index.actions
+
+
+# --- the two layers: declarations vs files ----------------------------------------
+
+def test_many_actions_can_share_one_file(tmp_path):
+    """The entry point is (file, function), and neither is tied to the action id."""
+    from packsmith.core.packages import create_package, add_action
+    pkg = create_package(tmp_path, "mine")
+    add_action(pkg, "alpha", file="toolbox.star", function="alpha")
+    add_action(load_package(pkg.root), "beta", file="toolbox.star", function="beta")
+
+    reloaded = load_package(pkg.root)
+    assert {a.action_id: (a.file, a.function) for a in reloaded.actions} == {
+        "alpha": ("toolbox.star", "alpha"),
+        "beta": ("toolbox.star", "beta"),
+    }
+    source = (pkg.root / "toolbox.star").read_text(encoding="utf-8")
+    assert "def alpha(pack):" in source and "def beta(pack):" in source
+    assert len(list(pkg.root.glob("*.star"))) == 1
+
+
+def test_declaring_into_an_existing_file_leaves_its_contents_alone(tmp_path):
+    from packsmith.core.packages import create_package, add_action, create_file
+    pkg = create_package(tmp_path, "mine")
+    create_file(pkg, "toolbox.star")
+    source = pkg.root / "toolbox.star"
+    source.write_text("# hand written\n\ndef helper():\n    return 1\n", encoding="utf-8")
+
+    add_action(pkg, "go", file="toolbox.star", function="go")
+    text = source.read_text(encoding="utf-8")
+    assert "# hand written" in text and "def helper():" in text
+    assert "def go(pack):" in text
+
+
+def test_declaring_an_existing_function_does_not_append_a_second_stub(tmp_path):
+    from packsmith.core.packages import create_package, add_action, create_file
+    pkg = create_package(tmp_path, "mine")
+    create_file(pkg, "toolbox.star")
+    source = pkg.root / "toolbox.star"
+    source.write_text("def go(pack):\n    pack.log('info', 'mine')\n", encoding="utf-8")
+    add_action(pkg, "go", file="toolbox.star", function="go")
+    assert source.read_text(encoding="utf-8").count("def go(pack):") == 1
+
+
+def test_two_actions_cannot_share_one_entry_point(tmp_path):
+    from packsmith.core.packages import create_package, add_action
+    pkg = create_package(tmp_path, "mine")
+    add_action(pkg, "alpha", file="toolbox.star", function="run")
+    with pytest.raises(ValueError, match="already points at"):
+        add_action(load_package(pkg.root), "beta", file="toolbox.star", function="run")
+
+
+def test_create_file_declares_nothing(tmp_path):
+    """The operation that used to be impossible — a library file with no manifest entry."""
+    from packsmith.core.packages import create_package, create_file, source_files
+    pkg = create_package(tmp_path, "mine")
+    created = create_file(pkg, "helpers.star")
+    assert created.is_file()
+    reloaded = load_package(pkg.root)
+    assert reloaded.actions == []
+    assert source_files(reloaded) == ["manifest.toml", "helpers.star"]
+
+
+def test_create_file_rejects_bad_names(tmp_path):
+    from packsmith.core.packages import create_package, create_file
+    pkg = create_package(tmp_path, "mine")
+    for bad in ("Helpers.star", "helpers", "../escape.star", "helpers.py", ""):
+        with pytest.raises(ValueError):
+            create_file(pkg, bad)
+
+
+def test_remove_action_undeclares_but_keeps_the_file(tmp_path):
+    from packsmith.core.packages import create_package, add_action, remove_action
+    pkg = create_package(tmp_path, "mine")
+    add_action(pkg, "alpha", file="toolbox.star", function="alpha")
+    add_action(load_package(pkg.root), "beta", file="toolbox.star", function="beta")
+
+    remove_action(load_package(pkg.root), "alpha")
+    reloaded = load_package(pkg.root)
+    assert [a.action_id for a in reloaded.actions] == ["beta"]
+    source = (pkg.root / "toolbox.star").read_text(encoding="utf-8")
+    assert "def alpha(pack):" in source and "def beta(pack):" in source
+
+
+def test_remove_action_takes_its_subtables_and_spares_the_rest(tmp_path):
+    """Removing a block as text has to take the action's [actions.*] sub-tables with it,
+    and touch nothing else in the file."""
+    from packsmith.core.packages import remove_action
+    root = tmp_path / "mine"; root.mkdir()
+    (root / "manifest.toml").write_text('''# top comment
+[package]
+name = "mine"
+
+[[actions]]
+id = "doomed"
+file = "a.star"
+function = "run"
+
+[actions.mappings.target]
+tag_type = "bool"
+registry_type = "minecraft:item"
+
+[[actions]]
+id = "kept"
+file = "b.star"
+function = "run"
+
+[actions.mappings.other]
+tag_type = "string"
+''', encoding="utf-8")
+    remove_action(load_package(root), "doomed")
+
+    text = (root / "manifest.toml").read_text(encoding="utf-8")
+    assert "# top comment" in text
+    assert "doomed" not in text and "minecraft:item" not in text
+    kept = load_package(root)
+    assert [a.action_id for a in kept.actions] == ["kept"]
+    assert list(kept.actions[0].mappings) == ["other"]
+
+
+def test_remove_action_rejects_an_unknown_id(tmp_path):
+    from packsmith.core.packages import create_package, remove_action
+    pkg = create_package(tmp_path, "mine")
+    with pytest.raises(ValueError, match="no action"):
+        remove_action(pkg, "ghost")
+
+
+def test_delete_file_is_refused_while_an_action_declares_it(tmp_path):
+    from packsmith.core.packages import create_package, add_action, delete_file
+    pkg = create_package(tmp_path, "mine")
+    add_action(pkg, "go", file="toolbox.star")
+    with pytest.raises(ValueError, match="still implements"):
+        delete_file(load_package(pkg.root), "toolbox.star")
+    assert (pkg.root / "toolbox.star").is_file()
+
+
+def test_delete_file_works_once_undeclared(tmp_path):
+    from packsmith.core.packages import (
+        create_package, add_action, remove_action, delete_file)
+    pkg = create_package(tmp_path, "mine")
+    add_action(pkg, "go", file="toolbox.star")
+    remove_action(load_package(pkg.root), "go")
+    delete_file(load_package(pkg.root), "toolbox.star")
+    assert not (pkg.root / "toolbox.star").exists()
+
+
+def test_delete_file_refuses_the_manifest(tmp_path):
+    from packsmith.core.packages import create_package, delete_file
+    pkg = create_package(tmp_path, "mine")
+    with pytest.raises(ValueError):
+        delete_file(pkg, "manifest.toml")
+
+
+def test_rename_file_retargets_declarations_and_spares_the_manifest(tmp_path):
+    from packsmith.core.packages import create_package, add_action, rename_file
+    pkg = create_package(tmp_path, "mine")
+    manifest = pkg.root / "manifest.toml"
+    manifest.write_text(manifest.read_text(encoding="utf-8") + "\n# keep me\n",
+                        encoding="utf-8")
+    add_action(pkg, "alpha", file="toolbox.star", function="alpha")
+    add_action(load_package(pkg.root), "beta", file="toolbox.star", function="beta")
+
+    rename_file(load_package(pkg.root), "toolbox.star", "kit.star")
+    assert (pkg.root / "kit.star").is_file()
+    assert not (pkg.root / "toolbox.star").exists()
+    assert "# keep me" in manifest.read_text(encoding="utf-8")
+    assert {a.file for a in load_package(pkg.root).actions} == {"kit.star"}
+
+
+# --- folders: organisation only ---------------------------------------------------
+
+def test_create_folder_shows_up_while_still_empty(tmp_path):
+    """Listed from disk, not inferred from file paths — organising usually starts by
+    making the empty box."""
+    from packsmith.core.packages import create_package, create_folder, folders
+    pkg = create_package(tmp_path, "mine")
+    create_folder(pkg, "helpers")
+    assert folders(load_package(pkg.root)) == ["helpers"]
+
+
+def test_folders_are_listed_parents_before_children(tmp_path):
+    from packsmith.core.packages import create_package, create_folder, folders
+    pkg = create_package(tmp_path, "mine")
+    create_folder(pkg, "a/b/c")
+    assert folders(load_package(pkg.root)) == ["a", "a/b", "a/b/c"]
+
+
+def test_folder_names_reject_traversal(tmp_path):
+    from packsmith.core.packages import create_package, create_folder, create_file
+    pkg = create_package(tmp_path, "mine")
+    for bad in ("../escape", "a/../../b", "Helpers", ""):
+        with pytest.raises(ValueError):
+            create_folder(pkg, bad)
+    with pytest.raises(ValueError):
+        create_file(pkg, "../escape.star")
+
+
+def test_an_action_can_live_in_a_folder(tmp_path):
+    from packsmith.core.packages import create_package, add_action
+    pkg = create_package(tmp_path, "mine")
+    source = add_action(pkg, "go", file="helpers/math.star", function="go")
+    assert source == pkg.root / "helpers" / "math.star" and source.is_file()
+    assert load_package(pkg.root).actions[0].file == "helpers/math.star"
+
+
+def test_a_folder_action_resolves_to_a_callable(tmp_path):
+    """The manifest holds a relative path, so nesting has to survive ref resolution."""
+    from packsmith.core.packages import create_package, add_action
+    packages = tmp_path / "packages"; packages.mkdir()
+    add_action(create_package(packages, "mine"), "go", file="helpers/math.star",
+               function="go")
+    index = PackageIndex(packages)
+    assert callable(index.load_callable("mine:go"))
+
+
+def test_rename_file_into_a_folder_is_a_move(tmp_path):
+    from packsmith.core.packages import create_package, add_action, rename_file
+    pkg = create_package(tmp_path, "mine")
+    add_action(pkg, "go", file="toolbox.star")
+    rename_file(load_package(pkg.root), "toolbox.star", "helpers/toolbox.star")
+    assert (pkg.root / "helpers" / "toolbox.star").is_file()
+    assert not (pkg.root / "toolbox.star").exists()
+    assert load_package(pkg.root).actions[0].file == "helpers/toolbox.star"
+
+
+def test_rename_folder_retargets_everything_underneath(tmp_path):
+    from packsmith.core.packages import create_package, add_action, rename_folder
+    pkg = create_package(tmp_path, "mine")
+    add_action(pkg, "alpha", file="lib/a.star", function="alpha")
+    add_action(load_package(pkg.root), "beta", file="lib/deep/b.star", function="beta")
+    add_action(load_package(pkg.root), "loose", file="top.star")
+
+    rename_folder(load_package(pkg.root), "lib", "helpers")
+    assert {a.action_id: a.file for a in load_package(pkg.root).actions} == {
+        "alpha": "helpers/a.star",
+        "beta": "helpers/deep/b.star",
+        "loose": "top.star",
+    }
+    assert (pkg.root / "helpers" / "deep" / "b.star").is_file()
+
+
+def test_rename_folder_refuses_to_move_inside_itself(tmp_path):
+    from packsmith.core.packages import create_package, create_folder, rename_folder
+    pkg = create_package(tmp_path, "mine")
+    create_folder(pkg, "lib")
+    with pytest.raises(ValueError, match="inside itself"):
+        rename_folder(pkg, "lib", "lib/deeper")
+
+
+def test_delete_folder_is_refused_while_it_holds_a_declared_file(tmp_path):
+    from packsmith.core.packages import create_package, add_action, delete_folder
+    pkg = create_package(tmp_path, "mine")
+    add_action(pkg, "go", file="lib/a.star")
+    with pytest.raises(ValueError, match="still holds"):
+        delete_folder(load_package(pkg.root), "lib")
+    assert (pkg.root / "lib" / "a.star").is_file()
+
+
+def test_delete_folder_takes_undeclared_contents(tmp_path):
+    from packsmith.core.packages import (
+        create_package, create_file, delete_folder, source_files)
+    pkg = create_package(tmp_path, "mine")
+    create_file(pkg, "lib/a.star")
+    create_file(pkg, "lib/deep/b.star")
+    delete_folder(load_package(pkg.root), "lib")
+    assert source_files(load_package(pkg.root)) == ["manifest.toml"]
+
+
+def test_file_operations_refuse_downloaded_packages(tmp_path):
+    from packsmith.core.packages import create_file, delete_file, remove_action
+    root = tmp_path / "vendored"; root.mkdir()
+    (root / "manifest.toml").write_text(
+        '[package]\nname = "vendored"\nprovenance = "downloaded"\n', encoding="utf-8")
+    pkg = load_package(root)
+    for call in (lambda: create_file(pkg, "x.star"),
+                 lambda: delete_file(pkg, "x.star"),
+                 lambda: remove_action(pkg, "x")):
+        with pytest.raises(ValueError, match="downloaded"):
+            call()

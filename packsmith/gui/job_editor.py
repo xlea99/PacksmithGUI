@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (
 )
 
 from packsmith.gui.shell import style
+from packsmith.gui.shell.tree import PanelTree
 
 _INHERIT = "(inherit from job)"
 
@@ -285,7 +286,7 @@ class JobEditorTab(QWidget):
         header.addWidget(run)
         root.addLayout(header)
 
-        self._tree = QTreeWidget()
+        self._tree = PanelTree()
         self._tree.setColumnCount(4)
         self._tree.setHeaderLabels(["#", "Step", "Configured", "On failure"])
         self._tree.setRootIsDecorated(False)

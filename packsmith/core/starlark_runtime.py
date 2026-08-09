@@ -23,9 +23,10 @@ The host-side ``Pack`` is unchanged and remains the real implementation; this mo
 only the bridge.
 """
 import json
+from pathlib import Path
 
 import starlark
-from starlark import Globals, LibraryExtension, Module, StarlarkError
+from starlark import FileLoader, Globals, LibraryExtension, Module, StarlarkError
 
 from packsmith.core.pack import ActionFailure
 
@@ -72,6 +73,94 @@ class StarlarkActionError(Exception):
     """An action's Starlark failed for a reason other than a deliberate ``pack.fail()`` —
     a syntax error, a bad reference, a host error. Carries Starlark's own traceback, which
     includes file and line, so it can be shown to the user verbatim."""
+
+
+class PackageLoader:
+    """Resolves intra-package ``load("//path.star", …)`` against one package root (3.3.1).
+
+    Three properties are load-bearing, and each is a decision rather than a detail:
+
+    * **Containment.** ``//`` means the package root and nothing above it. A load that
+      escapes is refused — the same shape as ``pack.filesystem`` being scoped to the
+      instance root. This is what makes "a package can only talk to itself" true, and it
+      is why the manifest does not need to list every file it owns: the boundary is the
+      directory, checked here, not a list that can drift from disk.
+    * **No ambient capability** (3.3.1). Loaded modules are evaluated with the globals and
+      *nothing else* — no ``pack``. A helper has exactly the authority its caller hands it
+      as an argument, which keeps capability tracking readable at the call site.
+    * **Freeze-and-cache per run.** A module is evaluated once per action invocation and
+      reused, so a diamond doesn't re-evaluate. The cache is deliberately per-invocation:
+      sources are re-read on every run so an edit takes effect without a restart, and a
+      longer-lived cache would quietly defeat that.
+
+    Cross-package ``@other//`` is not handled here. It needs the dependency list to
+    resolve against, which needs an installer that doesn't exist yet.
+    """
+
+    PREFIX = "//"
+
+    def __init__(self, package_root, package_name: str = ""):
+        self._root = Path(package_root).resolve()
+        self._name = package_name or self._root.name
+        self._cache = {}
+        self._loading = []      # the active load chain, for cycle detection
+
+    def file_loader(self) -> FileLoader:
+        return FileLoader(self.load)
+
+    def resolve(self, module_id: str) -> Path:
+        """Turn a Starlark module id into a real path inside the package."""
+        if module_id.startswith("@"):
+            raise ValueError(
+                f"cross-package load '{module_id}' isn't supported yet — an action can "
+                f"currently only load from its own package with "
+                f"'{self.PREFIX}path/to/file.star'")
+        if not module_id.startswith(self.PREFIX):
+            raise ValueError(
+                f"load path '{module_id}' must start with '{self.PREFIX}', which means "
+                f"the root of package '{self._name}' (e.g. "
+                f"'{self.PREFIX}helpers/thing.star')")
+
+        relative = module_id[len(self.PREFIX):]
+        if not relative.endswith(".star"):
+            raise ValueError(f"load path '{module_id}' must name a .star file")
+        # Rejected by name rather than by the containment check below, because "you can't
+        # go up out of the package" is the actual rule and says so.
+        if ".." in relative.replace("\\", "/").split("/"):
+            raise ValueError(
+                f"load path '{module_id}' leaves package '{self._name}'; a package can "
+                f"only load its own files")
+
+        target = (self._root / relative).resolve()
+        if not target.is_relative_to(self._root):
+            raise ValueError(
+                f"load path '{module_id}' leaves package '{self._name}'; a package can "
+                f"only load its own files")
+        if not target.is_file():
+            raise ValueError(f"no such file in package '{self._name}': {relative}")
+        return target
+
+    def load(self, module_id: str):
+        """The FileLoader callback: evaluate a module and hand back its frozen form."""
+        if module_id in self._cache:
+            return self._cache[module_id]
+        if module_id in self._loading:
+            chain = " -> ".join(self._loading + [module_id])
+            raise ValueError(f"load cycle: {chain}")
+
+        target = self.resolve(module_id)
+        self._loading.append(module_id)
+        try:
+            module = Module()
+            # No _inject here, deliberately: helpers get no ambient `pack`.
+            starlark.eval(module, starlark.parse(module_id,
+                                                 target.read_text(encoding="utf-8")),
+                          _GLOBALS, self.file_loader())
+            frozen = module.freeze()
+        finally:
+            self._loading.pop()
+        self._cache[module_id] = frozen
+        return frozen
 
 
 def _prelude(pack) -> str:
@@ -141,8 +230,13 @@ def _inject(module: Module, pack):
         module.add_callable(name, fn)
 
 
-def run_starlark(source: str, pack, *, function: str = "run", filename: str = "action.star"):
+def run_starlark(source: str, pack, *, function: str = "run", filename: str = "action.star",
+                 loader: PackageLoader = None):
     """Evaluate an action's Starlark source and call its entry point with ``pack``.
+
+    ``loader`` enables intra-package ``load()``; without one, a ``load`` statement is a
+    plain Starlark error ("No imports are available"), which is the correct behaviour for
+    a bare source string with no package behind it.
 
     Raises :class:`~packsmith.core.pack.ActionFailure` when the action called
     ``pack.fail()``, and :class:`StarlarkActionError` for anything else. The caller
@@ -151,9 +245,11 @@ def run_starlark(source: str, pack, *, function: str = "run", filename: str = "a
     """
     module = Module()
     _inject(module, pack)
+    files = loader.file_loader() if loader is not None else None
     try:
         starlark.eval(module, starlark.parse("_prelude.star", _prelude(pack)), _GLOBALS)
-        starlark.eval(module, starlark.parse(filename, source), _GLOBALS)
+        # Only the action's own source can carry loads; the prelude and the call are ours.
+        starlark.eval(module, starlark.parse(filename, source), _GLOBALS, files)
         return starlark.eval(module, starlark.parse(f"{filename}#call",
                                                     f"{function}(pack)"), _GLOBALS)
     except StarlarkError as e:

@@ -11,6 +11,7 @@ from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import QTreeWidget, QTreeWidgetItem, QAbstractItemView
 
 from packsmith.gui.shell import style
+from packsmith.gui.shell.tree import PanelTree
 from packsmith.gui.shell.panels.base import Panel
 
 
@@ -22,7 +23,7 @@ class RegistryPanel(Panel):
         super().__init__("Registry", parent)
         self._packdump = packdump
 
-        self._tree = QTreeWidget()
+        self._tree = PanelTree()
         self._tree.setColumnCount(2)
         self._tree.setHeaderHidden(True)
         self._tree.setRootIsDecorated(False)

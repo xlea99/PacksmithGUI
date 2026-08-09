@@ -31,9 +31,14 @@ _HTML_PATH = Path(__file__).with_name("monaco_host.html")
 
 # Monaco has no Starlark grammar, but Starlark *is* a Python dialect — the highlighting is
 # correct for everything an action can legally contain.
+#
+# It has no TOML grammar either, and unlike Starlark there's no exact stand-in. `ini` is
+# the closest thing Monaco ships: `[sections]`, `key = value`, `#` comments — TOML's basic
+# shape, and all manifest.toml actually uses. Naming a language Monaco doesn't have is not
+# an error, it just silently renders as plaintext, which is how this went unnoticed.
 _EXT_TO_LANGUAGE = {
     ".star": "python", ".py": "python", ".js": "javascript", ".ts": "typescript",
-    ".json": "json", ".json5": "json", ".mcmeta": "json", ".toml": "toml",
+    ".json": "json", ".json5": "json", ".mcmeta": "json", ".toml": "ini",
     ".yaml": "yaml", ".yml": "yaml", ".xml": "xml", ".html": "html", ".css": "css",
     ".md": "markdown", ".txt": "plaintext", ".cfg": "ini", ".ini": "ini",
     ".properties": "ini", ".lang": "ini", ".snbt": "plaintext", ".mcfunction": "plaintext",
@@ -91,6 +96,7 @@ class EditorHost(QObject):
         self._ready = False
         self._pending = []          # calls queued until Monaco finishes loading
         self._locked = set()
+        self._opened = set()        # keys Monaco holds a model for, so rebind can drop them
 
         self._bridge = _Bridge()
         self._bridge.ready.connect(self._on_ready)
@@ -111,10 +117,11 @@ class EditorHost(QObject):
         self.view.page().setBackgroundColor(QColor(style.BG_DEEP))
         self.view.setStyleSheet(f"background: {style.BG_DEEP};")
         self.view.hide()
-        # A real base URL so the CDN fetch resolves. Bundling Monaco locally (design 4.2)
-        # is still outstanding — until then the first open needs a network round trip.
-        self.view.setHtml(_HTML_PATH.read_text(encoding="utf-8"),
-                          QUrl("https://cdnjs.cloudflare.com/"))
+        # Navigate to the file rather than setHtml-ing its text: the page needs a real
+        # file:// document URL for `./vendor/monaco/vs` to resolve, and for the page to
+        # derive the absolute path its web workers need. Monaco is vendored, so this is
+        # the whole of the offline story — no network, no first-open round trip.
+        self.view.load(QUrl.fromLocalFile(str(_HTML_PATH)))
 
     # --- plumbing ----------------------------------------------------------
 
@@ -164,6 +171,7 @@ class EditorHost(QObject):
         source = self._sources[source_name]
         content = source.read(path) or ""
         read_only = bool(read_only or source.read_only_reason(path))
+        self._opened.add(key)
         if read_only:
             self._locked.add(key)
         self._js(f"openModel({self._quote(key)}, {self._quote(content)}, "
@@ -175,7 +183,23 @@ class EditorHost(QObject):
 
     def close_document(self, key: str):
         self._locked.discard(key)
+        self._opened.discard(key)
         self._js(f"closeModel({self._quote(key)})")
+
+    def rebind(self, sources: dict):
+        """Point the host at a different profile's documents, keeping the web view alive.
+
+        Switching profiles rebuilds everything else in the window, but not this: the view
+        is a `QWebEngineView`, so recreating it means paying Chromium startup again and
+        re-entering the widget-lifetime problems that made the shared-view design tricky
+        in the first place (see :meth:`EditorTab.attach_to`). Every model is dropped
+        because every model belonged to the old profile.
+        """
+        for key in list(self._opened):
+            self.close_document(key)
+        self._locked.clear()
+        self._opened.clear()
+        self._sources = dict(sources)
 
     def unlock(self, key: str):
         """Lift a lock the user is permitted to lift, unlocking the buffer in place."""

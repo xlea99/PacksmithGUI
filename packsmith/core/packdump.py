@@ -1,5 +1,6 @@
 import json
 import shutil
+from dataclasses import dataclass, field
 from pathlib import Path
 from datetime import datetime, timezone
 #from types import MappingProxyType
@@ -57,11 +58,17 @@ class Packdump:
             if mod['version'] != other_mod['version']:
                 return False
 
-        # Check for each registry key, and that each key has equivalent number of items
+        # Check each registry key, and that each holds the same ENTRIES — not merely the
+        # same number of them. Counts alone let a config change that swaps one item for
+        # another read as "no change", and equality here is what decides whether a new
+        # dump gets imported at all; a false "identical" is exactly the silent staleness
+        # the import design is built to prevent. Comparing id sets is cheap even at
+        # 300-mod scale.
         if set(self._registries.keys()) != set(other._registries.keys()):
             return False
         for reg_type in self._registries:
-            if self._registries[reg_type]["count"] != other._registries[reg_type]["count"]:
+            if (set(self._registries[reg_type]["values"])
+                    != set(other._registries[reg_type]["values"])):
                 return False
 
         return True
@@ -374,10 +381,93 @@ class Packdump:
 # This helper method imports a packdump from the minecraft instance (or a given path) as the local, current
 # packdump snapshot, rotating out previous dumps as specified by the user's `packdump_snapshot_count` in main.toml.
 # This is all skipped if the incoming dump is identical to the current dump
-def import_packdump(profile: Profile, source_path: Path = None):
-    source_path = source_path or (profile.mc_path / "packsmith")
-    incoming = Packdump.load(source_path)
+@dataclass
+class ImportResult:
+    """What an attempted import did, and what it means for the user's data.
 
+    The import itself is never the risky part — Layer 1 is read-only, so adopting a dump
+    modifies nothing the user owns. What changes is how their Layer 2 data *reads* against
+    it. So this carries enough for the caller to be loud in proportion to the consequences
+    rather than to the mere fact that an import happened.
+    """
+    status: str                       # unchanged | imported | refused | missing | unreadable
+    packdump: object = None           # the dump now in effect (previous one, if refused)
+    issues: dict = field(default_factory=dict)      # from Profile.validate_packdump
+    diff: dict = field(default_factory=dict)        # from Packdump.compare, old -> new
+    adopted: list = field(default_factory=list)     # contract fields this dump defined
+    forced: bool = False
+    reason: str = ""                  # why, when status is refused or missing
+
+    @property
+    def errors(self) -> dict:
+        return {name: issue for name, issue in self.issues.items()
+                if issue.get("level") == "error"}
+
+    def registry_delta(self) -> tuple:
+        """(added, removed) entry counts across every registry, for a one-line summary."""
+        changed = self.diff.get("registries", {}).get("changed", {})
+        # compare() is called as current.compare(incoming), so "only_in_self" is what the
+        # OLD dump had and the new one doesn't: removed.
+        removed = sum(len(c.get("only_in_self", [])) for c in changed.values())
+        added = sum(len(c.get("only_in_other", [])) for c in changed.values())
+        return added, removed
+
+    def mod_delta(self) -> tuple:
+        mods = self.diff.get("mods", {})
+        return len(mods.get("only_in_other", [])), len(mods.get("only_in_self", []))
+
+
+def check_packdump(profile: Profile, source_path: Path = None) -> ImportResult:
+    """Look at what's on disk without adopting it. Same decision as ``import_packdump``
+    makes, minus the side effects — used to poll on window focus without importing."""
+    source_path = source_path or (profile.mc_path / "packsmith")
+    current = current_packdump(profile)
+    if not (source_path / "meta.json").exists():
+        return ImportResult("missing", current,
+                            reason=f"no packdump found at {source_path}")
+    try:
+        incoming = Packdump.load(source_path)
+    except Exception as e:
+        # "unreadable", not "missing" — a corrupt or half-written dump is a different
+        # problem from an instance the Forge mod has never run in, and conflating them
+        # would send the user looking in the wrong place.
+        return ImportResult("unreadable", current, reason=str(e))
+
+    if current is not None and current == incoming:
+        return ImportResult("unchanged", current)
+    issues = profile.validate_packdump(incoming)
+    diff = current.compare(incoming) if current is not None else {}
+    status = "refused" if any(i.get("level") == "error" for i in issues.values()) \
+        else "imported"
+    return ImportResult(status, incoming if status == "imported" else current,
+                        issues=issues, diff=diff)
+
+
+def current_packdump(profile: Profile):
+    """The snapshot currently in effect, or None if the profile has never imported one."""
+    latest_dir = profile.packdumps_dir / "latest"
+    if not (latest_dir / "meta.json").exists():
+        return None
+    return Packdump.load(latest_dir)
+
+
+def import_packdump(profile: Profile, source_path: Path = None, *, force: bool = False) -> ImportResult:
+    """Adopt the instance's packdump as this profile's latest snapshot.
+
+    Refuses when the dump fails the profile's contract (see ``Profile.validate_packdump``):
+    a different loader or Minecraft version means this is not a snapshot of the same pack,
+    and adopting it would reinterpret every tag the user owns against a registry that isn't
+    theirs. ``force`` overrides, and exists only because a check we got wrong shouldn't be
+    a dead end.
+    """
+    source_path = source_path or (profile.mc_path / "packsmith")
+    checked = check_packdump(profile, source_path)
+    if checked.status in ("unchanged", "missing", "unreadable"):
+        return checked
+    if checked.status == "refused" and not force:
+        return checked
+
+    incoming = Packdump.load(source_path)
     latest_dir = profile.packdumps_dir / "latest"
     history_dir = profile.packdumps_dir / "history"
     history_dir.mkdir(parents=True, exist_ok=True)
@@ -385,9 +475,6 @@ def import_packdump(profile: Profile, source_path: Path = None):
     # If we already have a latest, check if it's the same dump
     if (latest_dir / "meta.json").exists():
         current = Packdump.load(latest_dir)
-        if current == incoming:
-            log.info("Incoming packdump is identical to latest, skipping import")
-            return current
 
         # This means its a new dump! Archive the current latest before replacing
         archive_name = current.timestamp.strftime("%Y-%m-%d_%H-%M-%S")
@@ -408,7 +495,12 @@ def import_packdump(profile: Profile, source_path: Path = None):
     latest_dir.mkdir(parents=True, exist_ok=True)
     incoming.save(latest_dir)
     log.info(f"Imported new packdump as latest")
-    return incoming
+
+    # A profile created without a declared version has no contract; the first dump it
+    # accepts defines one, and everything after is checked against that.
+    adopted = profile.adopt_contract_from(incoming)
+    return ImportResult("imported", incoming, issues=checked.issues, diff=checked.diff,
+                        adopted=adopted, forced=force and bool(checked.errors))
 
 # Simply returns a list of snapshot summaries from history, sorted newest first. Each summary contains
 # a timestamp, mc_version, loader, loader_version, mod_count, and path.

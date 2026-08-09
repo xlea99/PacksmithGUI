@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
 )
 
 from packsmith.gui.shell import style
+from packsmith.gui.shell.tree import PanelTree
 from packsmith.gui.shell.panels.base import Panel
 
 _ROLE_REGISTRY = Qt.UserRole
@@ -53,7 +54,7 @@ class TagsPanel(Panel):
         bar_lay.addStretch()
         self.body().addWidget(bar)
 
-        self._tree = QTreeWidget()
+        self._tree = PanelTree()
         self._tree.setColumnCount(2)
         self._tree.setHeaderHidden(True)
         self._tree.setSelectionMode(QAbstractItemView.SingleSelection)

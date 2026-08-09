@@ -17,6 +17,7 @@ from PySide6.QtWidgets import (
 
 from packsmith.core.history import rollback_step
 from packsmith.gui.shell import style
+from packsmith.gui.shell.tree import PanelTree
 
 
 def _empty_label(text) -> QLabel:
@@ -38,7 +39,7 @@ class _SummaryView(QWidget):
         lay.setSpacing(0)
 
         self._empty = _empty_label(empty_text)
-        self._tree = QTreeWidget()
+        self._tree = PanelTree()
         self._tree.setColumnCount(len(headers))
         self._tree.setHeaderLabels(headers)
         self._tree.setRootIsDecorated(False)
@@ -224,6 +225,11 @@ class ErrorsView(_SummaryView):
         self._tree.setContextMenuPolicy(Qt.CustomContextMenu)
         self._tree.customContextMenuRequested.connect(self._on_context_menu)
         self.refresh()
+
+    def has_problems(self) -> bool:
+        """Whether anything is currently listed. Lets callers decide to interrupt without
+        recomputing orphans a second time."""
+        return self._tree.topLevelItemCount() > 0
 
     def refresh(self):
         self._tree.clear()
