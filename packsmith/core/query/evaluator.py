@@ -253,8 +253,9 @@ def _compile_filter(node, catalog):
         sub = _compile_filter(node.clause, catalog)
         return lambda e: not sub(e)
     if isinstance(node, Has):
-        res = catalog.resolver(node.field)
-        return lambda e: res(e) is not None
+        # Existence, not value — see `presence`. Using the resolver here made HAS true for
+        # every entry whenever the tag had a default.
+        return catalog.presence(node.field)
     if isinstance(node, Cmp):
         return _compile_cmp(node, catalog.resolver(node.field))
     raise QueryError(f"not a filter: {node!r}")

@@ -93,6 +93,13 @@ class BlueprintFieldCatalog:
                 f"requires Deref, which is not supported in v1")
         raise QueryError(f"not a field: {field!r}")
 
+    def presence(self, field):
+        """Blueprint bindings have no defaults — a slot is bound or it is a gap — so here
+        existence really is "the resolver found something". Present for interface parity,
+        so the evaluator never has to ask which catalog it is holding."""
+        resolve = self.resolver(field)
+        return lambda e: resolve(e) is not None
+
 
 # A slot's storage type mapped to the column type the renderers understand. Registry and
 # blueprint bindings are ids: strings, as far as sorting and comparison care.
@@ -138,3 +145,22 @@ class RegistryFieldCatalog:
         if isinstance(field, Slot):
             raise QueryError("blueprint slots require a Blueprint scope (not supported in v1)")
         raise QueryError(f"not a field: {field!r}")
+
+    def presence(self, field):
+        """"Is this assigned?" — **existence**, which is a different question from value.
+
+        `resolver` deliberately sugars a pristine cell into the tag's default, because that
+        is what a table cell should show (design 3.2.1). Asking existence through it makes
+        `HAS t:remove` true for every entry the moment `remove` has a default — so the
+        gap-finding idiom the whole engine is built around quietly returns everything, and
+        `NOT HAS` returns nothing. 3.2.4 defines Has as "the tag is assigned", and only the
+        row's existence answers that.
+        """
+        reg = self._reg
+        if isinstance(field, Tag) and self._tags is not None:
+            name = field.name
+            return lambda e: self._tags.assignment(reg, e, name) is not None
+        # Everything else (id, mod, attributes) has no default to inflate, so presence is
+        # just "the resolver found something".
+        resolve = self.resolver(field)
+        return lambda e: resolve(e) is not None

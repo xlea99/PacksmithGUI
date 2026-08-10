@@ -105,6 +105,18 @@ def validate_binding(slot, tag_definition):
         raise ValueError(
             f"mapping '{slot.name}' needs a '{slot.tag_type}' tag, "
             f"but the bound tag is '{tag_definition['type']}'")
+    # Design 3.3: an action that branches on `if tier == "late"` has an undeclared
+    # dependency unless it says so — the mapping system would happily bind it to an enum
+    # with no `late` and the failure would only show up at run time as silently-skipped
+    # work. Semantics are AT-LEAST: the user's enum must contain these, and may have more.
+    if slot.requires_values:
+        absent = [v for v in slot.requires_values
+                  if v not in (tag_definition.get("values") or [])]
+        if absent:
+            raise ValueError(
+                f"mapping '{slot.name}' needs the value(s) {', '.join(absent)} on "
+                f"'{tag_definition['name']}', which only has "
+                f"{', '.join(tag_definition.get('values') or []) or 'none'}")
 
 
 # A ``kind='blueprint'`` mapping binds one of the user's blueprint SCHEMAS, and exists for

@@ -36,6 +36,9 @@ class MappingSlot:
     # Structural typing for blueprint mappings (design 3.3): the SHAPE this action needs,
     # never a schema name. Flat requirements by dotted path — see core/shapes.py.
     required_shape: tuple = ()
+    # The enum values this action actually branches on (design 3.3) — the tag analog of
+    # required_shape, and "the shape of the thing I am bound to" for a vocabulary.
+    requires_values: tuple = ()
     # Mandatory on write/read_write mappings (design 3.3): what happens when this action
     # writes a cell someone else already owns. There is deliberately NO default — "the
     # author must explicitly choose… there is no universally-correct answer."
@@ -641,6 +644,15 @@ def _parse_mappings(raw: dict) -> dict:
             raise ValueError(
                 f"mapping '{name}': invalid cardinality '{cardinality}' "
                 f"(expected one of {', '.join(CARDINALITIES)})")
+        raw_values = spec.get("requires_values")
+        if raw_values is not None:
+            if kind != "tag" or spec.get("tag_type") != "enum":
+                raise ValueError(
+                    f"mapping '{name}': requires_values only applies to enum tag mappings")
+            if not isinstance(raw_values, (list, tuple)) or not all(
+                    isinstance(v, str) for v in raw_values):
+                raise ValueError(
+                    f"mapping '{name}': requires_values must be a list of strings")
         raw_shape = spec.get("required_shape")
         if raw_shape is not None and kind not in BLUEPRINT_KINDS:
             # The tag analog of required_shape is `requires_values`; a shape on a tag
@@ -661,6 +673,7 @@ def _parse_mappings(raw: dict) -> dict:
             description=spec.get("description", ""),
             conflict_policy=policy,
             required_shape=shape,
+            requires_values=tuple(raw_values or ()),
         )
     return mappings
 

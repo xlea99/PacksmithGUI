@@ -112,8 +112,13 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def _default_profile() -> str:
-        """Which profile to open at launch. Falls back to creating the dev one so a fresh
-        checkout still starts; once profiles are switchable this is only a first-run path."""
+        """Which profile to open at launch, or "" when the user has none yet.
+
+        There used to be a hardcoded fallback that CREATED a profile pointing at a path
+        under one developer's home directory: a guaranteed launch crash on any other
+        machine, and on that one machine it quietly invented a profile nobody asked for.
+        First run now opens the gated window instead, which is what §3.1 describes —
+        PackSmith "won't let you do anything until it loads its first packdump"."""
         existing = list_profiles()
         if "packsmith_test" in existing:
             return "packsmith_test"
@@ -122,6 +127,9 @@ class MainWindow(QMainWindow):
     def _enter_profile(self, name: str):
         """Open a profile and build the window around it."""
         self._load_profile(name)
+        if self._blocked:
+            self._build_blocked_shell(self._blocked)
+            return
         self._seed_tags()
         self._seed_views()
         self._seed_packages()
@@ -130,14 +138,17 @@ class MainWindow(QMainWindow):
         self._report_import(self._import_result, initial=True)
 
     def _load_profile(self, name: str):
+        self._blocked = None
         if not name:
-            self._profile = Profile.create(
-                "packsmith_test",
-                mc_path=r"C:\Users\timbe\curseforge\minecraft\Instances\Packsmith Test",
-                loader="forge", loader_version="47.4.10", mc_version="1.20.1",
-            )
-        else:
-            self._profile = Profile.load(name)
+            self._profile = None
+            self._packdump = None
+            self._import_result = None
+            self._blocked = (
+                "PackSmith needs a profile before it can do anything.\n\n"
+                "A profile points at one Minecraft instance. Create one from the Profiles "
+                "menu, then launch the game once so the Packsmith mod writes its packdump.")
+            return
+        self._profile = Profile.load(name)
         # Auto-import, always — a stale registry is the worse failure, because it produces
         # confidently wrong output that looks fine, while an unwanted import announces
         # itself the moment you look at anything. What is *not* automatic is adopting a
@@ -145,9 +156,15 @@ class MainWindow(QMainWindow):
         self._import_result = import_packdump(self._profile)
         self._packdump = self._import_result.packdump or current_packdump(self._profile)
         if self._packdump is None:
-            raise RuntimeError(
-                f"Profile '{self._profile.name}' has no packdump and none could be "
-                f"imported from {self._profile.mc_path}: {self._import_result.reason}")
+            # §3.1 gates the app on the first packdump; it does not crash it. Raising here
+            # propagated straight out of __init__ at first launch, so the user got a console
+            # traceback and no window — indistinguishable from the app being broken.
+            self._blocked = (
+                f"Profile '{self._profile.name}' has no packdump yet.\n\n"
+                f"Launch Minecraft once with the Packsmith mod installed so it can write "
+                f"one to:\n{self._profile.mc_path}\n\n"
+                f"{self._import_result.reason or ''}").strip()
+            return
         self._db = UserDB(self._profile.root / "profile.db")
         self._tags = TagStore(self._db)
         self._packages = PackageIndex(self._profile.packages_dir)
@@ -159,6 +176,45 @@ class MainWindow(QMainWindow):
         self._blueprints = BlueprintStore(self._db, packdump=self._packdump)
 
     # --- shell -------------------------------------------------------------
+
+    def _build_blocked_shell(self, reason: str):
+        """A window that explains what's missing instead of a console traceback.
+
+        §3.1: PackSmith "won't let you do anything until it loads its first packdump" —
+        gated, not absent. The menu bar stays live so the one thing that can fix this
+        (Profiles) is reachable; everything that needs a registry simply isn't built.
+        """
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(48, 48, 48, 48)
+        lay.addStretch()
+
+        title = QLabel("Nothing to work on yet")
+        title.setAlignment(Qt.AlignCenter)
+        title.setStyleSheet(f"color: {style.TEXT}; font-size: 18px; font-weight: bold;")
+        lay.addWidget(title)
+
+        body = QLabel(reason)
+        body.setAlignment(Qt.AlignCenter)
+        body.setWordWrap(True)
+        body.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        body.setStyleSheet(f"color: {style.TEXT_MUTED}; font-size: 12px;")
+        lay.addWidget(body)
+
+        row = QHBoxLayout()
+        row.addStretch()
+        again = QPushButton("Check again")
+        again.clicked.connect(lambda: self._enter_profile(self._default_profile()))
+        row.addWidget(again)
+        profiles = QPushButton("Profiles…")
+        profiles.clicked.connect(self._open_profile)
+        row.addWidget(profiles)
+        row.addStretch()
+        lay.addLayout(row)
+        lay.addStretch()
+
+        self.setCentralWidget(page)
+        self.statusBar().showMessage("No packdump loaded")
 
     def _build_shell(self):
         central = QWidget()
@@ -1380,7 +1436,8 @@ class MainWindow(QMainWindow):
     def _edit_enum_values(self, registry_type, tag_name):
         """Add / remove / reorder an enum tag's values (§3.2.1). The dialog owns the
         blast-radius confirmation; removed values leave orphans, not deleted data."""
-        dlg = EnumValuesDialog(self._tags, registry_type, tag_name, parent=self)
+        dlg = EnumValuesDialog(self._tags, registry_type, tag_name, parent=self,
+                               job_store=self._jobs, package_index=self._packages)
         if not dlg.exec():
             return
         self._tags_panel.refresh()
@@ -1430,6 +1487,12 @@ class MainWindow(QMainWindow):
         self._reload_blueprint_tabs()
         self._blueprints_panel.refresh()
         self._files_panel.refresh()
+        # An open editor's lock was decided when it opened. If the run took a file the user
+        # had open, the tab has to stop looking editable — the save is refused either way
+        # (§6.1), but discovering that at Ctrl+S is a worse way to learn it.
+        for key in self._editor_host.resync_locks():
+            self._set_status(f"{key.split(':', 1)[-1]} was changed by this run — "
+                             f"it's now locked; reload it to see the new contents")
 
     def _delete_tag(self, registry_type, tag_name):
         """Undefine a tag. §3.2.1: this cascades to every assignment, so the confirmation

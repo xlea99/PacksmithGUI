@@ -21,6 +21,8 @@ implement.
 """
 from pathlib import Path
 
+from packsmith.core.files import FileOwnershipError
+
 
 class DocumentSource:
     """Read/write access to one family of editable documents."""
@@ -62,6 +64,21 @@ class InstanceFileSource(DocumentSource):
         return self._files.read(path)
 
     def write(self, path, content):
+        """Save — refusing if an action has taken the file since this buffer was read.
+
+        §6.1: "Never silent overwrites", and editing an action-owned file is locked until
+        an explicit take. That lock used to live only in the editor's read-only flag, which
+        is computed once when the document opens — so a file that became action-owned while
+        the tab sat there stayed writable, and Ctrl+S both destroyed the action's output and
+        transferred ownership with no prompt. The rule belongs on the write, where it can't
+        go stale.
+        """
+        managing = self.managing_action(path)
+        if managing:
+            raise FileOwnershipError(
+                f"'{path}' is now managed by '{managing}' — it was written while you had "
+                f"it open, so saving would overwrite that action's output with an older "
+                f"copy. Reload it, or take ownership first.")
         self._files.write(path, content, owner="user")
 
     def managing_action(self, path):

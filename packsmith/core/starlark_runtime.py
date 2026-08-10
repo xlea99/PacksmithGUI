@@ -287,8 +287,16 @@ def _inject(module: Module, pack):
         # Filesystem operations take the path first so `partial` can pre-bind it.
         "_fs_read_all": lambda path: pack.filesystem.resolve(path).read_all(),
         "_fs_read_json": lambda path: pack.filesystem.resolve(path).read_json(),
-        "_fs_write": lambda path, content: pack.filesystem.resolve(path).write(content),
-        "_fs_write_json": lambda path, obj: pack.filesystem.resolve(path).write_json(obj),
+        # The existence flags are part of the declared surface (§7.3) — dropping them here
+        # made `handle.write(x, file_must_exist=True)` a TypeError from Starlark, so the
+        # only guard an action could ask for was unreachable from the only language that
+        # writes actions.
+        "_fs_write": lambda path, content, file_must_exist=False:
+            pack.filesystem.resolve(path).write(
+                content, file_must_exist=file_must_exist),
+        "_fs_write_json": lambda path, obj, file_must_exist=False:
+            pack.filesystem.resolve(path).write_json(
+                obj, file_must_exist=file_must_exist),
         "_fs_exists": lambda path: pack.filesystem.resolve(path).exists(),
         "_fs_ownership": lambda path: pack.filesystem.resolve(path).ownership(),
     }.items():

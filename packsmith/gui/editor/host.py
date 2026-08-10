@@ -211,6 +211,32 @@ class EditorHost(QObject):
         self._js(f"setReadOnly({self._quote(key)}, false)")
         self.unlocked.emit(key)
 
+    def resync_locks(self):
+        """Re-ask every open document whether it is still writable.
+
+        Lock state is decided when a document opens, which is fine until something else
+        writes the file — a job run, most obviously. Without this the tab keeps *looking*
+        editable after an action takes the file; the save is refused at the source (§6.1),
+        but being told "no" at Ctrl+S is a worse experience than seeing the lock appear.
+        Returns the keys whose state changed, so the caller can say so.
+        """
+        changed = []
+        for key in sorted(self._opened):
+            try:
+                source, path = self._source_of(key)
+            except (KeyError, ValueError):
+                continue
+            locked_now = bool(source.read_only_reason(path))
+            if locked_now == (key in self._locked):
+                continue
+            if locked_now:
+                self._locked.add(key)
+            else:
+                self._locked.discard(key)
+            self._js(f"setReadOnly({self._quote(key)}, {str(locked_now).lower()})")
+            changed.append(key)
+        return changed
+
     def request_save(self, key: str):
         """Ask Monaco for the buffer, which comes back through the save signal."""
         self.view.page().runJavaScript(

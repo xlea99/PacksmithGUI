@@ -109,3 +109,44 @@ def test_best_guess_none_when_nothing_compatible(tags):
     tags.define(REG, "notes", "string")
     m = _manifest(mappings={"source": MappingSlot("source", tag_type="bool", registry_type=REG)})
     assert best_guess_bindings(m, tags)["source"] is None
+
+
+# --- requires_values: the tag analog of required_shape (design 3.3) ---------
+
+def test_requires_values_is_parsed_and_scoped_to_enum_tags():
+    from packsmith.core.packages import _parse_mappings
+    parsed = _parse_mappings({"tier": {"kind": "tag", "tag_type": "enum",
+                                       "registry_type": REG,
+                                       "requires_values": ["early", "late"]}})
+    assert parsed["tier"].requires_values == ("early", "late")
+
+    with pytest.raises(ValueError, match="only applies to enum tag mappings"):
+        _parse_mappings({"t": {"kind": "tag", "tag_type": "bool",
+                               "requires_values": ["x"]}})
+    with pytest.raises(ValueError, match="only applies to enum tag mappings"):
+        _parse_mappings({"b": {"kind": "blueprint", "requires_values": ["x"]}})
+
+
+def test_binding_an_enum_missing_a_required_value_is_refused(tags):
+    """§3.3: without this an action branching on `tier == "late"` has an undeclared
+    dependency, and the failure shows up at run time as silently-skipped work."""
+    tags.define(REG, "tier", "enum", ["early", "mid"])
+    slot = MappingSlot("tier", kind="tag", tag_type="enum", registry_type=REG,
+                       requires_values=("early", "late"))
+    with pytest.raises(ValueError, match="late"):
+        validate_binding(slot, tags.definition(REG, "tier"))
+
+
+def test_semantics_are_at_least_not_exact(tags):
+    """"the user's enum must *contain* the declared values but may have others" — adding a
+    value must never invalidate an action that doesn't care about it."""
+    tags.define(REG, "tier", "enum", ["early", "mid", "late", "end"])
+    slot = MappingSlot("tier", kind="tag", tag_type="enum", registry_type=REG,
+                       requires_values=("early", "late"))
+    validate_binding(slot, tags.definition(REG, "tier"))       # must not raise
+
+
+def test_a_mapping_declaring_nothing_accepts_any_enum(tags):
+    tags.define(REG, "tier", "enum", ["whatever"])
+    slot = MappingSlot("tier", kind="tag", tag_type="enum", registry_type=REG)
+    validate_binding(slot, tags.definition(REG, "tier"))

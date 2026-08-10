@@ -419,3 +419,78 @@ def test_an_edited_helper_takes_effect_without_a_restart(pack, tmp_path):
     assert index.load_callable("mine:go")(pack) == 1
     helper.write_text('def value():\n    return 99\n', encoding="utf-8")
     assert index.load_callable("mine:go")(pack) == 99
+
+
+# --- existence flags reach Starlark, and guard at the call (design 7.3) ------
+
+def _fs_action(src, tags, tmp_path):
+    """Run a Starlark source with a real file store, returning the StepResult."""
+    from packsmith.core.files import FileStore
+    from packsmith.core.runner import run_action
+    store = FileStore(tags._db, tmp_path)
+
+    def action(pack):
+        run_starlark(src, pack, function="run", filename="fs.star")
+
+    return run_action(action, tag_store=tags, packdump=FakeDump(), action_ref="pkg:act",
+                      file_store=store), store
+
+
+def test_file_must_exist_is_reachable_from_starlark(tags, tmp_path):
+    """It was declared in §7.3 and dropped by the bridge lambda, so asking for the only
+    guard an action can request was a TypeError from the only language actions are in."""
+    src = ('def run(pack):\n'
+           '    pack.filesystem.resolve("absent.json").write("{}", file_must_exist = True)\n')
+    result, store = _fs_action(src, tags, tmp_path)
+    assert not result.ok
+    assert "unexpected keyword argument" not in (result.reason or "")
+    assert "Expected file to exist" in result.reason
+
+
+def test_the_failure_points_at_the_line_that_asked(tags, tmp_path):
+    """§7.3 wants the guard "at the moment of the call" — that's what buys a traceback
+    naming the author's own line instead of one about flushing a buffer."""
+    src = ('def run(pack):\n'
+           '    pack.log("info", "step one")\n'
+           '    pack.filesystem.resolve("absent.json").write("x", file_must_exist = True)\n')
+    result, _ = _fs_action(src, tags, tmp_path)
+    assert "fs.star:3" in result.reason
+
+
+def test_file_must_exist_passes_when_the_file_is_there(tags, tmp_path):
+    (tmp_path / "there.json").write_text("{}", encoding="utf-8")
+    src = ('def run(pack):\n'
+           '    pack.filesystem.resolve("there.json").write("done", file_must_exist = True)\n')
+    result, store = _fs_action(src, tags, tmp_path)
+    assert result.ok
+    assert store.read("there.json") == "done"
+
+
+def test_omitting_the_flag_still_creates_the_file(tags, tmp_path):
+    """§7.3: file_must_exist=False "creates the file if missing" — the producing case."""
+    src = ('def run(pack):\n'
+           '    pack.filesystem.resolve("made.json").write("{}")\n')
+    result, store = _fs_action(src, tags, tmp_path)
+    assert result.ok and store.read("made.json") == "{}"
+
+
+def test_a_file_this_step_just_wrote_counts_as_existing(tags, tmp_path):
+    """An action producing a file and then editing it is doing so on purpose; the check
+    must see the step's own staged writes, not just the disk."""
+    src = ('def run(pack):\n'
+           '    pack.filesystem.resolve("two.json").write("first")\n'
+           '    pack.filesystem.resolve("two.json").write("second", file_must_exist = True)\n')
+    result, store = _fs_action(src, tags, tmp_path)
+    assert result.ok, result.reason
+    assert store.read("two.json") == "second"
+
+
+def test_a_refused_write_leaves_nothing_behind(tags, tmp_path):
+    """The step halts (§7.3) and, per 3.3, touches nothing — including the file it had
+    already staged before the bad call."""
+    src = ('def run(pack):\n'
+           '    pack.filesystem.resolve("ok.json").write("landed")\n'
+           '    pack.filesystem.resolve("absent.json").write("x", file_must_exist = True)\n')
+    result, store = _fs_action(src, tags, tmp_path)
+    assert not result.ok
+    assert not (tmp_path / "ok.json").exists()

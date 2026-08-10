@@ -222,3 +222,61 @@ def test_unknown_op_rejected(world):
     q = Query(scope=Registry(REG), filter=Cmp(Id, "sideways", "x"), select=[Id])
     with pytest.raises(QueryError):
         evaluate(q, packdump=dump, tag_store=tags)
+
+
+# --- Has means ASSIGNED, not "has a value" (design 3.2.4; root cause R1) ----
+
+def test_has_ignores_the_default_and_asks_whether_a_row_exists(world):
+    """The catastrophic one. §3.2.4 defines Has as "the tag is assigned" and §3.2.1 keeps
+    defaults out of the database — but the resolver sugars a pristine cell into the
+    default, so asking existence through it made HAS true for EVERY entry. `remove` has a
+    default, which is exactly why this hid: it's the flagship tag."""
+    dump, tags = world
+    q = Query(scope=Registry(REG), filter=Has(Tag("remove")), select=[Id])
+    assert set(_ids(evaluate(q, packdump=dump, tag_store=tags))) == {
+        "alexscaves:galena", "quark:rope"}
+
+
+def test_not_has_finds_the_gaps_rather_than_nothing(world):
+    """`NOT HAS` is the gap-finding idiom the engine is built around; it returned [] for
+    every defaulted tag."""
+    dump, tags = world
+    q = Query(scope=Registry(REG), filter=Not(Has(Tag("remove"))), select=[Id])
+    assert set(_ids(evaluate(q, packdump=dump, tag_store=tags))) == {
+        "alexscaves:galena_ore", "minecraft:iron_ore", "minecraft:diamond"}
+
+
+def test_has_and_not_has_partition_the_registry(world):
+    dump, tags = world
+    have = set(_ids(evaluate(Query(scope=Registry(REG), filter=Has(Tag("remove")),
+                                   select=[Id]), packdump=dump, tag_store=tags)))
+    havent = set(_ids(evaluate(Query(scope=Registry(REG), filter=Not(Has(Tag("remove"))),
+                                     select=[Id]), packdump=dump, tag_store=tags)))
+    everything = set(dump.registry[REG]["values"])
+    assert have | havent == everything and not (have & havent)
+
+
+def test_assigning_the_default_value_explicitly_still_counts_as_assigned(world):
+    """"Explicitly false" and "pristine, defaulting to false" look identical through
+    get_tag and are different states — only existence tells them apart."""
+    dump, tags = world
+    tags.assign(REG, "minecraft:diamond", "remove", False, owner="user")
+    q = Query(scope=Registry(REG), filter=Has(Tag("remove")), select=[Id])
+    assert "minecraft:diamond" in _ids(evaluate(q, packdump=dump, tag_store=tags))
+
+
+def test_has_on_an_undefaulted_tag_was_always_correct(world):
+    """The control that explains why this survived so long: with no default there is
+    nothing to inflate, and `tier` has none."""
+    dump, tags = world
+    q = Query(scope=Registry(REG), filter=Has(Tag("tier")), select=[Id])
+    assert set(_ids(evaluate(q, packdump=dump, tag_store=tags))) == {
+        "alexscaves:galena_ore", "minecraft:iron_ore"}
+
+
+def test_has_on_intrinsics_and_attributes_is_unchanged(world):
+    """id/mod/attributes have no defaults, so presence there is still "resolved to
+    something" — diamond has no localization."""
+    dump, tags = world
+    q = Query(scope=Registry(REG), filter=Not(Has(Attribute("localization"))), select=[Id])
+    assert _ids(evaluate(q, packdump=dump, tag_store=tags)) == ["minecraft:diamond"]

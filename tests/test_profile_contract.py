@@ -7,6 +7,8 @@ here are about **refusing**, and about the asymmetry that justifies it — wrong
 costs one explicit override, wrongly accepting silently reinterprets everything the user
 owns.
 """
+import pathlib
+
 import pytest
 
 from packsmith.core.profile import Profile, mc_versions_compatible
@@ -115,3 +117,23 @@ def test_adopting_never_overwrites_a_declared_field(tmp_path):
     profile.save = lambda: None
     assert profile.adopt_contract_from(FakeDump(mc_version="1.21.1")) == ["loader_version"]
     assert profile.mc_version == "1.20.1"      # untouched
+
+
+# --- launching with nothing to work on (design 3.1) -------------------------
+
+def test_no_developer_home_directory_is_baked_into_the_source():
+    """There was a fallback that CREATED a profile pointing at one developer's home
+    directory — a guaranteed launch crash on every other machine.
+
+    Deliberately a grep, because the value is that it cannot drift. It looks for a HOME
+    directory, not for "curseforge" -- a placeholder path shown as a hint in a dialog
+    in a dialog is a helpful hint, and nothing reads it.
+    """
+    import re
+    root = pathlib.Path(__file__).resolve().parent.parent / "packsmith"
+    pattern = re.compile(r"[A-Za-z]:.{0,4}[Uu]sers.{0,4}\w+", re.ASCII)
+    offenders = sorted(
+        str(f.relative_to(root)) for f in root.rglob("*.py")
+        if pattern.search(f.read_text(encoding="utf-8"))
+    )
+    assert not offenders, f"machine-specific paths in: {offenders}"

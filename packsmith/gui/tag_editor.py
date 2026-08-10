@@ -109,11 +109,16 @@ class EnumValuesDialog(QDialog):
     deleted — the user resolves them in the Errors panel.
     """
 
-    def __init__(self, tag_store, registry_type, tag_name, parent=None):
+    def __init__(self, tag_store, registry_type, tag_name, parent=None,
+                 job_store=None, package_index=None):
         super().__init__(parent)
         self._tags = tag_store
         self._registry_type = registry_type
         self._tag_name = tag_name
+        # Injected: which jobs exist is not this dialog's business to discover, but it
+        # cannot state 3.2.1's second blast radius without them.
+        self._jobs = job_store
+        self._packages = package_index
         self.setWindowTitle(f"Values — {tag_name}")
         self.setMinimumWidth(400)
 
@@ -143,6 +148,16 @@ class EnumValuesDialog(QDialog):
         buttons.rejected.connect(self.reject)
         root.addWidget(buttons)
 
+    def _steps_declaring(self, removed):
+        """Job steps that declared any of these values. Empty when the dialog has no job
+        context — the caller supplies it; nothing here reaches for globals."""
+        if not removed or self._jobs is None or self._packages is None:
+            return []
+        from packsmith.core.revalidate import steps_declaring_values
+        return steps_declaring_values(
+            self._registry_type, self._tag_name, removed,
+            job_store=self._jobs, package_index=self._packages, tag_store=self._tags)
+
     def accept(self):
         values = self._editor.values()
         if not values:
@@ -161,6 +176,20 @@ class EnumValuesDialog(QDialog):
                              "them in the Errors panel (Clear, Reassign, or Restore).")
             else:
                 lines.append("No assignments use the removed value(s).")
+            # 3.2.1's SECOND blast radius: "every bound job step whose mapping declares
+            # that value in requires_values". Reporting only the assignments made removal
+            # look safe while a job quietly stopped working.
+            breaking = self._steps_declaring(preview["removed"])
+            if breaking:
+                lines.append("")
+                plural = "step" if len(breaking) == 1 else "steps"
+                lines.append(f"{len(breaking)} job {plural} depend(s) on the removed "
+                             f"value(s):")
+                for step in breaking[:6]:
+                    lines.append(f"• {step.describe()} — {'; '.join(step.problems)}")
+                if len(breaking) > 6:
+                    lines.append(f"…and {len(breaking) - 6} more")
+                lines.append("Those steps will refuse to run until you re-bind them.")
             if preview["default_cleared"]:
                 lines.append("")
                 lines.append("This tag's default points at a removed value, so the default "

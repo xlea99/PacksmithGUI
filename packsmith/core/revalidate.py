@@ -109,6 +109,46 @@ def currently_broken(blueprint_store, *, job_store, package_index) -> list:
     return broken
 
 
+def steps_declaring_values(registry_type, tag_name, values, *, job_store,
+                          package_index, tag_store=None) -> list:
+    """Every bound step whose mapping declares one of ``values`` in `requires_values`.
+
+    3.2.1 requires the enum-removal confirmation to state BOTH blast radii — the
+    assignments that become orphans, and the automations that break. The second half was
+    unreportable because the field was never parsed, so removing a value a job depended on
+    was silent until the run. 3.3: this is "deterministic precisely *because* actions
+    declare the values they depend on".
+    """
+    wanted = set(values)
+    found = []
+    for job in job_store.all():
+        for index, step in enumerate(job_store.steps_of(job.id), start=1):
+            if step.kind != "action" or not step.action_ref:
+                continue
+            manifest = _manifest(package_index, step.action_ref)
+            if manifest is None:
+                continue
+            for name, slot in manifest.mappings.items():
+                if slot.kind != "tag" or not slot.requires_values:
+                    continue
+                if slot.registry_type and slot.registry_type != registry_type:
+                    continue
+                bound = step.bindings.get(name)
+                if bound is None:
+                    continue
+                # Bindings hold ids (3.2.1); legacy rows hold names. Compare through the
+                # same resolver everything else uses.
+                if binding_name(slot, bound, tag_store=tag_store) != tag_name:
+                    continue
+                needed = sorted(wanted & set(slot.requires_values))
+                if needed:
+                    found.append(BrokenStep(
+                        job_name=job.name, position=index, action_ref=step.action_ref,
+                        mapping=name, blueprint=tag_name,
+                        problems=tuple(f"declares '{v}'" for v in needed)))
+    return found
+
+
 def _targets(slot, bound, blueprint, blueprint_store) -> bool:
     """Is this binding pointed at ``blueprint``? Covers both blueprint kinds, both
     cardinalities, and both storage forms — bindings hold ids now (design 3.2.1) but legacy

@@ -209,6 +209,14 @@ class FileStaging:
                     f"'{rel_path}' is owned by you — actions are blocked from writing it. "
                     f"Release ownership in the Files panel to let '{owner_action_ref}' "
                     f"write it.")
+        # §7.3: the existence flags "guard the write at the moment of the call". Checking
+        # at commit told the author their file was missing long after the line that assumed
+        # it, in a traceback about flushing a buffer — same reasoning as the hard-block
+        # above, which is why both now live here. A file this step staged earlier counts as
+        # existing: an action that writes a file and then edits it is doing so on purpose.
+        if file_must_exist and not (rel_path in self._pending
+                                    or self._store.exists(rel_path)):
+            raise FileNotFoundError(f"Expected file to exist: {rel_path}")
         self._pending[rel_path] = {
             "content": content, "owner": owner, "owner_action_ref": owner_action_ref,
             "file_must_exist": file_must_exist,
@@ -233,22 +241,22 @@ class FileStaging:
         return bool(self._pending)
 
     def commit(self):
-        # Pre-flight every existence requirement BEFORE writing a byte. Files are the one
-        # engine with no transaction to roll back, so the only real protection is to fail
-        # before touching anything — and `file_must_exist` checked inside the loop meant
-        # the third file failing left the first two written and stamped.
-        missing = [rel for rel, staged in self._pending.items()
-                   if staged["file_must_exist"] and not self._store.exists(rel)]
-        if missing:
-            raise FileNotFoundError(
-                "Expected file(s) to exist: " + ", ".join(sorted(missing)))
+        # No existence pre-flight here any more, deliberately. §7.3 puts that guard "at the
+        # moment of the call", and `FileStaging.write` now enforces it — so by the time a
+        # write is staged it has already been validated, and re-checking against the DISK
+        # would reject the legitimate "produce a file, then edit it" pattern whose target
+        # only exists in this same buffer. Failing during the action is also strictly
+        # better than failing during the flush: nothing has been written yet either way,
+        # but the traceback names the author's own line.
 
         for rel_path, staged in self._pending.items():
             prior_owner = self._store.ownership(rel_path)          # capture before overwrite
             prior_content = self._store.write(
                 rel_path, staged["content"],
                 owner=staged["owner"], owner_action_ref=staged["owner_action_ref"],
-                file_must_exist=staged["file_must_exist"],
+                # Already validated at staging time; re-asserting here could only fail
+                # mid-loop, which is the partial-commit hole this engine can't roll back.
+                file_must_exist=False,
             )
             self.snapshots[rel_path] = {"content": prior_content, "ownership": prior_owner}
         self._pending.clear()

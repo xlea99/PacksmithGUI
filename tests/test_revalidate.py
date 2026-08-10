@@ -10,6 +10,7 @@ from packsmith.core.blueprints import BlueprintStore
 from packsmith.core.jobs import JobStore
 from packsmith.core.packages import ActionManifest, MappingSlot
 from packsmith.core.revalidate import (
+    steps_declaring_values,
     broken_steps, currently_broken, project_removal, project_rename, project_retype,
     summarise,
 )
@@ -178,3 +179,55 @@ def test_the_summary_names_steps_rather_than_counting_them(stone, jobs, index, b
 
 def test_no_breakage_is_an_empty_string_so_callers_can_just_test_it():
     assert summarise([], mutation="rename") == ""
+
+
+# --- enum-value removal: BOTH blast radii (design 3.2.1) --------------------
+
+ENUM_MANIFEST = ActionManifest(
+    package_name="palette", action_id="standardize", file="s.star", function="run",
+    mappings={"tier": MappingSlot(name="tier", kind="tag", tag_type="enum",
+                                  registry_type="minecraft:item",
+                                  requires_values=("early", "late"))})
+
+
+@pytest.fixture
+def enum_world(user_db):
+    from packsmith.core.tags import TagStore
+    tags = TagStore(user_db)
+    tags.define("minecraft:item", "tier", "enum", enum_values=["early", "mid", "late"])
+    jobs = JobStore(user_db)
+    job = jobs.create("stone_job")
+    from packsmith.core.bindings import binding_id
+    jobs.add_action_step(job.id, "palette:standardize", bindings={
+        "tier": binding_id(ENUM_MANIFEST.mappings["tier"], "tier", tag_store=tags)})
+    return tags, jobs, FakeIndex({"palette:standardize": ENUM_MANIFEST})
+
+
+def test_removing_a_declared_value_names_the_step(enum_world):
+    """3.2.1's own example: "23 assignments use it, and 1 job step (stone_job step 2 →
+    palette:standardize) declares it"."""
+    tags, jobs, index = enum_world
+    hits = steps_declaring_values("minecraft:item", "tier", ["late"],
+                                  job_store=jobs, package_index=index, tag_store=tags)
+    assert [h.describe() for h in hits] == ["stone_job step 1 (palette:standardize)"]
+    assert hits[0].problems == ("declares 'late'",)
+
+
+def test_removing_a_value_nobody_declared_breaks_nothing(enum_world):
+    tags, jobs, index = enum_world
+    assert steps_declaring_values("minecraft:item", "tier", ["mid"], job_store=jobs,
+                                  package_index=index, tag_store=tags) == []
+
+
+def test_a_step_bound_to_a_different_tag_is_not_affected(enum_world):
+    tags, jobs, index = enum_world
+    tags.define("minecraft:item", "phase", "enum", enum_values=["early", "late"])
+    assert steps_declaring_values("minecraft:item", "phase", ["late"], job_store=jobs,
+                                  package_index=index, tag_store=tags) == []
+
+
+def test_the_same_tag_name_on_another_registry_is_not_affected(enum_world):
+    """`requires_values` is scoped by the mapping's registry, like everything else."""
+    tags, jobs, index = enum_world
+    assert steps_declaring_values("minecraft:block", "tier", ["late"], job_store=jobs,
+                                  package_index=index, tag_store=tags) == []

@@ -1,9 +1,11 @@
 import dataclasses
 
 from PySide6.QtCore import Qt, QAbstractTableModel
+from PySide6.QtGui import QColor
 
 from packsmith.gui.table.edit_commands import EditStack, TagEditCommand
-from packsmith.core.query import evaluate, Tag
+from packsmith.core.query import evaluate, Tag, Attribute
+from packsmith.gui.shell import style
 
 
 # Custom model role carrying a tag cell's ownership (None = pristine, no row).
@@ -121,10 +123,33 @@ class RegistryTableModel(QAbstractTableModel):
                 return None
             return self._tag_store.get_ownership(self._registry_type, row.entry_id, name)
 
+        if role == Qt.ForegroundRole:
+            # The fallback is real content but not the *entry's own* name, so it reads
+            # muted — you can tell at a glance which rows a mod never localized.
+            return (QColor(style.TEXT_FAINT)
+                    if self._is_localization_fallback(row, col) else None)
+
         if role != Qt.DisplayRole:
             return None
         value = row.values.get(self._column_name(col))
+        if value is None and self._is_localization_fallback(row, col):
+            # §3.1: "If a display name isn't available in the current locale, the raw
+            # registry ID is shown." packdump.attribute() returns None and delegates this
+            # `or entry_id` to its callers; no caller did it, so entries outside
+            # item/block rendered as blank cells and sorted as null.
+            #
+            # Applied HERE and not in the resolver on purpose: inflating the value would
+            # make `HAS a:localization` true for every entry, which is exactly the bug
+            # Q-3 was. Display is display; existence is existence.
+            return row.entry_id
         return "" if value is None else str(value)
+
+    def _is_localization_fallback(self, row, col: int) -> bool:
+        """Is this cell a localization column with nothing behind it?"""
+        field = self._select[col]
+        return (isinstance(field, Attribute) and field.name == "localization"
+                and row.entry_id is not None
+                and row.values.get(self._column_name(col)) is None)
 
     # --- editing -----------------------------------------------------------
 

@@ -80,3 +80,4 @@ def test_combined_kwargs_and_filters(stocked):
 def test_invalid_op_raises(stocked):
     with pytest.raises(ValueError):
         stocked.query(REG, filters=[{"tag": "tier", "op": "sideways", "value": "x"}])
+
