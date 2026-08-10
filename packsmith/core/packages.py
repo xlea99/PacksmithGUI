@@ -16,13 +16,14 @@ import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from packsmith.core.shapes import parse_shape
 from packsmith.core.starlark_runtime import PackageLoader, run_starlark
 
 
 @dataclass
 class MappingSlot:
     """A declared mapping slot the user binds a Layer 2 artifact into (design 7.1).
-    MVP supports ``kind='tag'``; blueprint kinds are deferred."""
+    ``kind`` is ``tag``, ``blueprint`` (a schema) or ``blueprint_instance``."""
     name: str
     kind: str = "tag"
     tag_type: str = None          # required kind of tag (bool/string/enum/number/reference)
@@ -32,6 +33,9 @@ class MappingSlot:
     required: bool = True
     likely_name: str = None       # hint for best-guess fill
     description: str = ""
+    # Structural typing for blueprint mappings (design 3.3): the SHAPE this action needs,
+    # never a schema name. Flat requirements by dotted path — see core/shapes.py.
+    required_shape: tuple = ()
     # Mandatory on write/read_write mappings (design 3.3): what happens when this action
     # writes a cell someone else already owns. There is deliberately NO default — "the
     # author must explicitly choose… there is no universally-correct answer."
@@ -211,6 +215,16 @@ class PackageIndex:
 
 CONFLICT_POLICIES = ("overwrite", "skip", "fail", "ask")
 WRITE_ACCESS = ("write", "read_write")
+# `blueprint` binds one of the user's SCHEMAS — the action works over all of its instances.
+# `blueprint_instance` binds the instances themselves, which is what an action that should
+# run over *these six stone types* and not the whole schema needs. Both are typed by
+# `required_shape` (3.3), never by the name the user gave their schema.
+# `registry_entry` binds one specific Layer 1 entry, typed by `registry_type` — for the
+# action that needs "the block you want everything cut from", not a whole tag or schema.
+MAPPING_KINDS = ("tag", "blueprint", "blueprint_instance", "registry_entry")
+BLUEPRINT_KINDS = ("blueprint", "blueprint_instance")
+# 3.3: `one` is a single-select picker, `many` is "zero or more" and a multi-select list.
+CARDINALITIES = ("one", "many")
 
 MANIFEST_NAME = "manifest.toml"
 SOURCE_SUFFIX = ".star"
@@ -599,6 +613,11 @@ def _strip_action_block(text: str, action_id: str):
 def _parse_mappings(raw: dict) -> dict:
     mappings = {}
     for name, spec in raw.items():
+        kind = spec.get("kind", "tag")
+        if kind not in MAPPING_KINDS:
+            raise ValueError(
+                f"mapping '{name}': unknown kind '{kind}' "
+                f"(expected one of {', '.join(MAPPING_KINDS)})")
         access = spec.get("access", "read")
         policy = spec.get("conflict_policy")
         # Design 3.3: conflict policy is a MANDATORY per-write-mapping declaration with no
@@ -612,17 +631,36 @@ def _parse_mappings(raw: dict) -> dict:
             raise ValueError(
                 f"mapping '{name}': invalid conflict_policy '{policy}' "
                 f"(expected one of {', '.join(CONFLICT_POLICIES)})")
+        if kind == "registry_entry" and not spec.get("registry_type"):
+            # 3.3 types this kind by registry_type, and without one the picker would have
+            # to offer every entry of every registry — which is not a contract.
+            raise ValueError(
+                f"mapping '{name}' is kind 'registry_entry' but declares no registry_type")
+        cardinality = spec.get("cardinality", "one")
+        if cardinality not in CARDINALITIES:
+            raise ValueError(
+                f"mapping '{name}': invalid cardinality '{cardinality}' "
+                f"(expected one of {', '.join(CARDINALITIES)})")
+        raw_shape = spec.get("required_shape")
+        if raw_shape is not None and kind not in BLUEPRINT_KINDS:
+            # The tag analog of required_shape is `requires_values`; a shape on a tag
+            # mapping is an author mistake worth naming rather than ignoring.
+            raise ValueError(
+                f"mapping '{name}': required_shape only applies to blueprint mappings, "
+                f"not kind '{kind}'")
+        shape = parse_shape(raw_shape, where=f"mapping '{name}'")
         mappings[name] = MappingSlot(
             name=name,
-            kind=spec.get("kind", "tag"),
+            kind=kind,
             tag_type=spec.get("tag_type"),
             registry_type=spec.get("registry_type"),
             access=access,
-            cardinality=spec.get("cardinality", "one"),
+            cardinality=cardinality,
             required=spec.get("required", True),
             likely_name=spec.get("likely_name"),
             description=spec.get("description", ""),
             conflict_policy=policy,
+            required_shape=shape,
         )
     return mappings
 

@@ -53,8 +53,27 @@ class Attribute:
 
 @dataclass(frozen=True)
 class Slot:
-    """A blueprint slot binding (blueprint-scoped queries; not supported in v1)."""
+    """A blueprint slot binding (blueprint-scoped queries)."""
     name: str
+
+
+@dataclass(frozen=True)
+class _AllSlots:
+    """Every bindable slot of the scope's blueprint, in schema order.
+
+    A blueprint's columns are a **fact about the blueprint**, not a preference of the view:
+    empty slots are the primitive's whole output (design 3.2.2 — "empty slots = missing
+    content that needs to be generated or sourced"), so a saved view that froze its column
+    list would start hiding *gaps* the moment the schema grew. Selecting this instead means
+    the view follows the schema.
+
+    Listing slots explicitly is still allowed and still means what it says — a deliberately
+    curated subset. The difference between "everything" and "these" is then visible in the
+    query rather than implied.
+    """
+
+
+AllSlots = _AllSlots()
 
 
 # --- Scopes: the base row-source --------------------------------------------
@@ -75,13 +94,19 @@ class Blueprint:
 
 VALID_OPS = frozenset({
     "eq", "neq", "gt", "lt", "gte", "lte", "in", "not_in", "contains", "matches",
+    "matches_tokens",
 })
 
 
 @dataclass(frozen=True)
 class Cmp:
     """Compare a field against a value. ``matches`` is the Python ``re`` dialect
-    (unanchored ``search``); ``contains`` and string equality honour ``ci``."""
+    (unanchored ``search``); ``contains`` and string equality honour ``ci``.
+
+    ``matches_tokens`` takes a **list of tokens** and holds when the field's value carries
+    all of them, separators and namespace and word order ignored (design 5.3 — the
+    `quark:ac_galena_wall` case that defeats substring matching). It is an ordinary op
+    rather than a new node type, so a query using it stays plain serializable data."""
     field: object
     op: str
     value: object
@@ -110,15 +135,52 @@ class Not:
     clause: object
 
 
+# --- Aggregates -------------------------------------------------------------
+#
+# The Power Ladder's "aggregation / grouping" tier. These are the only nodes that may
+# appear in ``select`` alongside ``group_by`` fields, and the only ones ``having`` can
+# compare — the ordinary SQL rule, for the ordinary SQL reason.
+
+@dataclass(frozen=True)
+class _Count:
+    """How many rows fell into this group."""
+
+
+Count = _Count()
+
+
+@dataclass(frozen=True)
+class CountDistinct:
+    """How many *different* values of a field the group holds — "3 mods claim this name"
+    is a different and more interesting fact than "3 rows"."""
+    field: object
+
+
+@dataclass(frozen=True)
+class Collect:
+    """The group's values for a field, gathered into a list. Turns "this name collides"
+    into "these are the ids that collide", which is the answer you actually wanted."""
+    field: object
+    limit: int = None
+
+
+AGGREGATES = (_Count, CountDistinct, Collect)
+
+
 # --- Query ------------------------------------------------------------------
 
 @dataclass(frozen=True)
 class Query:
-    """A relational query: filter/project/sort/limit/distinct over a scope.
+    """A relational query: filter/project/group/sort/limit/distinct over a scope.
 
     Required: ``scope`` and ``select``. ``filter`` may be omitted (all rows). The
     conceptual signature in §3.2.4 lists ``(scope, filter, select, ...)``; in code the
     required params come first and everything is passed by keyword in practice.
+
+    ``group_by`` collapses rows into groups; ``select`` may then hold only grouping fields
+    and aggregates, and ``having`` filters the resulting groups (as opposed to ``filter``,
+    which runs before grouping). A grouped row is *computed* — no single entry backs it, so
+    it isn't editable.
     """
     scope: object
     select: list
@@ -126,3 +188,5 @@ class Query:
     order_by: list = None
     limit: int = None
     distinct: bool = False
+    group_by: list = None
+    having: object = None

@@ -1,8 +1,9 @@
 """The v1 executor — a pure-Python evaluator over in-memory L1 + L2 (design 3.2.4).
 
-Registry scope only (blueprint scope waits for blueprints). Order of operations mirrors
-SQL: WHERE -> project -> DISTINCT -> ORDER BY -> LIMIT. The executor is swappable behind
-the AST; this one is deliberately simple and correct at PackSmith's scale.
+Two scopes: **registry** (rows are entries) and **blueprint** (rows are the instances of a
+schema, fields are its slots). Order of operations mirrors SQL: WHERE -> project ->
+DISTINCT -> ORDER BY -> LIMIT. The executor is swappable behind the AST; this one is
+deliberately simple and correct at PackSmith's scale.
 
 Null semantics (deliberate, conservative): when a field has no value for an entry (an
 unset tag with no default, a missing attribute), every ``Cmp`` is False. Presence is
@@ -14,28 +15,35 @@ import re
 
 from packsmith.core.query.ast import (
     Query, Registry, Blueprint, Cmp, Has, And, Or, Not, VALID_OPS, QueryError,
+    AGGREGATES, Collect, CountDistinct, Slot, _AllSlots, _Count,
 )
-from packsmith.core.query.catalog import RegistryFieldCatalog, column_name
+from packsmith.core.query.catalog import (
+    BlueprintFieldCatalog, RegistryFieldCatalog, _Resolver, column_name,
+)
 from packsmith.core.query.result import Result, Column, Row
+from packsmith.core.query.tokens import tokenize, wanted_tokens
 
 
-def evaluate(query, *, packdump, tag_store) -> Result:
-    """Run ``query`` against a packdump (L1) and tag store (L2), returning a table."""
+def evaluate(query, *, packdump=None, tag_store=None, blueprint_store=None) -> Result:
+    """Run ``query`` against L1 + L2, returning a table.
+
+    Two scopes: registry entries, and the instances of a blueprint. They differ only in
+    where the rows come from and which catalog resolves the fields — everything after
+    (filter, project, distinct, order, limit) is identical, because a row is just an
+    identity string either way.
+    """
     if not isinstance(query, Query):
         raise QueryError("evaluate() expects a Query")
-    scope = query.scope
-    if isinstance(scope, Blueprint):
-        raise QueryError("Blueprint scope is not supported in v1 (registry scope only)")
-    if not isinstance(scope, Registry):
-        raise QueryError(f"unsupported scope: {scope!r}")
 
     select = list(query.select or [])
     if not select:
         raise QueryError("a query must select at least one field")
 
-    reg = scope.type
-    catalog = RegistryFieldCatalog(packdump, tag_store, reg)
-    entries = list(packdump.registry.get(reg, {}).get("values", []))
+    catalog, entries = _source(query.scope, packdump, tag_store, blueprint_store)
+    select = _expand(select, catalog)
+
+    if query.group_by:
+        return _grouped(query, catalog, entries)
 
     # WHERE
     predicate = _compile_filter(query.filter, catalog)
@@ -77,6 +85,150 @@ def evaluate(query, *, packdump, tag_store) -> Result:
         for (entry_id, values, _keys) in records
     ]
     return Result(columns=columns, rows=rows)
+
+
+def _grouped(query, catalog, entries) -> Result:
+    """WHERE -> GROUP BY -> aggregate -> HAVING -> ORDER BY -> LIMIT.
+
+    Grouped rows are **computed**: no single entry backs them, so they carry no
+    ``entry_id`` and a View renders them read-only. That falls out of the shape of the
+    query rather than being a flag anyone sets (design 3.2.4).
+    """
+    group_fields = list(query.group_by)
+    group_names = [column_name(f) for f in group_fields]
+    group_resolvers = [catalog.resolver(f) for f in group_fields]
+
+    # The ordinary SQL rule, for the ordinary reason: anything else has no single value
+    # for a group, so there is no honest thing to put in the cell.
+    for field in query.select:
+        if isinstance(field, AGGREGATES):
+            continue
+        if column_name(field) not in group_names:
+            raise QueryError(
+                f"'{column_name(field)}' is neither grouped nor aggregated — add it to "
+                f"group_by, or wrap it in Count/CountDistinct/Collect")
+
+    predicate = _compile_filter(query.filter, catalog)
+    buckets = {}
+    for entry in entries:
+        if not predicate(entry):
+            continue
+        key = tuple(res(entry) for res in group_resolvers)
+        buckets.setdefault(key, []).append(entry)
+
+    columns, rows = [], []
+    for field in query.select:
+        columns.append(Column(column_name(field), _column_type(field, catalog)))
+
+    # HAVING may name an aggregate that isn't selected — `HAVING count > 1` without a
+    # count column is the normal way to write a duplicates report. Compute those too, then
+    # project them back out.
+    needed = list(query.select) + [f for f in _fields_in(query.having)
+                                   if isinstance(f, AGGREGATES)]
+
+    for key, members in buckets.items():
+        values = dict(zip(group_names, key))
+        for field in needed:
+            if isinstance(field, AGGREGATES):
+                values[column_name(field)] = _aggregate(field, members, catalog)
+        rows.append(values)
+
+    if query.having is not None:
+        keep = _compile_filter(query.having, _ValuesCatalog())
+        rows = [v for v in rows if keep(v)]
+
+    selected = [c.name for c in columns]
+    rows = [{name: v[name] for name in selected} for v in rows]
+
+    if query.order_by:
+        names = [column_name(f) for f in query.order_by]
+        for name in names:
+            if name not in [c.name for c in columns]:
+                raise QueryError(f"cannot order a grouped query by '{name}' — it isn't "
+                                 f"selected")
+        rows.sort(key=lambda v: [_sort_key(v.get(n)) for n in names])
+
+    if query.limit is not None:
+        rows = rows[: query.limit]
+    return Result(columns=columns, rows=[Row(values=v, entry_id=None) for v in rows])
+
+
+def _fields_in(node) -> list:
+    """Every field a filter tree references, so HAVING's aggregates can be computed."""
+    if node is None:
+        return []
+    if isinstance(node, (And, Or)):
+        return [f for c in node.clauses for f in _fields_in(c)]
+    if isinstance(node, Not):
+        return _fields_in(node.clause)
+    if isinstance(node, (Cmp, Has)):
+        return [node.field]
+    return []
+
+
+def _aggregate(field, members, catalog):
+    if isinstance(field, _Count):
+        return len(members)
+    resolver = catalog.resolver(field.field)
+    values = [resolver(m) for m in members]
+    if isinstance(field, CountDistinct):
+        return len({v for v in values if v is not None})
+    gathered = sorted({v for v in values if v is not None})
+    return gathered[: field.limit] if field.limit else gathered
+
+
+def _column_type(field, catalog) -> str:
+    if isinstance(field, (_Count, CountDistinct)):
+        return "number"
+    if isinstance(field, Collect):
+        return "list"
+    return catalog.resolver(field).type
+
+
+class _ValuesCatalog:
+    """Resolves a HAVING clause against a group's computed row rather than an entry — the
+    same resolver protocol, one phase later."""
+
+    @staticmethod
+    def resolver(field):
+        name = column_name(field)
+        return _Resolver("number" if isinstance(field, (_Count, CountDistinct))
+                         else "string", lambda values: values.get(name))
+
+
+def _expand(select, catalog):
+    """Replace ``AllSlots`` with the scope's actual slots, at evaluation time.
+
+    Expanding here rather than when the query is written is the point: the saved query
+    keeps saying "every slot", so a schema that grows is reflected the next time the view
+    is opened instead of quietly under-reporting gaps.
+    """
+    if not any(isinstance(f, _AllSlots) for f in select):
+        return select
+    if not isinstance(catalog, BlueprintFieldCatalog):
+        raise QueryError("AllSlots needs a Blueprint scope")
+    expanded = []
+    for field in select:
+        if isinstance(field, _AllSlots):
+            expanded.extend(Slot(path) for path in catalog.slot_paths())
+        else:
+            expanded.append(field)
+    return expanded
+
+
+def _source(scope, packdump, tag_store, blueprint_store):
+    """(catalog, rows) for a scope. The only place the two scopes differ."""
+    if isinstance(scope, Registry):
+        if packdump is None:
+            raise QueryError("a registry-scoped query needs a packdump")
+        return (RegistryFieldCatalog(packdump, tag_store, scope.type),
+                list(packdump.registry.get(scope.type, {}).get("values", [])))
+    if isinstance(scope, Blueprint):
+        if blueprint_store is None:
+            raise QueryError("a blueprint-scoped query needs a blueprint store")
+        return (BlueprintFieldCatalog(blueprint_store, scope.name),
+                [i.name for i in blueprint_store.instances(scope.name)])
+    raise QueryError(f"unsupported scope: {scope!r}")
 
 
 def _sort_key(v):
@@ -152,6 +304,25 @@ def _compile_cmp(node, res):
             s = v if isinstance(v, str) else str(v)
             needle = str(val)
             return (needle.lower() in s.lower()) if ci else (needle in s)
+        return f
+
+    if op == "matches_tokens":
+        wanted = wanted_tokens([val] if isinstance(val, str) else list(val or []))
+        if not wanted:
+            # Almost always a template whose anchor resolved to nothing. Matching every
+            # row would silently hand back the whole registry as "recommendations".
+            raise QueryError("'matches_tokens' needs at least one token")
+        exact = {t for t, prefix in wanted if not prefix}
+        prefixes = [t for t, prefix in wanted if prefix]
+
+        def f(e):
+            v = res(e)
+            if v is None:
+                return False
+            have = tokenize(v)
+            if not exact <= have:
+                return False
+            return all(any(t.startswith(p) for t in have) for p in prefixes)
         return f
 
     if op == "matches":

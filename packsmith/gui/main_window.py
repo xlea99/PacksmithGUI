@@ -6,7 +6,9 @@ whose bottom-most strip is the status bar. The window itself stays thin: it wire
 services to the shell and owns the actions that span tabs (run an action, author a view,
 undo/redo).
 """
+import dataclasses
 import re
+import time
 from pathlib import Path
 
 from PySide6.QtWidgets import (
@@ -25,6 +27,7 @@ from packsmith.gui.profile_editor import (
 from packsmith.gui.shell.packdump_banner import PackdumpBanner
 from packsmith.core.db import UserDB
 from packsmith.core.tags import TagStore
+from packsmith.core.revalidate import broken_steps, summarise
 from packsmith.core.runner import run_action
 from packsmith.core.packages import (
     PackageIndex, create_package, add_action, remove_action, create_file, delete_file,
@@ -35,10 +38,11 @@ from packsmith.core.files import FileStore
 from packsmith.core.history import StepRunStore, JobRunStore
 from packsmith.core.views import ViewStore
 from packsmith.core.jobs import JobStore
+from packsmith.core.blueprints import BlueprintError, BlueprintStore
 from packsmith.core.job_runner import run_job
 
 from packsmith.gui.demo_views import demo_views
-from packsmith.gui.queries import browse_query, tag_query
+from packsmith.gui.queries import blueprint_query, browse_query, tag_query
 from packsmith.gui.query_constructor import QueryConstructorDialog
 from packsmith.gui.tag_editor import TagCreateDialog, EnumValuesDialog
 from packsmith.gui.shell import style
@@ -56,6 +60,11 @@ from packsmith.gui.shell.panels.files_panel import FilesPanel
 from packsmith.gui.editor.host import EditorHost, EditorTab
 from packsmith.gui.editor.sources import InstanceFileSource, PackageFileSource
 from packsmith.gui.shell.panels.actions_panel import ActionsPanel
+from packsmith.gui.shell.panels.blueprints_panel import BlueprintsPanel
+from packsmith.gui.query_bar import QueryBar, combine
+from packsmith.core.query.ast import Blueprint as QueryBlueprint, QueryError
+from packsmith.core.query.language import QuerySyntaxError
+from packsmith.gui.blueprint_editor import BlueprintEditorTab, NewBlueprintDialog
 from packsmith.gui.action_editor import (
     NewActionDialog, NewFileDialog, NewFolderDialog, RenameFileDialog,
 )
@@ -84,6 +93,9 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(1200, 700)
 
         self._tab_models = {}     # tab widget -> RegistryTableModel
+        self._tab_bars = {}       # tab widget -> its QueryBar
+        self._tab_base_queries = {}   # tab widget -> the view's own query (bar ANDs onto it)
+        self._tab_totals = {}     # tab widget -> unrefined row count, for "N of M"
         self._tab_views = {}      # tab widget -> the saved View it renders (if any)
         self._open_tabs = {}      # open-key -> tab widget (so we focus, not duplicate)
         self._delegates = []      # keep delegate refs alive
@@ -143,6 +155,7 @@ class MainWindow(QMainWindow):
         self._job_history = JobRunStore(self._db)
         self._views = ViewStore(self._db)
         self._jobs = JobStore(self._db)
+        self._blueprints = BlueprintStore(self._db, packdump=self._packdump)
 
     # --- shell -------------------------------------------------------------
 
@@ -197,6 +210,15 @@ class MainWindow(QMainWindow):
         self._files_panel.ownership_changed.connect(self._set_status)
         self._files_panel.file_activated.connect(self._open_file)
 
+        self._blueprints_panel = BlueprintsPanel(self._blueprints)
+        self._blueprints_panel.blueprint_activated.connect(self._open_blueprint)
+        self._blueprints_panel.new_blueprint_requested.connect(self._new_blueprint)
+        self._blueprints_panel.delete_blueprint_requested.connect(self._delete_blueprint)
+        self._blueprints_panel.rename_blueprint_requested.connect(self._rename_blueprint)
+        self._blueprints_panel.new_instance_requested.connect(self._new_instance)
+        self._blueprints_panel.delete_instance_requested.connect(self._delete_instance)
+        self._blueprints_panel.rename_instance_requested.connect(self._rename_instance)
+
         self._actions_panel = ActionsPanel(self._packages)
         self._actions_panel.document_activated.connect(self._open_package_document)
         self._actions_panel.new_action_requested.connect(self._new_action)
@@ -215,6 +237,7 @@ class MainWindow(QMainWindow):
             "jobs": self._jobs_panel,
             "files": self._files_panel,
             "actions": self._actions_panel,
+            "blueprints": self._blueprints_panel,
         }
         panels = {
             spec.key: live.get(spec.key) or StubPanel(spec.title, spec.description)
@@ -228,6 +251,7 @@ class MainWindow(QMainWindow):
             "files": self._files_panel.refresh,
             "registry": self._registry_panel.refresh,
             "actions": self._actions_panel.refresh,
+            "blueprints": self._blueprints_panel.refresh,
         }
 
         self._panel_stack = PanelStack(panels)
@@ -266,7 +290,8 @@ class MainWindow(QMainWindow):
                                  tag_store=self._tags, file_store=self._file_store)
         results.rolled_back.connect(self._on_rolled_back)
         self._bottom.set_panel("job_results", results)
-        errors = ErrorsView(self._tags, self._packdump)
+        errors = ErrorsView(self._tags, self._packdump,
+                            blueprint_store=self._blueprints)
         errors.resolved.connect(self._on_orphans_resolved)
         self._bottom.set_panel("errors", errors)
 
@@ -320,6 +345,207 @@ class MainWindow(QMainWindow):
         lay.addStretch()
         lay.addWidget(info)
         return header
+
+    # --- blueprints --------------------------------------------------------
+
+    def _open_blueprint(self, name):
+        """Panel B: an ephemeral view over the whole blueprint — the same gesture as
+        clicking a tag, and savable the same way."""
+        return self._open_blueprint_tab(("blueprint", name), name,
+                                        blueprint_query(name))
+
+    def _open_blueprint_tab(self, key, title, query, view=None):
+        existing = self._open_tabs.get(key)
+        if existing is not None and self._workspace.focus_widget(existing):
+            return existing
+        tab = BlueprintEditorTab(query, self._blueprints, packdump=self._packdump,
+                                 view=view,
+                                 on_config_changed=lambda c, v=view:
+                                     self._save_renderer_config(v, c),
+                                 job_impact=lambda projected, mutation, q=query:
+                                     self._schema_change_impact(q.scope.name, projected,
+                                                                mutation))
+        tab.changed.connect(self._after_blueprint_change)
+        tab.status.connect(self._set_status)
+        tab.save_requested.connect(lambda t=tab: self._save_blueprint_view(t))
+        self._workspace.add_tab(tab, title)
+        self._open_tabs[key] = tab
+        return tab
+
+    def _schema_change_impact(self, blueprint, projected_slots, mutation) -> str:
+        """What a proposed schema change would break, named (design 3.2.2).
+
+        The blueprint editor asks; the answer needs jobs and installed packages, which are
+        this window's to hold. Returns "" when nothing breaks, so the caller can treat it
+        as "is there anything to warn about".
+        """
+        return summarise(
+            broken_steps(blueprint, projected_slots,
+                         job_store=self._jobs, package_index=self._packages),
+            mutation=mutation)
+
+    def _save_renderer_config(self, view, config):
+        """Renderer config belongs to the View. Nowhere to put it until the tab is saved,
+        which is why an ephemeral tab just holds it in memory."""
+        if view is not None:
+            self._views.set_renderer_config(view.id, config)
+
+    def _save_blueprint_view(self, tab):
+        """Turn an ephemeral blueprint tab into a saved View — §3.2.3's "filter bar ->
+        save" path, for the renderer that isn't a table."""
+        if tab.view is not None:
+            self._save_renderer_config(tab.view, tab.renderer_config())
+            self._set_status(f"Saved '{tab.view.name}'")
+            return
+        name, ok = QInputDialog.getText(self, "Save View", "Name this view:",
+                                        text=tab.blueprint_name)
+        if not ok or not name.strip():
+            return
+        view = self._views.create(name.strip(), tab.query, renderer="blueprint_grid",
+                                  renderer_config=tab.renderer_config())
+        tab.view = view
+        tab._on_config_changed = lambda c, v=view: self._save_renderer_config(v, c)
+        self._open_tabs.pop(("blueprint", tab.blueprint_name), None)
+        self._open_tabs[("view", view.id)] = tab
+        index = self._workspace._tabs.indexOf(tab)
+        if index >= 0:
+            self._workspace._tabs.setTabText(index, view.name)
+        self._reload_views()
+        self._set_status(f"Saved view '{view.name}'")
+
+    def _after_blueprint_change(self):
+        self._blueprints_panel.refresh()
+        errors = self._bottom.panel("errors")
+        if errors is not None:
+            errors.refresh()
+
+    def _new_blueprint(self):
+        dialog = NewBlueprintDialog(parent=self)
+        if not dialog.exec():
+            return
+        if not self._blueprint_op(
+                lambda: self._blueprints.define(dialog.result_name,
+                                                dialog.result_description)):
+            return
+        self._open_blueprint(dialog.result_name)
+
+    def _rename_blueprint(self, name):
+        new_name, ok = QInputDialog.getText(self, "Rename Blueprint", "New name:",
+                                            text=name)
+        if not ok or not new_name.strip() or new_name.strip() == name:
+            return
+        new_name = new_name.strip()
+        if self._blueprint_op(lambda: self._blueprints.rename(name, new_name)):
+            self._repoint_blueprint_views(name, new_name)
+            self._retitle_blueprint_tab(name, new_name)
+
+    def _repoint_blueprint_views(self, old, new):
+        """A saved query names its blueprint, so a rename has to follow it into every view.
+
+        Blueprint identity is the surrogate id and the name is only a label (3.2.2), which
+        is what makes rename cheap in the store — but a query says `Blueprint("StoneType")`
+        because a query is meant to be readable. This is the price of that, paid once.
+        """
+        for view in self._views.all():
+            scope = getattr(view.query, "scope", None)
+            if isinstance(scope, QueryBlueprint) and scope.name == old:
+                self._views.update_query(
+                    view.id, dataclasses.replace(view.query, scope=QueryBlueprint(new)))
+
+    def _retitle_blueprint_tab(self, old, new):
+        for key, tab in list(self._open_tabs.items()):
+            if not isinstance(tab, BlueprintEditorTab) or tab.blueprint_name != old:
+                continue
+            tab.blueprint_name = new
+            tab.query = dataclasses.replace(tab.query, scope=QueryBlueprint(new))
+            tab.reload()
+            index = self._workspace._tabs.indexOf(tab)
+            # A saved view keeps its own name; only an unnamed tab is titled by its
+            # blueprint, so only that one gets retitled.
+            if index >= 0 and tab.view is None:
+                self._workspace._tabs.setTabText(index, new)
+            if key == ("blueprint", old):
+                self._open_tabs.pop(key, None)
+                self._open_tabs[("blueprint", new)] = tab
+
+    def _delete_blueprint(self, name):
+        instances = len(self._blueprints.instances(name))
+        if QMessageBox.question(
+                self, "Delete blueprint",
+                f"Delete the blueprint '{name}'?\n\nThis removes its shape and all "
+                f"{instances} instance(s) with their bindings.",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
+            return
+        views = [v for v in self._views.all()
+                 if isinstance(getattr(v.query, "scope", None), QueryBlueprint)
+                 and v.query.scope.name == name]
+        if views and QMessageBox.question(
+                self, "Views point at this blueprint",
+                f"{len(views)} saved view(s) render '{name}': "
+                f"{', '.join(v.name for v in views)}.\n\nDelete them too?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
+            return
+        if not self._blueprint_op(lambda: self._blueprints.delete(name)):
+            return
+        for view in views:
+            self._views.delete(view.id)
+        for key, tab in list(self._open_tabs.items()):
+            if isinstance(tab, BlueprintEditorTab) and tab.blueprint_name == name:
+                index = self._workspace._tabs.indexOf(tab)
+                if index >= 0:
+                    self._workspace._close_tab(index)
+        self._reload_views()
+
+    def _new_instance(self, blueprint):
+        name, ok = QInputDialog.getText(self, "New Instance",
+                                        f"Name of the new {blueprint}:")
+        if not ok or not name.strip():
+            return
+        if self._blueprint_op(
+                lambda: self._blueprints.create_instance(blueprint, name.strip())):
+            self._open_blueprint(blueprint)
+
+    def _rename_instance(self, blueprint, instance):
+        name, ok = QInputDialog.getText(self, "Rename Instance", "New name:",
+                                        text=instance)
+        if not ok or not name.strip():
+            return
+        self._blueprint_op(
+            lambda: self._blueprints.rename_instance(blueprint, instance, name.strip()))
+
+    def _delete_instance(self, blueprint, instance):
+        if QMessageBox.question(
+                self, "Delete instance",
+                f"Delete '{blueprint}:{instance}' and all its bindings?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
+            return
+        self._blueprint_op(
+            lambda: self._blueprints.delete_instance(blueprint, instance))
+
+    def _blueprint_op(self, operation) -> bool:
+        try:
+            operation()
+        except BlueprintError as e:
+            QMessageBox.warning(self, "Can't do that", str(e))
+            return False
+        self._blueprints_panel.refresh()
+        self._reload_blueprint_tabs()
+        self._after_blueprint_change()
+        return True
+
+    def _reload_blueprint_tabs(self):
+        """Re-read every open blueprint view from the store.
+
+        Blueprint tabs render themselves rather than going through `_tab_models`, so the
+        model-level refreshes miss them entirely — which is why an action that filled in
+        bindings left the open grid looking empty until something else forced a redraw.
+        """
+        for (kind, key), tab in list(self._open_tabs.items()):
+            if kind in ("blueprint", "view") and isinstance(tab, BlueprintEditorTab):
+                try:
+                    tab.reload()
+                except BlueprintError:
+                    pass          # its blueprint was just deleted; the tab is closing
 
     # --- profiles ----------------------------------------------------------
     #
@@ -554,7 +780,13 @@ class MainWindow(QMainWindow):
 
     def _open_view(self, view):
         """Open a saved View (from the Views panel). The tab remembers which View it
-        renders, so constructor edits can be written back to it."""
+        renders, so constructor edits can be written back to it.
+
+        Which renderer it gets is the View's own business — one list in the panel, two
+        renderers behind it."""
+        if view.renderer == "blueprint_grid":
+            return self._open_blueprint_tab(("view", view.id), view.name, view.query,
+                                            view=view)
         return self._open_tab_for(("view", view.id), view.name, view.query, view=view)
 
     def _open_browse(self, registry_type):
@@ -658,12 +890,59 @@ class MainWindow(QMainWindow):
                 control_row.addWidget(btn)
         control_row.addStretch()
         layout.addLayout(control_row)
+
+        # The bar refines what you're looking at; the ⚙ above edits what the view IS.
+        # Typing here never changes the view — "Keep" is the deliberate act that does.
+        bar = QueryBar()
+        bar.set_keepable(view is not None)
+        bar.filter_changed.connect(
+            lambda node, t=tab: self._apply_refinement(t, node))
+        bar.keep_requested.connect(lambda node, t=tab: self._keep_refinement(t, node))
+        layout.addWidget(bar)
         layout.addWidget(table)
 
         self._tab_models[tab] = model
+        self._tab_bars[tab] = bar
+        self._tab_base_queries[tab] = query
+        # The denominator of "N of M" is the view's own size, captured here while nothing
+        # is refined. Deriving it later reads a count that a refinement has already shrunk.
+        self._tab_totals[tab] = model.rowCount()
         if view is not None:
             self._tab_views[tab] = view
+        bar.report(model.rowCount(), model.rowCount())
         return tab
+
+    def _apply_refinement(self, tab, node):
+        """Re-run the tab's query with the bar's filter ANDed onto the view's own."""
+        model = self._tab_models.get(tab)
+        base = self._tab_base_queries.get(tab)
+        bar = self._tab_bars.get(tab)
+        if model is None or base is None:
+            return
+        started = time.perf_counter()
+        try:
+            model.set_filter(combine(base.filter, node))
+        except QueryError as e:
+            bar._show_error(QuerySyntaxError(str(e)))
+            return
+        if node is None:                       # cleared: this IS the view's own size
+            self._tab_totals[tab] = model.rowCount()
+        bar.report(model.rowCount(), self._tab_totals.get(tab, model.rowCount()),
+                   time.perf_counter() - started)
+
+    def _keep_refinement(self, tab, node):
+        """Fold the refinement into the view's own query — §3.2.3's "filter bar -> save"."""
+        view = self._tab_views.get(tab)
+        base = self._tab_base_queries.get(tab)
+        if view is None or base is None or node is None:
+            return
+        merged = dataclasses.replace(base, filter=combine(base.filter, node))
+        self._views.update_query(view.id, merged)
+        self._tab_base_queries[tab] = merged
+        self._tab_bars[tab].clear()
+        self._tab_totals[tab] = self._tab_models[tab].rowCount()   # the view is smaller now
+        self._reload_views()
+        self._set_status(f"Folded the filter into '{view.name}'")
 
     # --- text editor (design 6.3) ------------------------------------------
 
@@ -1115,8 +1394,15 @@ class MainWindow(QMainWindow):
 
     def _refresh_after_run(self):
         """An action run can touch both engines — L2 cells AND file ownership — so the
-        Files panel has to refresh too, not just the views and the bottom panels."""
+        Files panel has to refresh too, not just the views and the bottom panels.
+
+        Blueprint grids need saying explicitly: they aren't model-backed, so nothing in
+        `_refresh_after_tag_change` reaches them and a run that wrote bindings would leave
+        the open grid stale until an unrelated edit happened to rebuild it.
+        """
         self._refresh_after_tag_change()
+        self._reload_blueprint_tabs()
+        self._blueprints_panel.refresh()
         self._files_panel.refresh()
 
     def _delete_tag(self, registry_type, tag_name):
@@ -1161,8 +1447,9 @@ class MainWindow(QMainWindow):
         existing = self._open_tabs.get(key)
         if existing is not None and self._workspace.focus_widget(existing):
             return existing
-        tab = JobEditorTab(job, job_store=self._jobs, package_index=self._packages,
-                           tag_store=self._tags, parent=self)
+        tab = JobEditorTab(job, blueprint_store=self._blueprints,
+                           job_store=self._jobs, package_index=self._packages,
+                           tag_store=self._tags, parent=self, packdump=self._packdump)
         tab.changed.connect(self._reload_jobs)
         tab.run_requested.connect(self._run_job)
         self._workspace.add_tab(tab, f"Job: {job.name}")
@@ -1179,7 +1466,8 @@ class MainWindow(QMainWindow):
             return
 
         self._bottom.log(f"=== running job '{job.name}' ===")
-        result = run_job(job, job_store=self._jobs, package_index=self._packages,
+        result = run_job(job, blueprint_store=self._blueprints,
+                         job_store=self._jobs, package_index=self._packages,
                          tag_store=self._tags, packdump=self._packdump,
                          file_store=self._file_store, history=self._history,
                          job_history=self._job_history)
@@ -1293,7 +1581,8 @@ class MainWindow(QMainWindow):
             return
         for ref, manifest in sorted(self._packages.actions.items()):
             try:
-                bindings = best_guess_bindings(manifest, self._tags)
+                bindings = best_guess_bindings(manifest, self._tags,
+                                               blueprint_store=self._blueprints)
                 job = self._jobs.create(manifest.name or ref)
             except ValueError:
                 continue

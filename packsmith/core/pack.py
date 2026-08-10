@@ -129,6 +129,154 @@ class _Tags:
         self._staging.delete(registry_type, entry_id, tag_name)
 
 
+class _Blueprints:
+    """``pack.blueprints`` — Layer 2 blueprint access (design 3.2.2).
+
+    **Schemas are absent from this object on purpose.** 3.2.2: "Actions cannot create,
+    modify, rename, retype, or delete schemas." That isn't enforced with a guard — the
+    methods simply aren't here, and Starlark can reach nothing the host doesn't hand it.
+    The shape of a blueprint is the user's; only its *data* is shared.
+
+    **Instances and bindings are hybrid.** Ownership is per binding, so writing a slot
+    somebody else owns is resolved by the same declared conflict policy that governs tag
+    writes (3.2.2: "identical to tag assignment conflicts") — one rule, one implementation,
+    two primitives.
+
+    **A blueprint with orphaned instances refuses to be touched at all.** 3.2.2 is
+    unambiguous that the instance "does not silently degrade": until the user resolves what
+    a destructive schema change meant, an action reading it would be reasoning about a
+    shape that no longer describes the data.
+    """
+
+    def __init__(self, staging, blueprint_store, action_ref, conflict_policies=None,
+                 log=None):
+        self._staging = staging
+        self._store = blueprint_store
+        self._action_ref = action_ref
+        self._policies = dict(conflict_policies or {})
+        self._log = log or (lambda level, message: None)
+
+    # --- reads -------------------------------------------------------------
+
+    def instances(self, blueprint):
+        self._require_healthy(blueprint)
+        return self._staging.instances(blueprint)
+
+    def names(self):
+        """Every blueprint the user has defined."""
+        return self._store.names()
+
+    def slots(self, blueprint):
+        """Slot paths an instance of this blueprint can hold — the shape, read-only."""
+        self._require_healthy(blueprint)
+        return [s.path for s in self._store.value_slots(blueprint)]
+
+    def slot(self, blueprint, slot_path):
+        """What a slot *accepts*, as a dict the prelude turns into a struct.
+
+        Without this an action can iterate slots but not reason about them, which rules
+        out the whole interesting class — anything that searches a registry to fill a gap
+        has to know which registry the gap wants.
+        """
+        self._require_healthy(blueprint)
+        found = self._store.slot(blueprint, slot_path)
+        return {
+            "path": found.path, "name": found.name, "kind": found.kind,
+            "type": found.type, "registry_type": found.registry_type,
+            "blueprint": found.ref_blueprint, "values": list(found.enum_values),
+            "group": found.path.rsplit(".", 1)[0] if "." in found.path else "",
+        }
+
+    def get(self, blueprint, instance, slot_path):
+        self._require_healthy(blueprint)
+        return self._staging.read(blueprint, instance, slot_path)
+
+    def bindings(self, blueprint, instance):
+        """Every bound slot at once, ``{path: value}``. One call instead of one per slot,
+        and it reads the way an author thinks about an instance."""
+        self._require_healthy(blueprint)
+        return {path: self._staging.read(blueprint, instance, path)
+                for path in self.slots(blueprint)
+                if self._staging.read(blueprint, instance, path) is not None}
+
+    def ownership(self, blueprint, instance, slot_path):
+        self._require_healthy(blueprint)
+        return self._staging.read_ownership(blueprint, instance, slot_path)
+
+    def gaps(self, blueprint, instance):
+        """Slot paths with nothing bound — the reason blueprints exist. Staging-aware, so
+        an action sees the gaps it has already filled this step close behind it."""
+        self._require_healthy(blueprint)
+        return [path for path in self.slots(blueprint)
+                if self._staging.read(blueprint, instance, path) is None]
+
+    def has(self, blueprint, instance) -> bool:
+        self._require_healthy(blueprint)
+        return self._staging.instance_exists(blueprint, instance)
+
+    # --- writes ------------------------------------------------------------
+
+    def create(self, blueprint, instance):
+        """Create an instance, attributed to the calling action."""
+        self._require_healthy(blueprint)
+        if self._staging.instance_exists(blueprint, instance):
+            return
+        self._staging.create_instance(blueprint, instance, created_by=self._action_ref)
+
+    def bind(self, blueprint, instance, slot_path, value):
+        self._require_healthy(blueprint)
+        if not self._may_write(blueprint, instance, slot_path):
+            return
+        if not self._staging.instance_exists(blueprint, instance):
+            raise ActionFailure(
+                f"'{blueprint}' has no instance '{instance}' — create it first.")
+        self._staging.write(blueprint, instance, slot_path, value,
+                            owner="action", owner_action_ref=self._action_ref)
+
+    def unbind(self, blueprint, instance, slot_path):
+        self._require_healthy(blueprint)
+        self._staging.delete(blueprint, instance, slot_path)
+
+    def _may_write(self, blueprint, instance, slot_path) -> bool:
+        """Same resolution as ``_Tags._may_write`` — see there for why each branch exists.
+        Policy is keyed by blueprint name, which is what a mapping binds."""
+        current = self._staging.read_ownership(blueprint, instance, slot_path)
+        if current is None:
+            return True
+        if current["kind"] == "action" and current["action_ref"] == self._action_ref:
+            return True
+
+        who = "the user" if current["kind"] == "user" else f"'{current['action_ref']}'"
+        cell = f"{blueprint}:{instance}.{slot_path}"
+        policy = self._policies.get(blueprint)
+
+        if policy == "overwrite":
+            self._log("info", f"took {cell} from {who} (conflict policy: overwrite)")
+            return True
+        if policy == "skip":
+            self._log("info", f"left {cell} alone — owned by {who} (conflict policy: skip)")
+            return False
+        if policy == "ask":
+            raise ActionFailure(
+                f"{cell} is owned by {who} and this mapping's conflict policy is 'ask', "
+                f"which PackSmith does not support yet — choose overwrite, skip, or fail.")
+        if policy == "fail":
+            raise ActionFailure(
+                f"{cell} is owned by {who} and this mapping's conflict policy is 'fail'.")
+        raise ActionFailure(
+            f"{cell} is owned by {who}, and this action declares no conflict policy for "
+            f"'{blueprint}'. Declare one on the mapping that binds it.")
+
+    def _require_healthy(self, blueprint):
+        if self._store.has_orphans(blueprint):
+            waiting = self._store.orphans(blueprint)
+            names = ", ".join(sorted(o.instance for o in waiting[:5]))
+            raise ActionFailure(
+                f"'{blueprint}' has {len(waiting)} orphaned instance(s) ({names}) from a "
+                f"schema change nobody has resolved yet. Resolve them in the Errors panel "
+                f"before running actions against this blueprint.")
+
+
 class _FileHandle:
     """A handle to one file (from ``pack.filesystem.resolve(path)``). Writes are
     staged and stamp the calling action as owner (whole-file, open-world engine)."""
@@ -191,7 +339,8 @@ class Pack:
     """The capability object injected into an action for a single step invocation."""
 
     def __init__(self, *, staging, tag_store, packdump, action_ref,
-                 file_staging=None, mappings=None, config=None, conflict_policies=None):
+                 file_staging=None, mappings=None, config=None, conflict_policies=None,
+                 blueprint_staging=None, blueprint_store=None):
         self.action_ref = action_ref
         self._log = []
         # Set by fail(); None means "no deliberate failure was requested".
@@ -199,6 +348,9 @@ class Pack:
         self.registry = _Registry(packdump)
         self.tags = _Tags(staging, tag_store, action_ref,
                           conflict_policies=conflict_policies, log=self.log)
+        self.blueprints = _Blueprints(blueprint_staging, blueprint_store, action_ref,
+                                      conflict_policies=conflict_policies, log=self.log) \
+            if blueprint_store is not None else None
         self.filesystem = _Filesystem(file_staging, action_ref)
         self.step = _Step(mappings, config)
 

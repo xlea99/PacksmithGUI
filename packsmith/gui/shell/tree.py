@@ -27,6 +27,19 @@ class PanelTree(QTreeWidget):
         super().__init__(parent)
         self.setStyleSheet(style.LIST_QSS + extra_qss)
 
+    def mousePressEvent(self, event):
+        """Clicking empty space clears the selection.
+
+        Qt's default is to keep whatever was selected, which leaves a tree with no way to
+        select *nothing* — and "nothing" is a real answer whenever selection means
+        context. In the blueprint schema tree it means "the top level", so without this
+        you can't add a root slot once you've clicked into a group.
+        """
+        if self.itemAt(event.position().toPoint()) is None:
+            self.clearSelection()
+            self.setCurrentItem(None)
+        super().mousePressEvent(event)
+
     def drawBranches(self, painter: QPainter, rect: QRect, index):
         # Let the stylesheet paint the gutter first; the marker goes on top of it.
         super().drawBranches(painter, rect, index)

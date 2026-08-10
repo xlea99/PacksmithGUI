@@ -10,7 +10,7 @@ import dataclasses
 
 from packsmith.core.query.ast import (
     Query, Registry, Blueprint, Tag, Attribute, Slot,
-    Cmp, Has, And, Or, Not, Id, Mod, _Id, _Mod, QueryError,
+    Cmp, Has, And, Or, Not, Id, Mod, AllSlots, _Id, _Mod, _AllSlots, QueryError,
 )
 
 _NODE_TYPES = {
@@ -36,6 +36,8 @@ def _enc(v):
         return {"node": "Id"}
     if isinstance(v, _Mod):
         return {"node": "Mod"}
+    if isinstance(v, _AllSlots):
+        return {"node": "AllSlots"}
     if isinstance(v, (list, tuple)):
         return [_enc(x) for x in v]
     if dataclasses.is_dataclass(v) and not isinstance(v, type):
@@ -57,6 +59,8 @@ def _dec(v):
             return Id
         if tag == "Mod":
             return Mod
+        if tag == "AllSlots":
+            return AllSlots
         cls = _NODE_TYPES.get(tag)
         if cls is None:
             raise QueryError(f"unknown node type: {tag!r}")

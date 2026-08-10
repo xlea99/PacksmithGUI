@@ -13,9 +13,27 @@ class UserDB:
         self._conn = sqlite3.connect(str(db_path))
         self._conn.execute("PRAGMA foreign_keys = ON")
         self._conn.row_factory = sqlite3.Row  # rows always behave like dicts cuz this is the 21st century
+        self._drop_stale_tables()
         self._ensure_tables()
         self._migrate()
         log.info(f"UserDB connected: {db_path}")
+
+    # Tables whose *shape* changed incompatibly, which CREATE TABLE IF NOT EXISTS cannot
+    # fix — it sees the name and does nothing, then later statements referencing the new
+    # columns fail. Has to run BEFORE _ensure_tables, unlike the additive _migrate below.
+    def _drop_stale_tables(self):
+        # The original blueprint tables predated design 3.2.2 being written: no parent_id
+        # (so no inline groups), slots keyed by name (so a rename would be a data
+        # migration, which 3.2.2 forbids), and no per-binding ownership. Every one of them
+        # is empty in every profile — they were never written to.
+        columns = {row["name"] for row in
+                   self._conn.execute("PRAGMA table_info(blueprints)")}
+        if columns and "id" not in columns:
+            for table in ("instance_bindings", "blueprint_instances",
+                          "blueprint_slots", "blueprints"):
+                self._conn.execute(f"DROP TABLE IF EXISTS {table}")
+            self._conn.commit()
+            log.info("Dropped the pre-3.2.2 blueprint stub tables")
 
     # Releases the sqlite connection. Needed when switching profiles: on Windows an open
     # connection holds a file lock, so a profile you're still connected to can't be deleted
@@ -64,41 +82,115 @@ class UserDB:
                 PRIMARY KEY (tag_id, entry_id)
             );
 
-            -- Blueprint definitions
+            -- Blueprints (design 3.2.2): an instantiable schema — "a struct, or a class
+            -- without methods" — modelling relationships between registry entries that
+            -- the game's flat registry doesn't formally connect (the stone palette
+            -- problem).
+            --
+            -- `id` is the IDENTITY and `name` is only a label, the same split tags use
+            -- (design 3.2.1). It is what makes 3.2.2's "rename is a metadata-only
+            -- operation, not a remove-plus-add" true rather than aspirational: everything
+            -- points at ids, so a rename touches exactly one row.
             CREATE TABLE IF NOT EXISTS blueprints (
-                name        TEXT PRIMARY KEY,
-                description TEXT DEFAULT ''
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                name        TEXT NOT NULL UNIQUE,
+                description TEXT NOT NULL DEFAULT ''
             );
 
-            -- Blueprint slots: the shape of a blueprint
-            -- slot_type examples: 'string', 'number', 'bool',
-            --   'registry:minecraft:block', 'registry:minecraft:item',
-            --   'blueprint:stone_type',
-            --   'list:registry:minecraft:block', 'list:blueprint:phylogeny_node'
+            -- The shape of a blueprint. `parent_id` gives 3.2.2's **inline groups** —
+            -- "nesting depth is unlimited… at the DB level it's parent-child rows, but
+            -- the user sees one cohesive schema definition."
+            --
+            -- Two kinds of row: a 'group' (structure only, holds no value) and a 'value'
+            -- (a bindable slot). A value slot's type is spread across explicit columns
+            -- rather than encoded into one string, so nothing has to parse
+            -- 'list:registry:minecraft:block' back apart:
+            --   scalar     -> type in (string, number, bool, enum); enum_values for enum
+            --   registry   -> type='registry', registry_type='minecraft:block'
+            --   blueprint  -> type='blueprint', ref_blueprint_id -> blueprints(id)
+            --
+            -- ref_blueprint_id is RESTRICT, not CASCADE: deleting a blueprint another
+            -- schema points at would silently gut that schema. Schema-level CYCLES are
+            -- explicitly legal (3.2.2) — a CladeNode whose `descendants` slot is a
+            -- CladeNode is the point, not a bug.
             CREATE TABLE IF NOT EXISTS blueprint_slots (
-                blueprint_name  TEXT NOT NULL REFERENCES blueprints(name) ON DELETE CASCADE,
-                slot_name       TEXT NOT NULL,
-                slot_type       TEXT NOT NULL DEFAULT 'string',
-                PRIMARY KEY (blueprint_name, slot_name)
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                blueprint_id    INTEGER NOT NULL REFERENCES blueprints(id) ON DELETE CASCADE,
+                parent_id       INTEGER REFERENCES blueprint_slots(id) ON DELETE CASCADE,
+                name            TEXT NOT NULL,
+                kind            TEXT NOT NULL CHECK(kind IN ('group', 'value')),
+                type            TEXT CHECK(type IN ('string', 'number', 'bool', 'enum',
+                                                    'registry', 'blueprint')),
+                registry_type   TEXT,
+                ref_blueprint_id INTEGER REFERENCES blueprints(id) ON DELETE RESTRICT,
+                enum_values     TEXT,   -- JSON array, only when type='enum'
+                position        INTEGER NOT NULL DEFAULT 0
             );
+            -- Sibling names must be unique, but SQLite treats NULLs as distinct in a
+            -- UNIQUE constraint, so root-level slots need their own index to be covered.
+            CREATE UNIQUE INDEX IF NOT EXISTS blueprint_slots_nested
+                ON blueprint_slots(blueprint_id, parent_id, name) WHERE parent_id IS NOT NULL;
+            CREATE UNIQUE INDEX IF NOT EXISTS blueprint_slots_root
+                ON blueprint_slots(blueprint_id, name) WHERE parent_id IS NULL;
 
-            -- Blueprint instances: a named binding of a blueprint
+            -- A named instantiation: StoneType:granite, StoneType:andesite.
+            -- `created_by` is 3.2.2's attributability ("this instance was created by
+            -- mod_classifier:classify"); NULL means the user made it.
+            -- `orphaned_by` is 3.2.2's orphan state: a destructive schema change (slot
+            -- removal or retype) orphans the WHOLE instance, not just the affected
+            -- binding, and "any action that touches a blueprint with orphaned instances
+            -- refuses to run until the orphans are resolved." NULL means healthy.
             CREATE TABLE IF NOT EXISTS blueprint_instances (
                 id              INTEGER PRIMARY KEY AUTOINCREMENT,
-                blueprint_name  TEXT NOT NULL REFERENCES blueprints(name) ON DELETE CASCADE,
-                instance_name   TEXT NOT NULL,
-                UNIQUE(blueprint_name, instance_name)
+                blueprint_id    INTEGER NOT NULL REFERENCES blueprints(id) ON DELETE CASCADE,
+                name            TEXT NOT NULL,
+                created_by      TEXT,
+                orphaned_by     INTEGER REFERENCES blueprint_mutations(id) ON DELETE SET NULL,
+                UNIQUE(blueprint_id, name)
             );
 
-            -- Instance bindings: which real entries fill which slots
-            -- For list-typed slots, multiple rows share (instance_id, slot_name) with different positions
-            -- value holds the actual data: a registry ID, blueprint instance name, string, number, etc.
+            -- One destructive schema change, kept so it can be undone. Revert is ONE step
+            -- back by design decision, so at most one mutation per blueprint is ever
+            -- outstanding: a blueprint with unresolved orphans refuses further destructive
+            -- edits, because "snap back to the pre-mutation state" stops meaning anything
+            -- once two of them are stacked.
+            CREATE TABLE IF NOT EXISTS blueprint_mutations (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                blueprint_id    INTEGER NOT NULL REFERENCES blueprints(id) ON DELETE CASCADE,
+                kind            TEXT NOT NULL CHECK(kind IN ('remove_slot', 'retype_slot')),
+                slot_path       TEXT NOT NULL,
+                snapshot        TEXT NOT NULL,   -- JSON: slot subtree + affected bindings
+                created_at      TEXT NOT NULL
+            );
+
+            -- Bindings a destructive change displaced. 3.2.2's "Preserve" resolution keeps
+            -- them "in a limbo state… not exposed to actions but retained in the database,
+            -- useful if the slot might return." A separate table is what makes "not
+            -- exposed" structural rather than a flag every reader has to remember.
+            CREATE TABLE IF NOT EXISTS blueprint_limbo (
+                id              INTEGER PRIMARY KEY AUTOINCREMENT,
+                instance_id     INTEGER NOT NULL REFERENCES blueprint_instances(id) ON DELETE CASCADE,
+                slot_path       TEXT NOT NULL,
+                value           TEXT NOT NULL,
+                owner           TEXT NOT NULL DEFAULT 'user',
+                action_ref      TEXT,
+                mutation_id     INTEGER REFERENCES blueprint_mutations(id) ON DELETE SET NULL
+            );
+
+            -- Which real entries fill which slots. `value` holds a registry id, a
+            -- blueprint instance id, or a scalar, according to the slot's type.
+            --
+            -- Ownership is PER BINDING, not per instance (3.2.2): "an instance created by
+            -- an action can have its bindings individually overwritten by the user,
+            -- transferring ownership slot-by-slot." Same shape as tag_assignments, so the
+            -- conflict policies in 3.3 apply unchanged.
             CREATE TABLE IF NOT EXISTS instance_bindings (
                 instance_id     INTEGER NOT NULL REFERENCES blueprint_instances(id) ON DELETE CASCADE,
-                slot_name       TEXT NOT NULL,
+                slot_id         INTEGER NOT NULL REFERENCES blueprint_slots(id) ON DELETE CASCADE,
                 value           TEXT NOT NULL,
-                position        INTEGER NOT NULL DEFAULT 0,
-                PRIMARY KEY (instance_id, slot_name, position)
+                owner           TEXT NOT NULL DEFAULT 'user' CHECK(owner IN ('user', 'action')),
+                action_ref      TEXT,
+                PRIMARY KEY (instance_id, slot_id)
             );
 
             -- Saved Views (design 3.2.3): a View is a named (query, renderer, renderer
@@ -197,6 +289,9 @@ class UserDB:
         self._add_column_if_missing("step_runs", "position_in_run", "INTEGER")
         # `flows` was a dead placeholder table, never used — drop it if an old DB has it.
         self._conn.execute("DROP TABLE IF EXISTS flows")
+        # Orphan state arrived with blueprint schema evolution (design 3.2.2), after the
+        # instances table already existed in some profiles.
+        self._add_column_if_missing("blueprint_instances", "orphaned_by", "INTEGER")
         self._conn.commit()
 
     def _add_column_if_missing(self, table: str, column: str, definition: str):

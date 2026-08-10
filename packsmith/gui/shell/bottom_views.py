@@ -217,11 +217,12 @@ class ErrorsView(_SummaryView):
 
     resolved = Signal()   # something changed; the app should re-evaluate views
 
-    def __init__(self, tag_store, packdump, parent=None):
+    def __init__(self, tag_store, packdump, blueprint_store=None, parent=None):
         super().__init__(["Problem", "Registry", "Detail"],
                          "No problems detected.", parent)
         self._tags = tag_store
         self._packdump = packdump
+        self._blueprints = blueprint_store
         self._tree.setContextMenuPolicy(Qt.CustomContextMenu)
         self._tree.customContextMenuRequested.connect(self._on_context_menu)
         self.refresh()
@@ -240,9 +241,9 @@ class ErrorsView(_SummaryView):
             self._show_empty(False)
             return
 
-        if not orphans:
-            self._show_empty(True)
-            return
+        # No early return on "no tag orphans": this panel answers "what is broken" across
+        # every primitive, and blueprint orphans are added below. Bailing here would hide
+        # them whenever tags happened to be clean, which is most of the time.
 
         # Group by (registry, tag, cause, value) — one row per thing the user can act on.
         groups = {}
@@ -266,13 +267,57 @@ class ErrorsView(_SummaryView):
             item.setToolTip(2, "Right-click to resolve")
             self._tree.addTopLevelItem(item)
 
+        self._add_blueprint_orphans()
         for col in range(self._tree.columnCount()):
             self._tree.resizeColumnToContents(col)
-        self._show_empty(False)
+        self._show_empty(not self.has_problems())
+
+    def _add_blueprint_orphans(self):
+        """Design 3.2.2: an orphaned instance "surfaces in the Errors panel under an
+        'Orphaned Instances' section and is locked against action access." Same panel as
+        tag orphans on purpose — one place to answer "what is broken", whichever primitive
+        broke it."""
+        if self._blueprints is None:
+            return
+        for orphan in self._blueprints.orphans():
+            if orphan.reason == "retype_slot":
+                detail = (f"'{orphan.slot_path}' changed type"
+                          + (f" — {len(orphan.problematic)} value(s) need re-binding"
+                             if orphan.problematic else ""))
+            else:
+                detail = f"'{orphan.slot_path}' was removed while this instance used it"
+            item = QTreeWidgetItem(["Orphaned instance",
+                                    f"{orphan.blueprint}:{orphan.instance}", detail])
+            item.setForeground(0, style.qt_colour(style.ERROR))
+            item.setData(0, Qt.UserRole + 1, orphan)
+            item.setToolTip(2, "Right-click to resolve — you must choose one")
+            self._tree.addTopLevelItem(item)
+
+        # A binding whose target vanished. Not an error the user caused, so it reads as a
+        # warning and locks nothing — the same treatment tag orphans get.
+        for orphan in self._blueprints.find_binding_orphans(self._packdump):
+            item = QTreeWidgetItem(
+                ["Orphaned binding",
+                 f"{orphan.blueprint}:{orphan.instance}.{orphan.slot_path}",
+                 orphan.detail])
+            item.setForeground(0, style.qt_colour(style.WARNING))
+            self._tree.addTopLevelItem(item)
+
+        for path in self._blueprints.cycles():
+            item = QTreeWidgetItem(["Instance cycle", path[0], " → ".join(path)])
+            item.setForeground(0, style.qt_colour(style.ERROR))
+            item.setToolTip(2, "Unbind one of these references to break the loop")
+            self._tree.addTopLevelItem(item)
 
     def _on_context_menu(self, pos):
         item = self._tree.itemAt(pos)
-        payload = item.data(0, Qt.UserRole) if item else None
+        if item is None:
+            return
+        orphan = item.data(0, Qt.UserRole + 1)
+        if orphan is not None:
+            self._blueprint_menu(pos, orphan)
+            return
+        payload = item.data(0, Qt.UserRole)
         if not payload:
             return
         registry_type, tag_name, reason, value, members = payload
@@ -289,6 +334,112 @@ class ErrorsView(_SummaryView):
             menu.addAction(f"Clear  ({len(members)} assignments)",
                            lambda: self._clear_entries(registry_type, tag_name, members))
         menu.exec(self._tree.mapToGlobal(pos))
+
+    def _blueprint_menu(self, pos, orphan):
+        """3.2.2's four resolutions. "The user must choose one; there is no 'ignore' or
+        'dismiss' that silently proceeds with a broken instance." — hence no such entry."""
+        menu = QMenu(self)
+        menu.addAction("Discard the orphaned bindings",
+                       lambda: self._resolve_orphan("discard", orphan))
+        menu.addAction("Preserve them (hidden from actions)",
+                       lambda: self._resolve_orphan("preserve", orphan))
+        menu.addAction(f"Revert the schema change to '{orphan.slot_path}'",
+                       lambda: self._resolve_orphan("revert", orphan))
+        if "rebind" in orphan.resolutions and orphan.problematic:
+            menu.addSeparator()
+            for path in orphan.problematic:
+                menu.addAction(f"Re-bind '{path}'…",
+                               lambda p=path: self._rebind_orphan(orphan, p))
+        # 3.2.2: the four resolutions are available "per-instance (or applied in bulk)".
+        # One destructive schema edit orphans EVERY bound instance at once, so resolving
+        # them one right-click at a time is the common case, not the rare one.
+        siblings = [o for o in self._blueprints.orphans(orphan.blueprint)
+                    if o.slot_path == orphan.slot_path]
+        if len(siblings) > 1:
+            menu.addSeparator()
+            bulk = menu.addMenu(f"All {len(siblings)} orphaned by '{orphan.slot_path}'")
+            bulk.addAction("Discard their orphaned bindings",
+                           lambda: self._resolve_orphans("discard", siblings))
+            bulk.addAction("Preserve them (hidden from actions)",
+                           lambda: self._resolve_orphans("preserve", siblings))
+        menu.exec(self._tree.mapToGlobal(pos))
+
+    def _resolve_orphan(self, how, orphan):
+        target = f"{orphan.blueprint}:{orphan.instance}"
+        prompts = {
+            "discard": (f"Discard the orphaned bindings on {target}?\n\n"
+                        f"The data tied to '{orphan.slot_path}' is deleted permanently."),
+            "preserve": (f"Keep {target}'s orphaned bindings in limbo?\n\n"
+                         f"The instance un-orphans and actions can use it again. The "
+                         f"displaced data stays in the database but is never exposed to "
+                         f"actions — useful if the slot comes back."),
+            "revert": (f"Revert the schema change to '{orphan.slot_path}' on "
+                       f"'{orphan.blueprint}'?\n\nEVERY instance of this blueprint snaps "
+                       f"back to how it was before the change."),
+        }
+        if not self._confirm("Resolve orphan", prompts[how]):
+            return
+        try:
+            if how == "discard":
+                self._blueprints.discard(orphan.blueprint, orphan.instance)
+            elif how == "preserve":
+                self._blueprints.preserve(orphan.blueprint, orphan.instance)
+            else:
+                self._blueprints.revert(orphan.blueprint)
+        except Exception as e:
+            QMessageBox.warning(self, "Couldn't resolve", str(e))
+            return
+        self.refresh()
+        self.resolved.emit()
+
+    def _resolve_orphans(self, how, orphans):
+        """The same resolution across a whole batch, confirmed once.
+
+        `revert` is deliberately absent from the bulk menu: it already acts on every
+        instance of the blueprint, so "apply revert to these twelve" would be a lie about
+        its blast radius. `rebind` is absent too — each value is a separate decision.
+        """
+        verb = ("Discard the orphaned bindings on" if how == "discard"
+                else "Keep the orphaned bindings in limbo for")
+        names = ", ".join(f"{o.blueprint}:{o.instance}" for o in orphans[:10])
+        more = f"\n…and {len(orphans) - 10} more" if len(orphans) > 10 else ""
+        detail = ("Their data is deleted permanently."
+                  if how == "discard"
+                  else "They un-orphan and actions can use them again; the displaced data "
+                       "stays in the database but is never exposed to actions.")
+        if not self._confirm(
+                f"Resolve {len(orphans)} orphans",
+                f"{verb} {len(orphans)} instance(s)?\n\n{names}{more}\n\n{detail}"):
+            return
+        failed = []
+        for orphan in orphans:
+            try:
+                if how == "discard":
+                    self._blueprints.discard(orphan.blueprint, orphan.instance)
+                else:
+                    self._blueprints.preserve(orphan.blueprint, orphan.instance)
+            except Exception as e:
+                failed.append(f"{orphan.blueprint}:{orphan.instance} — {e}")
+        if failed:
+            # Named, not counted: a partial failure the user can't see is worse than none.
+            QMessageBox.warning(self, "Some couldn't be resolved", "\n".join(failed[:10]))
+        self.refresh()
+        self.resolved.emit()
+
+    def _rebind_orphan(self, orphan, path):
+        slot = self._blueprints.slot(orphan.blueprint, path)
+        value, ok = QInputDialog.getText(
+            self, "Re-bind slot",
+            f"{orphan.blueprint}:{orphan.instance}.{path}\n\nNew value ({slot.describe()}):")
+        if not ok or not value.strip():
+            return
+        try:
+            self._blueprints.rebind(orphan.blueprint, orphan.instance, path, value.strip())
+        except Exception as e:
+            QMessageBox.warning(self, "Couldn't re-bind", str(e))
+            return
+        self.refresh()
+        self.resolved.emit()
 
     # --- resolutions -------------------------------------------------------
 

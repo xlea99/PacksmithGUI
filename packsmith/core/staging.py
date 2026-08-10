@@ -94,3 +94,116 @@ class L2Staging:
     def discard(self):
         """Drop the buffer. The store was never touched."""
         self._pending.clear()
+
+
+class BlueprintStaging:
+    """The same contract as :class:`L2Staging`, for blueprint slot bindings (design 3.2.2).
+
+    Ownership here is **per binding**, not per instance: "an instance created by an action
+    can have its bindings individually overwritten by the user, transferring ownership
+    slot-by-slot." So the staged key is ``(blueprint, instance, slot_path)`` — the same
+    granularity as a tag cell, which is why the conflict machinery transfers unchanged.
+
+    Creating an *instance* is staged too. An action that creates an instance and then binds
+    into it has to be able to read it back mid-step, and neither may survive a failure.
+    """
+
+    def __init__(self, blueprint_store):
+        self._store = blueprint_store
+        # (blueprint, instance, slot_path) -> {"value", "owner", "owner_action_ref"} | _DELETE
+        self._pending = {}
+        # (blueprint, instance) -> created_by
+        self._new_instances = {}
+        self.inverse = []
+
+    # --- staging writes (no DB contact) ---
+
+    def create_instance(self, blueprint, instance, *, created_by=None):
+        self._new_instances[(blueprint, instance)] = created_by
+
+    def write(self, blueprint, instance, slot_path, value, *, owner, owner_action_ref=None):
+        self._pending[(blueprint, instance, slot_path)] = {
+            "value": value, "owner": owner, "owner_action_ref": owner_action_ref,
+        }
+
+    def delete(self, blueprint, instance, slot_path):
+        self._pending[(blueprint, instance, slot_path)] = _DELETE
+
+    # --- reads (read-your-writes) ---
+
+    def instance_exists(self, blueprint, instance) -> bool:
+        if (blueprint, instance) in self._new_instances:
+            return True
+        return any(i.name == instance for i in self._safe_instances(blueprint))
+
+    def instances(self, blueprint) -> list:
+        committed = [i.name for i in self._safe_instances(blueprint)]
+        staged = [name for (bp, name) in self._new_instances if bp == blueprint]
+        return sorted(set(committed) | set(staged))
+
+    def read(self, blueprint, instance, slot_path):
+        staged = self._pending.get((blueprint, instance, slot_path))
+        if staged is _DELETE:
+            return None
+        if staged is not None:
+            return staged["value"]
+        if (blueprint, instance) in self._new_instances:
+            return None                       # not committed yet, so nothing is bound
+        return self._store.value_of(blueprint, instance, slot_path)
+
+    def read_ownership(self, blueprint, instance, slot_path):
+        staged = self._pending.get((blueprint, instance, slot_path))
+        if staged is _DELETE:
+            return None
+        if staged is not None:
+            return {"kind": staged["owner"], "action_ref": staged["owner_action_ref"]}
+        if (blueprint, instance) in self._new_instances:
+            return None
+        binding = self._store.bindings(blueprint, instance).get(slot_path)
+        if binding is None:
+            return None
+        return {"kind": binding.owner, "action_ref": binding.action_ref}
+
+    # --- lifecycle ---
+
+    @property
+    def has_pending(self) -> bool:
+        return bool(self._pending or self._new_instances)
+
+    def commit(self):
+        self.inverse = []
+        for (blueprint, instance), created_by in self._new_instances.items():
+            if not any(i.name == instance for i in self._safe_instances(blueprint)):
+                self._store.create_instance(blueprint, instance, created_by=created_by)
+                self.inverse.append({"kind": "instance", "key": [blueprint, instance],
+                                     "existed": False})
+
+        for key, staged in self._pending.items():
+            blueprint, instance, slot_path = key
+            prior = self._store.bindings(blueprint, instance).get(slot_path)
+            self.inverse.append({
+                "kind": "binding",
+                "key": list(key),
+                "existed": prior is not None,
+                "value": prior.value if prior else None,
+                "owner_kind": prior.owner if prior else None,
+                "owner_ref": prior.action_ref if prior else None,
+            })
+            if staged is _DELETE:
+                self._store.unbind(blueprint, instance, slot_path)
+            else:
+                self._store.bind(blueprint, instance, slot_path, staged["value"],
+                                 owner=staged["owner"],
+                                 action_ref=staged["owner_action_ref"])
+        self._pending.clear()
+        self._new_instances.clear()
+
+    def discard(self):
+        self._pending.clear()
+        self._new_instances.clear()
+
+    def _safe_instances(self, blueprint):
+        try:
+            return self._store.instances(blueprint)
+        except Exception:
+            return []

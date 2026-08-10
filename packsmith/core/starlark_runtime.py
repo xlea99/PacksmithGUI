@@ -163,6 +163,24 @@ class PackageLoader:
         return frozen
 
 
+class _NoBlueprints:
+    """Stands in when a step was constructed without a blueprint store.
+
+    ``add_callable`` needs something to bind either way, so the absence has to be a
+    callable that explains itself rather than a missing name — a Starlark NameError on
+    ``_bp_bind`` would tell the author nothing about why.
+    """
+
+    def __getattr__(self, name):
+        def unavailable(*_args, **_kwargs):
+            raise ActionFailure("the blueprint capability is not available for this step")
+        return unavailable
+
+
+def _blueprints(pack):
+    return pack.blueprints if pack.blueprints is not None else _NoBlueprints()
+
+
 def _prelude(pack) -> str:
     """The Starlark source that assembles `pack` from the injected callables.
 
@@ -170,6 +188,24 @@ def _prelude(pack) -> str:
     names that :func:`_inject` adds to the module.
     """
     return f"""
+def _bp_slot_info(blueprint, path):
+    # add_callable can only hand back plain values, so the host returns a dict and this
+    # promotes it to a struct — `slot.registry_type` rather than `slot["registry_type"]`,
+    # matching how `pack` itself reads.
+    d = _bp_slot(blueprint, path)
+    if d == None:
+        return None
+    return struct(
+        path = d["path"],
+        name = d["name"],
+        kind = d["kind"],
+        type = d["type"],
+        registry_type = d["registry_type"],
+        blueprint = d["blueprint"],
+        values = d["values"],
+        group = d["group"],
+    )
+
 def _resolve(path):
     return struct(
         path = path,
@@ -197,6 +233,20 @@ pack = struct(
         write = _tags_write,
         clear = _tags_clear,
     ),
+    blueprints = struct(
+        names = _bp_names,
+        instances = _bp_instances,
+        slots = _bp_slots,
+        slot = _bp_slot_info,
+        get = _bp_get,
+        bindings = _bp_bindings,
+        ownership = _bp_ownership,
+        gaps = _bp_gaps,
+        has = _bp_has,
+        create = _bp_create,
+        bind = _bp_bind,
+        unbind = _bp_unbind,
+    ),
     filesystem = struct(resolve = _resolve),
     step = struct(
         mappings = {_literal(pack.step.mappings)},
@@ -219,6 +269,21 @@ def _inject(module: Module, pack):
         "_tags_ownership": pack.tags.ownership,
         "_tags_write": pack.tags.write,
         "_tags_clear": pack.tags.clear,
+        # Blueprint SCHEMA methods are deliberately absent (design 3.2.2 — "actions cannot
+        # create, modify, rename, retype, or delete schemas"). Starlark can reach nothing
+        # that isn't injected here, so the rule needs no guard.
+        "_bp_names": _blueprints(pack).names,
+        "_bp_instances": _blueprints(pack).instances,
+        "_bp_slots": _blueprints(pack).slots,
+        "_bp_slot": _blueprints(pack).slot,
+        "_bp_get": _blueprints(pack).get,
+        "_bp_bindings": _blueprints(pack).bindings,
+        "_bp_ownership": _blueprints(pack).ownership,
+        "_bp_gaps": _blueprints(pack).gaps,
+        "_bp_has": _blueprints(pack).has,
+        "_bp_create": _blueprints(pack).create,
+        "_bp_bind": _blueprints(pack).bind,
+        "_bp_unbind": _blueprints(pack).unbind,
         # Filesystem operations take the path first so `partial` can pre-bind it.
         "_fs_read_all": lambda path: pack.filesystem.resolve(path).read_all(),
         "_fs_read_json": lambda path: pack.filesystem.resolve(path).read_json(),

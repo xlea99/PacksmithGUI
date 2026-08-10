@@ -7,14 +7,18 @@ user; they just fill in what the action asks for."* So both kinds of slot render
 of one form — artifact pickers for mappings, inline editors for config — and nothing in
 the UI names the distinction.
 """
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtGui import QCursor
 from PySide6.QtWidgets import (
     QWidget, QDialog, QVBoxLayout, QHBoxLayout, QFormLayout, QLabel, QPushButton,
     QComboBox, QLineEdit, QCheckBox, QTreeWidget, QTreeWidgetItem, QDialogButtonBox,
     QAbstractItemView, QMessageBox, QListWidget, QListWidgetItem,
 )
 
+from packsmith.core.bindings import mapping_mismatches
+from packsmith.core.shapes import describe_shape
 from packsmith.gui.shell import style
+from packsmith.gui.shell.picker import PickerPopup, _token_match
 from packsmith.gui.shell.tree import PanelTree
 
 _INHERIT = "(inherit from job)"
@@ -104,17 +108,116 @@ class JobPickerDialog(QDialog):
         super().accept()
 
 
+class _EntryField(QWidget):
+    """Bind one Layer 1 entry: a typed field with a browse button.
+
+    Not a QComboBox — `minecraft:item` is 14,000 entries on a real pack, which is the exact
+    case `PickerPopup` was built for. And the field stays typeable: §5.3's rule that a
+    recommendation "must never restrict" applies just as much to a picker as to a template.
+    """
+
+    def __init__(self, registry_type, entries, current):
+        super().__init__()
+        self._entries = entries
+        self._registry_type = registry_type
+        self._picker = None
+        row = QHBoxLayout(self)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(4)
+        self._edit = QLineEdit(self)
+        self._edit.setPlaceholderText(f"{len(entries):,} in {registry_type}")
+        if current:
+            self._edit.setText(str(current))
+        row.addWidget(self._edit, 1)
+        browse = QPushButton("…", self)
+        browse.setFixedWidth(28)
+        browse.clicked.connect(self._browse)
+        row.addWidget(browse)
+
+    def _browse(self):
+        picker = PickerPopup(self._entries, header=self._registry_type, parent=self)
+        picker.chosen.connect(self._edit.setText)
+        self._picker = picker           # held: a popup with no owner vanishes mid-show
+        QTimer.singleShot(0, lambda: picker.popup_at(QCursor.pos()))
+
+    def value(self):
+        return self._edit.text().strip() or None
+
+
+class _MultiSelect(QWidget):
+    """A checkable list for a `cardinality = "many"` mapping (design 3.3).
+
+    Checkboxes rather than Ctrl-click selection: a binding that survives closing the dialog
+    should look like a binding, and a multi-select highlight reads as transient. Misfits are
+    listed but not checkable, for the same reason the single picker keeps them.
+
+    A filter appears once the list is long enough to need one. A `many` mapping over a
+    registry is 14,000 rows on a real pack, and scrolling to find three of them is the
+    problem `PickerPopup` was built to solve — the same token matching, applied here by
+    hiding rows so checked-but-hidden entries stay bound.
+    """
+
+    _FILTER_THRESHOLD = 12
+
+    def __init__(self, candidates, current):
+        super().__init__()
+        chosen = set(current or ())
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(3)
+
+        self._filter = QLineEdit(self)
+        self._filter.setPlaceholderText(f"type to narrow {len(candidates):,}")
+        self._filter.textChanged.connect(self._apply_filter)
+        root.addWidget(self._filter)
+
+        self._list = QListWidget(self)
+        for value, reasons in candidates:
+            item = QListWidgetItem(value if not reasons else f"{value} — doesn't fit")
+            item.setData(Qt.UserRole, value)
+            if reasons:
+                item.setFlags(Qt.NoItemFlags)      # visible, inert, uncheckable
+                item.setToolTip("\n".join(reasons))
+                item.setForeground(style.qt_colour(style.TEXT_FAINT))
+            else:
+                item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+                item.setCheckState(Qt.Checked if value in chosen else Qt.Unchecked)
+            self._list.addItem(item)
+        self._list.setUniformItemSizes(True)
+        self._list.setMaximumHeight(150)
+        self._list.setStyleSheet(style.LIST_QSS)
+        root.addWidget(self._list)
+        # Ordered after addWidget: setVisible on a parentless widget shows a real window.
+        self._filter.setVisible(len(candidates) >= self._FILTER_THRESHOLD)
+
+    def _apply_filter(self, text):
+        for row in range(self._list.count()):
+            item = self._list.item(row)
+            item.setHidden(not _token_match(item.data(Qt.UserRole), text))
+
+    def count(self) -> int:
+        return self._list.count()
+
+    def chosen(self) -> list:
+        """Every checked row, hidden or not — filtering narrows the view, not the binding."""
+        return [self._list.item(r).data(Qt.UserRole) for r in range(self._list.count())
+                if self._list.item(r).checkState() == Qt.Checked]
+
+
 # --- editing one step -------------------------------------------------------
 
 class StepEditorDialog(QDialog):
     """Fill in what a step needs. Mappings and config are one list of slots."""
 
-    def __init__(self, manifest, tag_store, step, parent=None):
+    def __init__(self, manifest, tag_store, step, parent=None, blueprint_store=None,
+                 packdump=None):
         super().__init__(parent)
+        self._dump = packdump
         self.setWindowTitle(f"Step — {manifest.name or manifest.action_id}")
         self.setMinimumWidth(480)
         self._manifest = manifest
         self._tags = tag_store
+        self._blueprints = blueprint_store
         self._mapping_widgets = {}
         self._config_widgets = {}
 
@@ -179,10 +282,32 @@ class StepEditorDialog(QDialog):
         return label
 
     def _mapping_widget(self, name, slot, current):
-        """An artifact picker: the user's own tags of the type this slot asks for."""
+        """An artifact picker: the user's own artifacts of the kind this slot asks for."""
+        if slot.cardinality == "many":
+            # 3.3: "many — zero or more artifacts (UI: multi-select list)".
+            return _MultiSelect(self._candidates_for(slot), current)
+
         combo = QComboBox()
         if not slot.required:
             combo.addItem("(unbound)", None)
+
+        if slot.kind == "registry_entry":
+            return _EntryField(slot.registry_type,
+                               self._registry_entries(slot.registry_type), current)
+
+        if slot.kind == "blueprint_instance":
+            self._fill_choice_combo(combo, slot, current,
+                                    empty="(no instances fit this action)")
+            return combo
+
+        if slot.kind == "blueprint":
+            # Blueprint mappings bind a SCHEMA, so the action never names the user's own
+            # (design 3.3) — the same rule tags follow. Which schemas qualify is decided
+            # structurally, by required_shape.
+            self._fill_choice_combo(combo, slot, current,
+                                    empty="(no blueprint fits this action)")
+            return combo
+
         definitions = self._tags.definitions_for(slot.registry_type) if slot.registry_type else {}
         for tag_name, definition in sorted(definitions.items()):
             if slot.tag_type and definition["type"] != slot.tag_type:
@@ -195,6 +320,58 @@ class StepEditorDialog(QDialog):
         if index >= 0:
             combo.setCurrentIndex(index)
         return combo
+
+    def _registry_entries(self, registry_type) -> list:
+        if self._dump is None:
+            return []
+        return sorted((self._dump.registry.get(registry_type) or {}).get("values", ()))
+
+    def _candidates_for(self, slot) -> list:
+        """``[(value, reasons)]`` — everything bindable here, fitting ones first.
+
+        Misfits are kept, with their reasons, rather than filtered out: a user whose
+        `StoneType` doesn't appear has no way to learn that it's missing `polished.wall`.
+        Showing it greyed with "why" turns a dead end into a to-do.
+        """
+        if slot.kind == "registry_entry":
+            return [(e, []) for e in self._registry_entries(slot.registry_type)]
+        if self._blueprints is None:
+            return []
+        if slot.kind == "blueprint_instance":
+            values = [i.ref for name in self._blueprints.names()
+                      for i in self._blueprints.instances(name)]
+        else:
+            values = list(self._blueprints.names())
+        scored = [(v, mapping_mismatches(slot, v, self._blueprints)) for v in values]
+        return [s for s in scored if not s[1]] + [s for s in scored if s[1]]
+
+    def _fill_choice_combo(self, combo, slot, current, *, empty):
+        candidates = self._candidates_for(slot)
+        if not candidates:
+            combo.addItem("(nothing of this kind exists yet)", None)
+            combo.setEnabled(False)
+            return
+
+        fitting = [v for v, reasons in candidates if not reasons]
+        for value, reasons in candidates:
+            combo.addItem(value if not reasons else f"{value} — doesn't fit", value)
+            if reasons:
+                item = combo.model().item(combo.count() - 1)
+                item.setEnabled(False)
+                item.setToolTip("\n".join(reasons))
+
+        if slot.required_shape:
+            combo.setToolTip(f"needs: {describe_shape(slot.required_shape)}")
+        if not fitting:
+            # A placeholder carrying None, or the disabled misfit at row 0 would become
+            # `currentData()` and get saved as the binding — the picker would look refused
+            # and bind anyway.
+            combo.insertItem(0, empty, None)
+            combo.setEnabled(False)
+        # An existing binding stays selected even if it no longer fits: opening this dialog
+        # shouldn't quietly unbind a step. The run refuses instead, and says why.
+        index = combo.findData(current)
+        combo.setCurrentIndex(max(0, index))
 
     @staticmethod
     def _config_widget(param, current):
@@ -211,8 +388,18 @@ class StepEditorDialog(QDialog):
 
     def accept(self):
         bindings = {}
-        for name, combo in self._mapping_widgets.items():
-            value = combo.currentData()
+        for name, widget in self._mapping_widgets.items():
+            if isinstance(widget, _EntryField):
+                value = widget.value()
+                if value is not None:
+                    bindings[name] = value
+                continue
+            if isinstance(widget, _MultiSelect):
+                # Stored even when empty: "I deliberately chose none" and "I never opened
+                # this" are different, and only the second should read as unbound.
+                bindings[name] = widget.chosen()
+                continue
+            value = widget.currentData()
             if value is not None:
                 bindings[name] = value
 
@@ -251,12 +438,15 @@ class JobEditorTab(QWidget):
     changed = Signal()             # the job was modified; panels should refresh
     run_requested = Signal(object)  # Job
 
-    def __init__(self, job, *, job_store, package_index, tag_store, parent=None):
+    def __init__(self, job, *, job_store, package_index, tag_store, parent=None,
+                 blueprint_store=None, packdump=None):
         super().__init__(parent)
         self._job_id = job.id
         self._jobs = job_store
         self._packages = package_index
         self._tags = tag_store
+        self._blueprints = blueprint_store
+        self._dump = packdump
 
         root = QVBoxLayout(self)
         root.setContentsMargins(8, 8, 8, 8)
@@ -353,9 +543,38 @@ class JobEditorTab(QWidget):
             policy = step.on_error or f"({job.default_on_error})"
             item = QTreeWidgetItem([str(index), what, configured or "—", policy])
             item.setData(0, Qt.UserRole, step)
+            # 3.2.2: a step whose mapping no longer validates "is flagged as needing
+            # attention". It already refuses to run — this is what stops that being a
+            # surprise at run time, long after the schema edit that caused it.
+            reasons = self._step_problems(step)
+            if reasons:
+                item.setText(1, f"⚠ {what}")
+                item.setForeground(1, style.qt_colour(style.ERROR))
+                item.setToolTip(1, "\n".join(reasons))
             self._tree.addTopLevelItem(item)
         for col in range(self._tree.columnCount()):
             self._tree.resizeColumnToContents(col)
+
+    def _step_problems(self, step) -> list:
+        """Why this step won't run, as sentences — empty when it's fine."""
+        if not step.is_action or self._packages is None or self._blueprints is None:
+            return []
+        try:
+            manifest = self._packages.get(step.action_ref)
+        except (KeyError, ValueError):
+            return [f"'{step.action_ref}' is not installed"]
+        problems = []
+        for name, slot in manifest.mappings.items():
+            bound = step.bindings.get(name)
+            if bound is None or bound == []:
+                if slot.required:
+                    problems.append(f"'{name}' is unbound")
+                continue
+            if slot.kind in ("blueprint", "blueprint_instance"):
+                for item in (bound if isinstance(bound, list) else [bound]):
+                    problems += [f"'{name}': {why}" for why in
+                                 mapping_mismatches(slot, item, self._blueprints)]
+        return problems
 
     def _selected_step(self):
         item = self._tree.currentItem()
@@ -410,7 +629,9 @@ class JobEditorTab(QWidget):
             QMessageBox.warning(self, "Action missing",
                                 f"'{step.action_ref}' isn't installed in this profile.")
             return
-        dlg = StepEditorDialog(manifest, self._tags, step, self)
+        dlg = StepEditorDialog(manifest, self._tags, step, self,
+                               blueprint_store=self._blueprints,
+                               packdump=self._dump)
         if not dlg.exec():
             return
         self._jobs.update_step(step.id, bindings=dlg.result_bindings,

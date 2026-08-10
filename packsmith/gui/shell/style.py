@@ -24,9 +24,28 @@ SIDEBAR_PANEL_WIDTH = 230
 #   action -> amber: "an action manages this", meant to catch the eye
 OWNER_USER = "#4a5568"
 OWNER_ACTION = "#c8963c"
+# The same amber, dimmed: used where an action-owned value is also LOCKED against casual
+# editing. Amber says "an action wrote this"; the dimming says "and it isn't yours to type
+# over" — the standard read-only cue, so the cell doesn't invite an edit it will refuse.
+OWNER_ACTION_LOCKED = "#96702d"
 
 # Failure text — readable on the dark ground, unlike Qt.red.
 ERROR = "#e06c6c"
+# Something is wrong but nobody did anything wrong — a binding whose registry entry left
+# with the packdump. Distinct from ERROR so "you must decide" and "you should look" don't
+# shout at the same volume.
+WARNING = "#d0a050"
+
+# A gap in a blueprint instance: an empty slot is missing content, not an error, so it
+# reads as absence rather than alarm (design 3.2.2).
+GAP = "#3a3a48"
+
+
+def qt_colour(hex_string):
+    """QColor from one of the constants above, for the widget APIs that want an object
+    rather than a stylesheet string."""
+    from PySide6.QtGui import QColor
+    return QColor(hex_string)
 
 # Shared look for the list/tree widgets that fill sidebar panels.
 LIST_QSS = f"""

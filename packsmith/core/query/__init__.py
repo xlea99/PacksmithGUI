@@ -6,7 +6,7 @@ suggestions. It reads L1 (packdump) and L2 (tags); it never reads L3 — actions
 """
 from packsmith.core.query.ast import (
     Query, Registry, Blueprint,
-    Id, Mod, Tag, Attribute, Slot,
+    Id, Mod, Tag, Attribute, Slot, AllSlots,
     Cmp, Has, And, Or, Not,
     QueryError, VALID_OPS,
 )
@@ -17,7 +17,7 @@ from packsmith.core.query.serde import to_dict, from_dict
 
 __all__ = [
     "Query", "Registry", "Blueprint",
-    "Id", "Mod", "Tag", "Attribute", "Slot",
+    "Id", "Mod", "Tag", "Attribute", "Slot", "AllSlots",
     "Cmp", "Has", "And", "Or", "Not",
     "QueryError", "VALID_OPS",
     "Result", "Column", "Row",

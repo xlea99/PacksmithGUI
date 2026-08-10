@@ -4,7 +4,9 @@ These are the "I didn't configure anything, just show me" queries — the ones t
 panels hand you. They're ordinary queries with no special status; the difference between
 one of these and a saved View is only that nobody named and kept it.
 """
-from packsmith.core.query import Query, Registry, Id, Attribute, Tag
+from packsmith.core.query import (
+    Query, Registry, Blueprint, Id, Attribute, Tag, AllSlots,
+)
 
 
 def browse_query(registry_type: str) -> Query:
@@ -25,5 +27,20 @@ def tag_query(registry_type: str, tag_name: str) -> Query:
     return Query(
         scope=Registry(registry_type),
         select=[Id, Attribute("localization"), Tag(tag_name)],
+        order_by=[Id],
+    )
+
+
+def blueprint_query(blueprint: str) -> Query:
+    """Every instance of a blueprint, with every one of its slots (§4.1, Blueprints panel).
+
+    ``AllSlots`` rather than a frozen list of columns: a blueprint's slots are a fact about
+    the blueprint, not a preference of the view. Freeze them and a schema that grows starts
+    hiding *gaps* — and gaps are the whole output of the primitive (§3.2.2). A deliberately
+    curated view still names its slots explicitly; this is just the default.
+    """
+    return Query(
+        scope=Blueprint(blueprint),
+        select=[Id, AllSlots],
         order_by=[Id],
     )

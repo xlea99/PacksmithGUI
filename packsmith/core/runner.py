@@ -14,7 +14,7 @@ Starlark). The runner takes an already-loaded callable, so it never sees the lan
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
-from packsmith.core.staging import L2Staging
+from packsmith.core.staging import BlueprintStaging, L2Staging
 from packsmith.core.files import FileStaging
 from packsmith.core.pack import Pack, ActionFailure
 
@@ -39,25 +39,32 @@ def _now() -> str:
 
 def run_action(action_fn, *, tag_store, packdump, action_ref,
                mappings=None, config=None, file_store=None, history=None,
-               history_context=None, conflict_policies=None) -> StepResult:
+               history_context=None, conflict_policies=None,
+               blueprint_store=None) -> StepResult:
     """Run a single action callable through the staging lifecycle. Returns a
     StepResult; never raises for a failing action — failures are captured.
 
     If ``file_store`` is given, the action can also write files via ``pack.filesystem``
-    (open-world engine); both engines commit or discard together. If ``history`` (a
-    StepRunStore) is given, the run is recorded — with rollback data on success — and
-    the new run id comes back on the result."""
+    (open-world engine); both engines commit or discard together. If ``blueprint_store``
+    is given, ``pack.blueprints`` is available and stages alongside tags — both are the
+    closed-world Layer 2 engine, so they share the step's all-or-nothing semantics. If
+    ``history`` (a StepRunStore) is given, the run is recorded — with rollback data on
+    success — and the new run id comes back on the result."""
     started_at = _now()
     l2 = L2Staging(tag_store)
     files = FileStaging(file_store) if file_store is not None else None
+    blueprints = BlueprintStaging(blueprint_store) if blueprint_store is not None else None
     pack = Pack(staging=l2, file_staging=files, tag_store=tag_store, packdump=packdump,
                 action_ref=action_ref, mappings=mappings, config=config,
-                conflict_policies=conflict_policies)
+                conflict_policies=conflict_policies,
+                blueprint_staging=blueprints, blueprint_store=blueprint_store)
 
     def _discard():
         l2.discard()
         if files is not None:
             files.discard()
+        if blueprints is not None:
+            blueprints.discard()
 
     status, reason = "success", None
     try:
@@ -70,6 +77,8 @@ def run_action(action_fn, *, tag_store, packdump, action_ref,
             if files is not None:
                 files.commit()
             l2.commit()
+            if blueprints is not None:
+                blueprints.commit()
         except Exception as e:
             _discard()
             status, reason = "failed", f"commit failed: {e}"
@@ -81,8 +90,9 @@ def run_action(action_fn, *, tag_store, packdump, action_ref,
         status, reason = "failed", f"{type(e).__name__}: {e}"
 
     rollback_data = (
-        {"l2": l2.inverse, "files": files.snapshots if files is not None else {}}
-        if status == "success" else {"l2": [], "files": {}}
+        {"l2": l2.inverse, "files": files.snapshots if files is not None else {},
+         "blueprints": blueprints.inverse if blueprints is not None else []}
+        if status == "success" else {"l2": [], "files": {}, "blueprints": []}
     )
     run_id = None
     if history is not None:
