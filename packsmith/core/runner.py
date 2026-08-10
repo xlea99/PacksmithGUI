@@ -11,6 +11,7 @@ Resolving an `action_ref` to a callable lives in `packages.PackageIndex.load_cal
 (the one language-specific seam — it returns a closure that evaluates the action's
 Starlark). The runner takes an already-loaded callable, so it never sees the language.
 """
+from contextlib import ExitStack
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
@@ -59,6 +60,26 @@ def run_action(action_fn, *, tag_store, packdump, action_ref,
                 conflict_policies=conflict_policies,
                 blueprint_staging=blueprints, blueprint_store=blueprint_store)
 
+    def _joint_transaction(l2_staging, blueprint_staging):
+        """One transaction spanning every distinct database these stores write through.
+
+        Deduplicated by identity, because tags and blueprints normally share one UserDB —
+        and then this is genuinely one COMMIT across both, which is what makes an L2 flush
+        that fails halfway leave nothing behind.
+        """
+        stack = ExitStack()
+        seen = []
+        for store in (getattr(l2_staging, "_tags", None),
+                      getattr(blueprint_staging, "_store", None)):
+            db = getattr(store, "_db", None)
+            if db is None or not hasattr(db, "transaction"):
+                continue
+            if any(db is other for other in seen):
+                continue
+            seen.append(db)
+            stack.enter_context(db.transaction())
+        return stack
+
     def _discard():
         l2.discard()
         if files is not None:
@@ -67,21 +88,33 @@ def run_action(action_fn, *, tag_store, packdump, action_ref,
             blueprints.discard()
 
     status, reason = "success", None
+    partial = False
     try:
         action_fn(pack)
-        # Commit — file (open-world) engine first, so a commit-time failure (e.g.
-        # file_must_exist) leaves L2 uncommitted and cleanly discardable. Cross-engine
-        # atomicity beyond this is the deferred crash-recovery concern (design 3.3);
-        # the store-by-path snapshots exist so it can be recovered later.
+        # Commit — file (open-world) engine first, so a commit-time failure leaves the
+        # database untouched and cleanly discardable. Files pre-flight their existence
+        # requirements, so by the time bytes are written the likely failures are gone.
         try:
             if files is not None:
                 files.commit()
-            l2.commit()
-            if blueprints is not None:
-                blueprints.commit()
+            # L2 and blueprints flush inside ONE transaction. They usually share a
+            # connection, in which case this is a single COMMIT across both; when they
+            # don't, each is still individually all-or-nothing instead of per-statement.
+            with _joint_transaction(l2, blueprints):
+                l2.commit()
+                if blueprints is not None:
+                    blueprints.commit()
         except Exception as e:
+            # Buffers are dropped, but NOT the inverse records: whatever did land is
+            # exactly what those describe, and they are the only way back. The database
+            # side rolls itself back; files cannot, so anything already written stays and
+            # has to remain undoable.
+            partial = files is not None and bool(files.snapshots)
             _discard()
             status, reason = "failed", f"commit failed: {e}"
+            if partial:
+                reason += (f" — {len(files.snapshots)} file(s) were already written; "
+                           f"roll this step back to undo them")
     except ActionFailure as e:
         _discard()
         status, reason = "failed", e.reason
@@ -89,10 +122,14 @@ def run_action(action_fn, *, tag_store, packdump, action_ref,
         _discard()
         status, reason = "failed", f"{type(e).__name__}: {e}"
 
+    # A failed step normally touches nothing, so it records nothing to undo. The exception
+    # is a commit that got partway: recording an empty rollback there would strand the
+    # changes that did land, with the snapshots that could restore them thrown away.
+    keep_rollback = status == "success" or partial
     rollback_data = (
         {"l2": l2.inverse, "files": files.snapshots if files is not None else {},
          "blueprints": blueprints.inverse if blueprints is not None else []}
-        if status == "success" else {"l2": [], "files": {}, "blueprints": []}
+        if keep_rollback else {"l2": [], "files": {}, "blueprints": []}
     )
     run_id = None
     if history is not None:

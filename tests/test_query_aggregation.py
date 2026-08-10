@@ -9,10 +9,13 @@ called "Cave Painting". Finding those is `GROUP BY localization HAVING count > 1
 is why grouping, not the condition joins the Power Ladder pointed at, turned out to be the
 short road to the duplicate-name finder.
 """
+import json
 import pytest
 
+from packsmith.core.query.serde import from_dict, to_dict
 from packsmith.core.query.ast import (
-    Attribute, Cmp, Collect, Count, CountDistinct, Id, Mod, Query, Registry, QueryError,
+    Attribute, Cmp, Collect, Count, CountDistinct, Id, Mod, Query, Registry, Tag,
+    QueryError,
 )
 from packsmith.core.query.evaluator import evaluate
 
@@ -168,3 +171,54 @@ def test_an_ungrouped_query_is_unaffected():
     assert [r.values["id"] for r in result.rows] == ["caverns:granite_bricks",
                                                      "minecraft:stone"]
     assert all(r.editable for r in result.rows)
+
+
+# --- serde (design 3.2.4: "queries round-trip through JSON with zero code") -------------
+
+def _round_trip(query):
+    return from_dict(json.loads(json.dumps(to_dict(query))))
+
+
+def test_an_aggregate_query_round_trips():
+    """It encoded fine and died on the way back in — at load time, in a later session."""
+    q = Query(scope=Registry("minecraft:item"),
+              select=[Attribute("localization"), Count,
+                      CountDistinct(Tag("mod")), Collect(Id, limit=5)],
+              group_by=[Attribute("localization")],
+              having=Cmp(Count, "gt", 1))
+    assert _round_trip(q) == q
+
+
+def test_count_decodes_to_the_singleton_not_a_copy():
+    """The evaluator compares aggregates by identity in places; a fresh _Count() would
+    still be equal, but keeping identity means neither style can break."""
+    assert _round_trip(Query(scope=Registry("r"), select=[Count])).select[0] is Count
+
+
+@pytest.mark.parametrize("node", [
+    Count,
+    CountDistinct(Id),
+    CountDistinct(Tag("mod")),
+    Collect(Id),
+    Collect(Attribute("localization"), limit=3),
+])
+def test_each_aggregate_node_round_trips(node):
+    q = Query(scope=Registry("minecraft:item"), select=[node], group_by=[Id])
+    assert _round_trip(q) == q
+
+
+def test_every_ast_node_round_trips():
+    """The guard for the *class* of bug, not this instance of it.
+
+    `_enc` encodes any dataclass; `_dec` used to consult a hand-written list. So a new node
+    was silently encodable-but-not-decodable until someone saved one and reopened the app.
+    This walks the AST module itself, so the next tier up the Power Ladder cannot repeat it.
+    """
+    import dataclasses
+    from packsmith.core.query import ast as ast_module
+    from packsmith.core.query.serde import _NODE_TYPES
+
+    declared = {name for name, obj in vars(ast_module).items()
+                if isinstance(obj, type) and dataclasses.is_dataclass(obj)}
+    missing = declared - set(_NODE_TYPES)
+    assert not missing, f"AST nodes the decoder cannot rebuild: {sorted(missing)}"

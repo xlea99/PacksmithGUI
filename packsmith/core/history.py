@@ -40,7 +40,7 @@ class StepRunStore:
         data is cleared with it, so the same step can't be rolled back twice."""
         self._db.execute(
             "UPDATE step_runs SET status = 'rolled_back', rollback_data = ? WHERE id = ?",
-            (json.dumps({"l2": [], "files": {}}), run_id))
+            (json.dumps({"l2": [], "files": {}, "blueprints": []}), run_id))
 
     def for_job_run(self, job_run_id: int) -> list[dict]:
         return [dict(r) for r in self._db.fetch_all(
@@ -83,11 +83,15 @@ class JobRunStore:
             "SELECT * FROM job_runs ORDER BY id DESC")]
 
 
-def rollback_step(run_id: int, *, tag_store, history, file_store=None):
-    """Reverse a committed step, restoring both engines to their pre-step state.
+def rollback_step(run_id: int, *, tag_store, history, file_store=None,
+                  blueprint_store=None):
+    """Reverse a committed step, restoring every engine to its pre-step state.
 
-    Requires a ``file_store`` if the step wrote any files. Raises KeyError for an
-    unknown run.
+    Requires a ``file_store`` if the step wrote any files, and a ``blueprint_store`` if it
+    touched blueprints — a step whose writes can't all be undone must refuse rather than
+    half-undo, or "rolled_back" becomes a lie about the state of the pack.
+
+    Raises KeyError for an unknown run.
     """
     run = history.get(run_id)
     if run is None:
@@ -109,3 +113,21 @@ def rollback_step(run_id: int, *, tag_store, history, file_store=None):
         raise ValueError("this step wrote files; rollback needs a file_store")
     for path, snap in file_snapshots.items():
         file_store.restore(path, snap["content"], snap["ownership"])
+
+    # Blueprints: same shape as L2, plus instances the step brought into existence.
+    blueprint_inverse = data.get("blueprints", [])
+    if blueprint_inverse and blueprint_store is None:
+        raise ValueError("this step wrote blueprints; rollback needs a blueprint_store")
+    # Bindings before instances, because an instance the step created has to be emptied
+    # before it can be removed — and the bindings that emptied it are in this same list.
+    for inv in [i for i in blueprint_inverse if i.get("kind") == "binding"]:
+        blueprint, instance, slot_path = inv["key"]
+        if inv["existed"]:
+            blueprint_store.bind(blueprint, instance, slot_path, inv["value"],
+                                 owner=inv["owner_kind"], action_ref=inv["owner_ref"])
+        else:
+            blueprint_store.unbind(blueprint, instance, slot_path)
+    for inv in [i for i in blueprint_inverse if i.get("kind") == "instance"]:
+        blueprint, instance = inv["key"]
+        if not inv["existed"]:
+            blueprint_store.delete_instance(blueprint, instance)

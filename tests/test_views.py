@@ -144,3 +144,32 @@ def test_rename_onto_existing_name_raises(views):
 def test_blank_name_raises(views):
     with pytest.raises(ValueError):
         views.create("   ", _simple_query())
+
+
+def test_one_unreadable_view_does_not_take_the_others_with_it(views):
+    """A saved query is data that outlives the code that wrote it — a row from a newer
+    PackSmith or a hand-edited profile is a real possibility. Losing every healthy view to
+    one broken row is a far worse failure than the broken row."""
+    import json
+    views.create("first", Query(scope=Registry("minecraft:item"), select=[Id]))
+    doomed = views.create("doomed", Query(scope=Registry("minecraft:item"), select=[Id]))
+    views.create("last", Query(scope=Registry("minecraft:block"), select=[Id]))
+
+    views._db.execute("UPDATE views SET query_json = ? WHERE id = ?",
+                      (json.dumps({"node": "FromTheFuture"}), doomed.id))
+    assert [v.name for v in views.all()] == ["first", "last"]
+    assert [(name, reason.split(":")[0]) for _id, name, reason in views.unreadable()] == [
+        ("doomed", "QueryError")]
+
+
+def test_an_aggregate_view_survives_a_save_and_reload(views):
+    """Q-1: this bricked the whole panel on next launch."""
+    from packsmith.core.query.ast import Attribute, Cmp, Count
+    query = Query(scope=Registry("minecraft:item"),
+                  select=[Attribute("localization"), Count],
+                  group_by=[Attribute("localization")],
+                  having=Cmp(Count, "gt", 1))
+    views.create("duplicate names", query)
+    reloaded = [v for v in views.all() if v.name == "duplicate names"][0]
+    assert reloaded.query == query
+    assert views.unreadable() == []

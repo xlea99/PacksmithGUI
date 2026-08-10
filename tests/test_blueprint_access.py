@@ -14,6 +14,7 @@ Three rules are under test, and they are the ones that keep the primitive honest
 """
 import pytest
 
+from packsmith.core.bindings import policy_key
 from packsmith.core.blueprints import BlueprintStore
 from packsmith.core.pack import ActionFailure, Pack
 from packsmith.core.runner import run_action
@@ -158,7 +159,7 @@ def test_overwrite_takes_the_slot_and_says_so(tags, blueprints):
         pack.blueprints.bind("StoneType", "granite", "base_block", "minecraft:andesite")
 
     result = run(action, tags, blueprints,
-                 conflict_policies={"StoneType": "overwrite"})
+                 conflict_policies={policy_key("blueprint", None, "StoneType"): "overwrite"})
     assert result.ok
     assert blueprints.value_of("StoneType", "granite", "base_block") == "minecraft:andesite"
     assert any("conflict policy: overwrite" in m for _lvl, m in result.log_lines)
@@ -171,7 +172,7 @@ def test_skip_leaves_it_alone(tags, blueprints):
     def action(pack):
         pack.blueprints.bind("StoneType", "granite", "base_block", "minecraft:andesite")
 
-    result = run(action, tags, blueprints, conflict_policies={"StoneType": "skip"})
+    result = run(action, tags, blueprints, conflict_policies={policy_key("blueprint", None, "StoneType"): "skip"})
     assert result.ok
     assert blueprints.value_of("StoneType", "granite", "base_block") == "minecraft:granite"
 
@@ -185,7 +186,7 @@ def test_fail_discards_the_whole_step(tags, blueprints):
                              "minecraft:polished_granite")
         pack.blueprints.bind("StoneType", "granite", "base_block", "minecraft:andesite")
 
-    result = run(action, tags, blueprints, conflict_policies={"StoneType": "fail"})
+    result = run(action, tags, blueprints, conflict_policies={policy_key("blueprint", None, "StoneType"): "fail"})
     assert not result.ok
     # the earlier, uncontested write went down with the step
     assert "polished.base" not in blueprints.bindings("StoneType", "granite")
@@ -391,7 +392,7 @@ def run(pack):
         filled["n"] = run_starlark(src, pack)
 
     result = run(action, tags, blueprints, mappings={"palette": "StoneType"},
-                 conflict_policies={"StoneType": "overwrite"})
+                 conflict_policies={policy_key("blueprint", None, "StoneType"): "overwrite"})
     assert result.ok, result.reason
     assert filled["n"] == 3          # polished_granite, its stairs, polished_andesite
     assert blueprints.value_of("StoneType", "granite", "polished.base") == \
@@ -447,3 +448,113 @@ def test_an_unknown_mapping_kind_is_rejected_at_load(tmp_path):
         '[actions.mappings.thing]\nkind = "vibes"\n', encoding="utf-8")
     with pytest.raises(ValueError, match="unknown kind 'vibes'"):
         load_package(root)
+
+
+# --- deleting is not writing (design 3.2.1, applied to bindings) -------------
+
+def test_an_action_may_unbind_what_it_owns(tags, blueprints):
+    pack = make_pack(tags, blueprints, policies={policy_key("blueprint", None, "StoneType"): "overwrite"})
+    pack.blueprints.bind("StoneType", "granite", "base_block", "minecraft:granite")
+    pack.blueprints._staging.commit()
+    pack.blueprints.unbind("StoneType", "granite", "base_block")
+    pack.blueprints._staging.commit()
+    assert blueprints.value_of("StoneType", "granite", "base_block") is None
+
+
+def test_an_action_cannot_unbind_what_the_user_owns(tags, blueprints):
+    """The binding analog of 3.2.1's "actions cannot fully delete an assignment". An
+    action that can erase a user's binding can destroy the record of a decision instead
+    of superseding it."""
+    blueprints.bind("StoneType", "granite", "base_block", "minecraft:granite",
+                    owner="user")
+    pack = make_pack(tags, blueprints)
+    with pytest.raises(ActionFailure, match="may not delete what it does not own"):
+        pack.blueprints.unbind("StoneType", "granite", "base_block")
+    assert blueprints.value_of("StoneType", "granite", "base_block") == "minecraft:granite"
+
+
+def test_overwrite_policy_does_not_license_an_unbind(tags, blueprints):
+    """`overwrite` says "I may take this slot", not "I may empty it". A gap is the OUTPUT
+    of this primitive (3.2.2), so manufacturing one is a real change of meaning, not a
+    lesser form of writing."""
+    blueprints.bind("StoneType", "granite", "base_block", "minecraft:granite",
+                    owner="user")
+    pack = make_pack(tags, blueprints, policies={policy_key("blueprint", None, "StoneType"): "overwrite"})
+
+    pack.blueprints.bind("StoneType", "granite", "base_block", "minecraft:andesite")
+    pack.blueprints._staging.commit()                      # taking it: allowed
+    assert blueprints.value_of("StoneType", "granite", "base_block") == "minecraft:andesite"
+
+    blueprints.bind("StoneType", "granite", "polished.base", "minecraft:polished_granite",
+                    owner="user")
+    with pytest.raises(ActionFailure, match="may not delete"):
+        pack.blueprints.unbind("StoneType", "granite", "polished.base")
+
+
+def test_an_action_cannot_unbind_another_actions_binding(tags, blueprints):
+    blueprints.bind("StoneType", "granite", "base_block", "minecraft:granite",
+                    owner="action", action_ref="other:thing")
+    pack = make_pack(tags, blueprints)
+    with pytest.raises(ActionFailure, match="'other:thing'"):
+        pack.blueprints.unbind("StoneType", "granite", "base_block")
+
+
+# --- rollback (design 3.3: "the user can roll back an individual step's writes") --------
+
+def test_rolling_back_undoes_bindings_and_the_instances_the_step_created(tags, blueprints):
+    """The records were always written; only the replay was missing, so a rolled-back step
+    left its blueprint half committed while claiming to be reversed."""
+    from packsmith.core.history import StepRunStore, rollback_step
+    history = StepRunStore(tags._db)
+    blueprints.bind("StoneType", "granite", "base_block", "minecraft:granite",
+                    owner="user")
+
+    def action(pack):
+        pack.blueprints.create("StoneType", "andesite")
+        pack.blueprints.bind("StoneType", "andesite", "base_block", "minecraft:andesite")
+        pack.blueprints.bind("StoneType", "granite", "polished.base",
+                             "minecraft:polished_granite")
+
+    result = run(action, tags, blueprints, history=history,
+                 conflict_policies={policy_key("blueprint", None, "StoneType"): "overwrite"})
+    assert result.ok
+    assert "andesite" in [i.name for i in blueprints.instances("StoneType")]
+    assert blueprints.value_of("StoneType", "granite", "polished.base") is not None
+
+    rollback_step(result.run_id, tag_store=tags, history=history,
+                  blueprint_store=blueprints)
+    assert "andesite" not in [i.name for i in blueprints.instances("StoneType")]
+    assert blueprints.value_of("StoneType", "granite", "polished.base") is None
+    # ...and what the user owned before the step is exactly as it was
+    binding = blueprints.bindings("StoneType", "granite")["base_block"]
+    assert (binding.value, binding.owner) == ("minecraft:granite", "user")
+
+
+def test_rollback_restores_a_binding_the_step_overwrote(tags, blueprints):
+    from packsmith.core.history import StepRunStore, rollback_step
+    history = StepRunStore(tags._db)
+    blueprints.bind("StoneType", "granite", "base_block", "minecraft:granite",
+                    owner="user")
+
+    result = run(lambda pack: pack.blueprints.bind(
+        "StoneType", "granite", "base_block", "minecraft:andesite"),
+        tags, blueprints, history=history,
+        conflict_policies={policy_key("blueprint", None, "StoneType"): "overwrite"})
+    assert blueprints.value_of("StoneType", "granite", "base_block") == "minecraft:andesite"
+
+    rollback_step(result.run_id, tag_store=tags, history=history,
+                  blueprint_store=blueprints)
+    binding = blueprints.bindings("StoneType", "granite")["base_block"]
+    assert (binding.value, binding.owner) == ("minecraft:granite", "user")
+
+
+def test_rollback_refuses_rather_than_half_undoing(tags, blueprints):
+    """Without a blueprint store the tag half would land and the blueprint half wouldn't,
+    and the step would still be marked rolled_back."""
+    from packsmith.core.history import StepRunStore, rollback_step
+    history = StepRunStore(tags._db)
+    result = run(lambda pack: pack.blueprints.bind(
+        "StoneType", "granite", "base_block", "minecraft:granite"),
+        tags, blueprints, history=history)
+    with pytest.raises(ValueError, match="needs a blueprint_store"):
+        rollback_step(result.run_id, tag_store=tags, history=history)

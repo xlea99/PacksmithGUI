@@ -42,10 +42,27 @@ class ViewStore:
     # --- reads -------------------------------------------------------------
 
     def all(self) -> list[View]:
-        """Every saved view, in display order."""
-        rows = self._db.fetch_all(
-            "SELECT * FROM views ORDER BY position, id")
-        return [self._row_to_view(r) for r in rows]
+        """Every saved view that can be loaded, in display order.
+
+        One unreadable row must not take the panel with it. A view is a saved query, and a
+        query is data that outlives the code that wrote it — a row from a newer PackSmith,
+        a hand-edited profile, or a node the decoder doesn't know yet is a real possibility,
+        and losing access to nine healthy views because the tenth is broken is a far worse
+        failure than the broken one. Casualties are reported via :meth:`unreadable`.
+        """
+        rows = self._db.fetch_all("SELECT * FROM views ORDER BY position, id")
+        loaded, broken = [], []
+        for row in rows:
+            try:
+                loaded.append(self._row_to_view(row))
+            except Exception as e:
+                broken.append((row["id"], row["name"], f"{type(e).__name__}: {e}"))
+        self._unreadable = broken
+        return loaded
+
+    def unreadable(self) -> list:
+        """``[(id, name, reason)]`` for rows the last :meth:`all` could not decode."""
+        return list(getattr(self, "_unreadable", []))
 
     def get(self, view_id: int) -> View | None:
         row = self._db.fetch_one("SELECT * FROM views WHERE id = ?", (view_id,))

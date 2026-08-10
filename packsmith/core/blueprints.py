@@ -182,6 +182,28 @@ class BlueprintStore:
         return [row["name"] for row in
                 self._db.fetch_all("SELECT name FROM blueprints ORDER BY name")]
 
+    def id_of(self, name: str) -> int:
+        """The surrogate id a job-step binding stores (design 3.2.1's identity table)."""
+        return self._require_blueprint(name)["id"]
+
+    def name_of(self, blueprint_id: int) -> str | None:
+        """The current name of a blueprint id, or None if it's been deleted."""
+        row = self._db.fetch_one("SELECT name FROM blueprints WHERE id = ?",
+                                 (blueprint_id,))
+        return row["name"] if row else None
+
+    def instance_by_id(self, instance_id: int) -> "Instance | None":
+        """The instance an id points at, with its blueprint's *current* name."""
+        row = self._db.fetch_one(
+            """SELECT i.id AS id, i.name AS name, i.created_by AS created_by,
+                      b.name AS blueprint
+               FROM blueprint_instances i JOIN blueprints b ON b.id = i.blueprint_id
+               WHERE i.id = ?""", (instance_id,))
+        if row is None:
+            return None
+        return Instance(id=row["id"], blueprint=row["blueprint"], name=row["name"],
+                        created_by=row["created_by"])
+
     def get(self, name: str) -> "Blueprint":
         row = self._require_blueprint(name)
         return Blueprint(id=row["id"], name=row["name"], description=row["description"],

@@ -10,6 +10,7 @@ MVP scope: whole-file ownership only. Per-key ownership, comment-preserving
 round-trip parsers, and the content-addressed blob store are all deferred. Reads and
 writes are plain UTF-8 text within the instance root; paths are stored relative to it.
 """
+import os
 from pathlib import Path
 
 
@@ -35,6 +36,34 @@ class FileStore:
         self._db = db
         self._root = Path(instance_root).resolve()
 
+    @staticmethod
+    def key(rel_path: str) -> str:
+        """The canonical identity of a path — **one disk file, one key**.
+
+        Ownership used to be keyed on whatever string the writer happened to pass, so
+        ``config/foo.json``, ``config\\foo.json`` and (on Windows) ``Config/foo.json`` were
+        three rows for one file. §6.1's hard-block is an exact lookup, so that isn't a
+        cosmetic split: a user claim under one spelling silently failed to block an action
+        writing another, and rollback snapshots fragmented across the same keys.
+
+        ``normcase`` is doing the platform-sensitive half deliberately: it lowercases on
+        Windows, where the filesystem genuinely treats those as one file, and is the
+        identity function on POSIX, where they are genuinely two. Case-folding
+        unconditionally would merge distinct files on Linux.
+        """
+        text = str(rel_path).replace("\\", "/").strip("/")
+        # Collapse "." and ".." without touching the disk, so the key of a path that
+        # doesn't exist yet is still stable.
+        parts = []
+        for part in text.split("/"):
+            if part in ("", "."):
+                continue
+            if part == ".." and parts and parts[-1] != "..":
+                parts.pop()
+                continue
+            parts.append(part)
+        return os.path.normcase("/".join(parts))
+
     def _abs(self, rel_path: str) -> Path:
         p = (self._root / rel_path).resolve()
         if p != self._root and not p.is_relative_to(self._root):
@@ -53,7 +82,7 @@ class FileStore:
     def ownership(self, rel_path: str):
         row = self._db.fetch_one(
             "SELECT owner_kind, owner_action_ref FROM file_ownership WHERE path = ?",
-            (rel_path,),
+            (self.key(rel_path),),
         )
         if not row:
             return None  # untouched — no ownership record
@@ -90,13 +119,14 @@ class FileStore:
                    ON CONFLICT(path) DO UPDATE SET
                        owner_kind = excluded.owner_kind,
                        owner_action_ref = excluded.owner_action_ref""",
-            (rel_path, owner, owner_action_ref),
+            (self.key(rel_path), owner, owner_action_ref),
         )
 
     def release(self, rel_path: str):
         """Drop the ownership record, returning the file to **untouched** — anyone may
         claim it again. The file on disk is untouched; only the claim goes away."""
-        self._db.execute("DELETE FROM file_ownership WHERE path = ?", (rel_path,))
+        self._db.execute("DELETE FROM file_ownership WHERE path = ?",
+                         (self.key(rel_path),))
 
     # --- write (called at commit; captures prior bytes for store-by-path rollback) ---
 
@@ -119,7 +149,7 @@ class FileStore:
                    ON CONFLICT(path) DO UPDATE SET
                        owner_kind = excluded.owner_kind,
                        owner_action_ref = excluded.owner_action_ref""",
-            (rel_path, owner, owner_action_ref),
+            (self.key(rel_path), owner, owner_action_ref),
         )
         return prior
 
@@ -128,7 +158,8 @@ class FileStore:
         p = self._abs(rel_path)
         if p.is_file():
             p.unlink()
-        self._db.execute("DELETE FROM file_ownership WHERE path = ?", (rel_path,))
+        self._db.execute("DELETE FROM file_ownership WHERE path = ?",
+                         (self.key(rel_path),))
 
     def restore(self, rel_path: str, prior_content, prior_ownership):
         """Return a file to a prior state (for rollback). A None prior_content means
@@ -147,10 +178,12 @@ class FileStore:
                        ON CONFLICT(path) DO UPDATE SET
                            owner_kind = excluded.owner_kind,
                            owner_action_ref = excluded.owner_action_ref""",
-                (rel_path, prior_ownership["kind"], prior_ownership["action_ref"]),
+                (self.key(rel_path), prior_ownership["kind"],
+                 prior_ownership["action_ref"]),
             )
         else:
-            self._db.execute("DELETE FROM file_ownership WHERE path = ?", (rel_path,))
+            self._db.execute("DELETE FROM file_ownership WHERE path = ?",
+                         (self.key(rel_path),))
 
 
 class FileStaging:
@@ -200,6 +233,16 @@ class FileStaging:
         return bool(self._pending)
 
     def commit(self):
+        # Pre-flight every existence requirement BEFORE writing a byte. Files are the one
+        # engine with no transaction to roll back, so the only real protection is to fail
+        # before touching anything — and `file_must_exist` checked inside the loop meant
+        # the third file failing left the first two written and stamped.
+        missing = [rel for rel, staged in self._pending.items()
+                   if staged["file_must_exist"] and not self._store.exists(rel)]
+        if missing:
+            raise FileNotFoundError(
+                "Expected file(s) to exist: " + ", ".join(sorted(missing)))
+
         for rel_path, staged in self._pending.items():
             prior_owner = self._store.ownership(rel_path)          # capture before overwrite
             prior_content = self._store.write(

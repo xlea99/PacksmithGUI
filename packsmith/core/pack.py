@@ -11,6 +11,8 @@ point as its single argument.
 """
 import json
 
+from packsmith.core.bindings import policy_key
+
 try:
     import json5 as _json5
 
@@ -54,6 +56,32 @@ class _Registry:
 
     def attribute(self, registry_type, entry_id, name):
         return self._dump.attribute(registry_type, entry_id, name)
+
+
+def _refuse_foreign_delete(current, action_ref, *, cell):
+    """Deletes are not writes, and conflict policy does not cover them (design 3.2.1).
+
+    "**Delete assignment** — fully remove an assignment row, returning the (entry, tag)
+    pair to the pristine state. **User-only; actions cannot fully delete an assignment,
+    only write over it** (which transfers ownership rather than clearing it)."
+
+    So this is deliberately *stricter* than ``_may_write``: a declared `overwrite` policy
+    licenses **taking** a cell, never **erasing** it. Pristine — "nobody has ever had an
+    opinion about this" — is a state only the user can produce, and an action that could
+    manufacture it could quietly destroy the record of a decision rather than supersede it.
+
+    An action clearing something **it owns itself** is allowed, and is the one case that
+    isn't covered by the rule above: it's the same "re-asserting is not a conflict"
+    reasoning `_may_write` uses, applied to an action retracting its own output.
+    """
+    if current is None:
+        return                                            # already pristine; nothing to do
+    if current["kind"] == "action" and current["action_ref"] == action_ref:
+        return                                            # ours to retract
+    who = "the user" if current["kind"] == "user" else f"'{current['action_ref']}'"
+    raise ActionFailure(
+        f"{cell} is owned by {who}, and an action may not delete what it does not own — "
+        f"only write over it. Write a new value instead, or leave it alone.")
 
 
 class _Tags:
@@ -104,7 +132,7 @@ class _Tags:
 
         who = "the user" if current["kind"] == "user" else f"'{current['action_ref']}'"
         cell = f"{tag_name} on {entry_id}"
-        policy = self._policies.get(tag_name)
+        policy = self._policies.get(policy_key("tag", registry_type, tag_name))
 
         if policy == "overwrite":
             self._log("info", f"took {cell} from {who} (conflict policy: overwrite)")
@@ -126,6 +154,9 @@ class _Tags:
             f"'{tag_name}'. Declare one on the mapping that binds it.")
 
     def clear(self, registry_type, entry_id, tag_name):
+        _refuse_foreign_delete(
+            self._staging.read_ownership(registry_type, entry_id, tag_name),
+            self._action_ref, cell=f"{tag_name} on {entry_id}")
         self._staging.delete(registry_type, entry_id, tag_name)
 
 
@@ -235,6 +266,9 @@ class _Blueprints:
 
     def unbind(self, blueprint, instance, slot_path):
         self._require_healthy(blueprint)
+        _refuse_foreign_delete(
+            self._staging.read_ownership(blueprint, instance, slot_path),
+            self._action_ref, cell=f"{blueprint}:{instance}.{slot_path}")
         self._staging.delete(blueprint, instance, slot_path)
 
     def _may_write(self, blueprint, instance, slot_path) -> bool:
@@ -248,7 +282,7 @@ class _Blueprints:
 
         who = "the user" if current["kind"] == "user" else f"'{current['action_ref']}'"
         cell = f"{blueprint}:{instance}.{slot_path}"
-        policy = self._policies.get(blueprint)
+        policy = self._policies.get(policy_key("blueprint", None, blueprint))
 
         if policy == "overwrite":
             self._log("info", f"took {cell} from {who} (conflict policy: overwrite)")

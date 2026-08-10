@@ -69,13 +69,14 @@ class JobResultsView(_SummaryView):
     rolled_back = Signal()
 
     def __init__(self, history, job_history=None, tag_store=None, file_store=None,
-                 parent=None):
+                 parent=None, blueprint_store=None):
         super().__init__(["Run", "Status", "Changes", "Finished"],
                          "No runs yet.", parent)
         self._history = history
         self._job_history = job_history
         self._tags = tag_store
         self._files = file_store
+        self._blueprints = blueprint_store
         self._tree.setRootIsDecorated(True)
         self._tree.setContextMenuPolicy(Qt.CustomContextMenu)
         self._tree.customContextMenuRequested.connect(self._on_context_menu)
@@ -109,13 +110,13 @@ class JobResultsView(_SummaryView):
         if QMessageBox.question(
                 self, "Roll back step",
                 f"Reverse '{step.get('action_ref')}'?\n\n"
-                f"Its Layer 2 writes are undone and any files it changed are restored to "
-                f"their previous contents.{warning}",
+                f"Its tag and blueprint writes are undone, and any files it changed are "
+                f"restored to their previous contents.{warning}",
                 QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
             return
         try:
             rollback_step(step["id"], tag_store=self._tags, history=self._history,
-                          file_store=self._files)
+                          file_store=self._files, blueprint_store=self._blueprints)
         except Exception as e:
             QMessageBox.warning(self, "Rollback failed", f"{type(e).__name__}: {e}")
             return
@@ -523,8 +524,11 @@ def _describe_changes(rollback_json) -> str:
     parts = []
     cells = len(data.get("l2", []) or [])
     files = len(data.get("files", {}) or {})
+    bindings = len(data.get("blueprints", []) or [])
     if cells:
         parts.append(f"{cells} tag cell{'s' if cells != 1 else ''}")
+    if bindings:
+        parts.append(f"{bindings} blueprint write{'s' if bindings != 1 else ''}")
     if files:
         parts.append(f"{files} file{'s' if files != 1 else ''}")
     return ", ".join(parts) if parts else "no changes"

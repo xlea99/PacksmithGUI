@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
     QAbstractItemView, QComboBox,
 )
 
+from packsmith.core.files import FileStore
 from packsmith.gui.shell import style
 from packsmith.gui.shell.tree import PanelTree
 from packsmith.gui.shell.panels.base import Panel
@@ -52,9 +53,9 @@ _ROLE_LOADED = Qt.UserRole + 2
 
 
 def _norm(path: str) -> str:
-    """Ownership records are keyed by whatever string the writer used; compare on a
-    single normalized form so `config/x.json5` and `config\\x.json5` are one file."""
-    return str(path).replace("\\", "/")
+    """The store's own canonical key — one definition, so the browser can never disagree
+    with the hard-block about which record belongs to which file."""
+    return FileStore.key(path)
 
 
 class FilesPanel(Panel):

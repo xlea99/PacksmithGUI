@@ -1,6 +1,8 @@
 """Run history + rollback: record a step, then reverse it — both engines (design 3.3)."""
 import pytest
 
+from packsmith.core.bindings import policy_key
+
 from packsmith.core.files import FileStore
 from packsmith.core.history import StepRunStore, rollback_step
 from packsmith.core.runner import run_action
@@ -76,7 +78,7 @@ def test_rollback_restores_prior_value_and_owner(env, history):
     tags.assign(REG, "quark:rope", "queued", False, owner="user")    # prior: user-owned False
     # Taking a user-owned cell requires the action to have declared `overwrite` (design 3.3).
     result = run_action(_mark, tag_store=tags, packdump=dump, action_ref="demo:mark",
-                        history=history, conflict_policies={"queued": "overwrite"})
+                        history=history, conflict_policies={policy_key("tag", "minecraft:item", "queued"): "overwrite"})
     assert tags.get_tag(REG, "quark:rope", "queued") is True         # action took it over
     assert tags.get_ownership(REG, "quark:rope", "queued")["kind"] == "action"
 

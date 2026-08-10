@@ -44,6 +44,55 @@ def parse_instance_ref(ref, blueprint_store):
     return None
 
 
+# === WHAT A STORED BINDING POINTS AT (design 3.2.1's identity table) =========
+#
+# "Job step bindings (mappings) -> **id**. Internal, per-profile. Stable across renames."
+# So a binding stores the artifact's surrogate id, and the **type is the discriminator**:
+# an int is an id, a str is a legacy name written before this rule was enforced. No schema
+# change, no wrapper object, and legacy rows keep resolving until something rewrites them.
+#
+# `registry_entry` is the deliberate exception: an entry id IS Layer 1 identity and cannot
+# be renamed, so it stays the string it always was.
+#
+# NOTE saved View queries stay NAME-based on purpose (same table, opposite ruling — views
+# are portable and an id means nothing in another profile). Do not "fix" them to match.
+
+
+def binding_id(slot, artifact_name, *, tag_store=None, blueprint_store=None):
+    """The value to STORE for a chosen artifact — its id, or the string for L1 entries."""
+    if slot.kind == "registry_entry":
+        return artifact_name
+    if slot.kind == "tag":
+        definition = tag_store.definition(slot.registry_type, artifact_name)
+        return definition["id"] if definition else None
+    if slot.kind == "blueprint":
+        return blueprint_store.id_of(artifact_name)
+    resolved = parse_instance_ref(artifact_name, blueprint_store)
+    if resolved is None:
+        return None
+    blueprint, instance = resolved
+    return blueprint_store.instance(blueprint, instance).id
+
+
+def binding_name(slot, bound, *, tag_store=None, blueprint_store=None):
+    """What a stored binding is *called* right now — for display, matching and validation.
+
+    Returns None when the id points at something that no longer exists, which is a real
+    state the UI has to show rather than crash on.
+    """
+    if bound is None or slot.kind == "registry_entry":
+        return bound
+    if isinstance(bound, str):
+        return bound                       # legacy name, written before ids
+    if slot.kind == "tag":
+        definition = tag_store.definition_by_id(bound) if tag_store else None
+        return definition["name"] if definition else None
+    if slot.kind == "blueprint":
+        return blueprint_store.name_of(bound) if blueprint_store else None
+    instance = blueprint_store.instance_by_id(bound) if blueprint_store else None
+    return instance.ref if instance else None
+
+
 def validate_binding(slot, tag_definition):
     """Raise ValueError if ``tag_definition`` doesn't satisfy ``slot``'s contract.
     ``tag_definition`` is what ``TagStore.definition(name)`` returns (or None)."""
@@ -164,7 +213,16 @@ def resolve_step(manifest, *, bindings: dict, config: dict, tag_store,
                 f"mapping '{name}' takes one artifact but {len(chosen)} are bound")
 
         values = []
-        for item in chosen:
+        for stored in chosen:
+            # An id is only an identity while the thing still exists. A dead id is loud
+            # here rather than silently resolving to whatever now holds that name — which
+            # is the whole reason 3.2.1 puts ids on bindings.
+            item = binding_name(slot, stored, tag_store=tag_store,
+                                blueprint_store=blueprint_store)
+            if item is None:
+                raise ValueError(
+                    f"mapping '{name}' points at something that no longer exists "
+                    f"(id {stored!r}) — re-bind this step")
             if slot.kind in ("blueprint", "blueprint_instance"):
                 if blueprint_store is None:
                     raise ValueError(
@@ -218,22 +276,50 @@ def _instance_value(slot, bound, blueprint_store):
     return {"blueprint": blueprint, "instance": instance, "ref": bound}
 
 
-def conflict_policies_for(manifest, mappings: dict) -> dict:
-    """Map each bound tag name to the conflict policy its slot declared (design 3.3).
+def policy_key(kind: str, scope, name) -> tuple:
+    """The identity a conflict policy is stored and looked up under.
 
-    The runtime enforces policy per *tag*, because that's what an action names when it
+    A bare name is not an identity (design 3.2.1: tag definitions are registry-scoped, and
+    names are labels). Keyed by name alone, three different artifacts collided into one
+    policy: the same tag name on ``minecraft:item`` and ``minecraft:block``, and — worse
+    across the namespace boundary — a tag called ``palette`` and a *blueprint* called
+    ``palette``, which share nothing but a string yet shared a rule about who may overwrite
+    whom.
+    """
+    return (kind, scope, name)
+
+
+def conflict_policies_for(manifest, mappings: dict) -> dict:
+    """Map each bound artifact to the conflict policy its slot declared (design 3.3).
+
+    The runtime enforces policy per *artifact*, because that's what an action names when it
     writes (``pack.tags.write(..., tag_name, ...)``), while the declaration lives on the
     *slot*. This is the translation between the two.
+
+    Two slots binding the same artifact with **different** policies is refused rather than
+    resolved: 3.3 makes the declaration mandatory precisely so the choice is never implicit,
+    and letting whichever mapping iterated last win would be the silent default the rule
+    exists to forbid.
     """
     policies = {}
     for name, slot in manifest.mappings.items():
         if not slot.conflict_policy:
             continue
         for bound in _as_list(mappings.get(name)):
-            # An instance mapping resolves to {blueprint, instance, ref}, but the blueprint
-            # runtime keys policy by BLUEPRINT — that's the granularity `_may_write` asks
-            # at. Binding two instances of one schema is still one policy.
-            key = bound["blueprint"] if isinstance(bound, dict) else bound
+            if slot.kind in ("blueprint", "blueprint_instance"):
+                # An instance mapping resolves to {blueprint, instance, ref}, but the
+                # blueprint runtime asks per BLUEPRINT — binding two instances of one
+                # schema is still one policy.
+                artifact = bound["blueprint"] if isinstance(bound, dict) else bound
+                key = policy_key("blueprint", None, artifact)
+            else:
+                key = policy_key("tag", slot.registry_type, bound)
+            existing = policies.get(key)
+            if existing is not None and existing != slot.conflict_policy:
+                raise ValueError(
+                    f"mappings '{name}' and another both bind {key[2]!r} but declare "
+                    f"different conflict policies ('{slot.conflict_policy}' vs "
+                    f"'{existing}') — one artifact cannot have two rules")
             policies[key] = slot.conflict_policy
     return policies
 
@@ -254,13 +340,18 @@ def best_guess_bindings(manifest, tag_store, blueprint_store=None, packdump=None
                 fitting = instances_fitting(slot, blueprint_store)
             else:
                 fitting = blueprints_fitting(slot, blueprint_store)
+            def _id(chosen):
+                return binding_id(slot, chosen, tag_store=tag_store,
+                                  blueprint_store=blueprint_store)
+
             if slot.cardinality == "many":
                 # "zero or more" — the useful default for a bulk action is everything that
                 # qualifies, which the user then narrows.
-                suggestions[name] = fitting
+                suggestions[name] = [_id(f) for f in fitting]
             else:
-                suggestions[name] = (slot.likely_name if slot.likely_name in fitting
-                                     else (fitting[0] if fitting else None))
+                pick = (slot.likely_name if slot.likely_name in fitting
+                        else (fitting[0] if fitting else None))
+                suggestions[name] = _id(pick) if pick is not None else None
             continue
         if slot.kind == "registry_entry":
             # `likely_name` is the author's hint at an id. Offered only if the pack
@@ -281,7 +372,8 @@ def best_guess_bindings(manifest, tag_store, blueprint_store=None, packdump=None
                 if _type_ok(slot, definition):
                     pick = tag_name
                     break
-        suggestions[name] = pick
+        suggestions[name] = (binding_id(slot, pick, tag_store=tag_store)
+                             if pick is not None else None)
     return suggestions
 
 

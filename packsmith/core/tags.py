@@ -15,6 +15,23 @@ from packsmith.core.db import UserDB
 
 
 @dataclass(frozen=True)
+class Assignment:
+    """A row that actually exists in ``tag_assignments`` — value *and* who owns it.
+
+    The counterpart to ``get_tag``, which deliberately sugars a pristine cell into the tag's
+    default. That sugar is right for display and wrong for anything that has to *restore* a
+    cell later: "explicitly False" and "pristine, defaulting to False" read identically
+    through it, so a caller that captures a pristine cell and writes the value back has
+    silently invented a user-owned assignment (design 3.2.1: "the default is NOT written to
+    the database"). Anything undoing, diffing, or asking "was a decision made here?" wants
+    this instead.
+    """
+    value: object
+    owner: str                   # "user" | "action"
+    action_ref: str | None
+
+
+@dataclass(frozen=True)
 class Orphan:
     """An assignment pointing at something that no longer exists (design 3.2.1).
 
@@ -217,6 +234,26 @@ class TagStore:
         # Pristine cell — fall back to the tag's default (or None).
         return self.default_for(registry_type, tag_name)
 
+    def assignment(self, registry_type: str, entry_id: str,
+                   tag_name: str) -> "Assignment | None":
+        """The stored assignment, or **None when the cell is pristine**.
+
+        One query for value + ownership, because every caller that cares about existence
+        also cares about who owned it — restoring a value without its owner turns an
+        action's cell into the user's.
+        """
+        tag_id = self._tag_id(registry_type, tag_name, required=False)
+        row = self._db.fetch_one(
+            "SELECT value, owner_kind, owner_action_ref FROM tag_assignments "
+            "WHERE tag_id = ? AND entry_id = ?",
+            (tag_id, entry_id)
+        )
+        if not row:
+            return None
+        return Assignment(
+            value=self._cast_tag_value(registry_type, tag_name, row["value"]),
+            owner=row["owner_kind"], action_ref=row["owner_action_ref"])
+
     # Gets ALL tag assignments for a single entry.
     def get_all_tags(self, registry_type: str, entry_id: str) -> dict:
         rows = self._db.fetch_all(
@@ -273,6 +310,19 @@ class TagStore:
     # Gets a single tag definition on a registry, or None if it doesn't exist.
     def definition(self, registry_type: str, name: str) -> dict | None:
         return self._cached_definitions.get(registry_type, {}).get(name)
+
+    def definition_by_id(self, tag_id: int) -> dict | None:
+        """The definition a stored **id** points at, or None if it's been undefined.
+
+        Design 3.2.1: "a tag definition's identity is a surrogate id, not its name", and
+        job step bindings reference the id. This is how a binding gets back to a tag it
+        will keep pointing at across renames. A cache scan, not a query.
+        """
+        for by_name in self._cached_definitions.values():
+            for definition in by_name.values():
+                if definition["id"] == tag_id:
+                    return definition
+        return None
 
     # Resolves (registry, name) -> the definition's id, the thing rows actually reference.
     # A cache hit, not a query. With required=False an unknown tag yields the _NO_SUCH_TAG

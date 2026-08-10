@@ -3,24 +3,45 @@ from dataclasses import dataclass, field
 
 @dataclass
 class TagEditCommand:
-    """A single tag edit that can be done and undone."""
+    """A single tag edit that can be done and undone.
+
+    ``prior`` is the cell's whole previous **state** — a ``tags.Assignment`` or None for
+    pristine — not just its previous value. Two reasons, both learned the hard way:
+
+    * A pristine cell on a defaulted tag reads back as the default through ``get_tag``, so
+      an undo that re-assigns "the old value" *creates* a user-owned row where the user had
+      never decided anything (design 3.2.1: "the default is NOT written to the database").
+      Only existence distinguishes them, and only ``prior is None`` records it.
+    * Ownership is part of assignment state. Undoing an edit to an **action-owned** cell has
+      to give it back to that action, `action_ref` and all; restoring the value alone
+      quietly launders it into a user decision and changes what conflict policy will do on
+      the next run.
+
+    This mirrors what ``L2Staging.inverse`` already captures for action rollback — the
+    runner had it right; the edit stack didn't.
+    """
     registry_type: str
     entry_id: str
     tag_name: str
-    old_value: object  # None means "was unset"
+    prior: object      # tags.Assignment, or None when the cell was pristine
     new_value: object  # None means "unset it"
 
     def apply(self, tag_store):
         if self.new_value is None:
             tag_store.unassign(self.registry_type, self.entry_id, self.tag_name)
         else:
-            tag_store.assign(self.registry_type, self.entry_id, self.tag_name, self.new_value)
+            # A GUI edit is the user speaking, so it lands user-owned — taking the cell from
+            # an action if one held it, which is the "loud transfer" 3.2.1 describes.
+            tag_store.assign(self.registry_type, self.entry_id, self.tag_name,
+                             self.new_value, owner="user")
 
     def undo(self, tag_store):
-        if self.old_value is None:
+        if self.prior is None:
             tag_store.unassign(self.registry_type, self.entry_id, self.tag_name)
         else:
-            tag_store.assign(self.registry_type, self.entry_id, self.tag_name, self.old_value)
+            tag_store.assign(self.registry_type, self.entry_id, self.tag_name,
+                             self.prior.value, owner=self.prior.owner,
+                             owner_action_ref=self.prior.action_ref)
 
 
 @dataclass
@@ -36,21 +57,36 @@ class BatchEditCommand:
         self._apply_bulk(tag_store, forward=False)
 
     def _apply_bulk(self, tag_store, forward: bool):
-        """Group edits by (registry_type, tag_name, value) and issue bulk assign/unassign calls."""
-        assigns = {}   # (registry_type, tag_name, value) -> [entry_id, ...]
+        """Bulk assign/unassign, grouped by everything that has to match.
+
+        Undo groups by **owner too**, not just value: a selection can span cells the user
+        owned and cells an action owned, and collapsing those into one `assign` would hand
+        the whole batch to whichever owner happened to sort first.
+        """
+        assigns = {}   # (registry_type, tag_name, value, owner, action_ref) -> [entry_id]
         unassigns = {}  # (registry_type, tag_name) -> [entry_id, ...]
 
         for edit in self.edits:
-            value = edit.new_value if forward else edit.old_value
-            if value is None:
-                key = (edit.registry_type, edit.tag_name)
-                unassigns.setdefault(key, []).append(edit.entry_id)
+            if forward:
+                value, owner, action_ref = edit.new_value, "user", None
+            elif edit.prior is None:
+                unassigns.setdefault((edit.registry_type, edit.tag_name), []).append(
+                    edit.entry_id)
+                continue
             else:
-                key = (edit.registry_type, edit.tag_name, value)
+                value = edit.prior.value
+                owner, action_ref = edit.prior.owner, edit.prior.action_ref
+
+            if value is None:
+                unassigns.setdefault((edit.registry_type, edit.tag_name), []).append(
+                    edit.entry_id)
+            else:
+                key = (edit.registry_type, edit.tag_name, value, owner, action_ref)
                 assigns.setdefault(key, []).append(edit.entry_id)
 
-        for (reg, tag, val), ids in assigns.items():
-            tag_store.assign(reg, ids, tag, val)
+        for (reg, tag, val, owner, action_ref), ids in assigns.items():
+            tag_store.assign(reg, ids, tag, val, owner=owner,
+                             owner_action_ref=action_ref)
         for (reg, tag), ids in unassigns.items():
             tag_store.unassign(reg, ids, tag)
 

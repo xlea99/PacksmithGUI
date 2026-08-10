@@ -89,20 +89,20 @@ def test_best_guess_prefers_likely_name(tags):
     tags.define(REG, "banned", "bool")
     tags.define(REG, "remove", "bool")
     m = _manifest(mappings={"source": MappingSlot("source", tag_type="bool", registry_type=REG, likely_name="remove")})
-    assert best_guess_bindings(m, tags)["source"] == "remove"
+    assert best_guess_bindings(m, tags)["source"] == tags.definition(REG, "remove")["id"]
 
 
 def test_best_guess_falls_back_to_type_match(tags):
     tags.define(REG, "banned", "bool")                         # no `remove` tag exists
     m = _manifest(mappings={"source": MappingSlot("source", tag_type="bool", registry_type=REG, likely_name="remove")})
-    assert best_guess_bindings(m, tags)["source"] == "banned"
+    assert best_guess_bindings(m, tags)["source"] == tags.definition(REG, "banned")["id"]
 
 
 def test_best_guess_likely_name_wrong_type_is_skipped(tags):
     tags.define(REG, "remove", "string")                      # likely_name exists but wrong type
     tags.define(REG, "banned", "bool")
     m = _manifest(mappings={"source": MappingSlot("source", tag_type="bool", registry_type=REG, likely_name="remove")})
-    assert best_guess_bindings(m, tags)["source"] == "banned"  # falls back to the bool tag
+    assert best_guess_bindings(m, tags)["source"] == tags.definition(REG, "banned")["id"]  # falls back to the bool tag
 
 
 def test_best_guess_none_when_nothing_compatible(tags):

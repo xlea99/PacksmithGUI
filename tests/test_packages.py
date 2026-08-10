@@ -114,7 +114,10 @@ def test_full_chain_manifest_to_bindings_to_run(package_root, tags):
 
     # best-guess fills `source` from the `remove` tag (its likely_name); user picks target
     guesses = best_guess_bindings(manifest, tags)
-    assert guesses["source"] == "remove"
+    # A binding stores the tag's ID (design 3.2.1) — stable across renames.
+    assert guesses["source"] == tags.definition("minecraft:item", "remove")["id"]
+    # ...and a legacy name-binding still resolves alongside it, which is what lets existing
+    # job rows keep working without a migration.
     bindings = {**guesses, "target": "queued"}
 
     mappings, config = resolve_step(manifest, bindings=bindings, config={}, tag_store=tags)

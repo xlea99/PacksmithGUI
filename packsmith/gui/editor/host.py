@@ -359,3 +359,45 @@ class EditorTab(QWidget):
     @property
     def is_dirty(self) -> bool:
         return "unsaved" in self._status.text()
+
+
+class UnsupportedFileTab(QWidget):
+    """The "cannot display" placeholder design 6.0 asks for.
+
+    Deliberately not an error dialog: opening a jar isn't a mistake, it's a reasonable
+    thing to try in a folder full of jars. So this says what the file *is*, which editor
+    would own it, and offers the one thing that always works — open it in whatever the OS
+    uses. A dead end that names the road out isn't a dead end.
+    """
+
+    def __init__(self, rel_path, kind, parent=None):
+        super().__init__(parent)
+        from packsmith.core import filetypes
+
+        self.rel_path = rel_path
+        self.kind = kind
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(24, 24, 24, 24)
+        lay.setSpacing(10)
+        lay.addStretch()
+
+        title = QLabel(Path(rel_path).name)
+        title.setAlignment(Qt.AlignCenter)
+        title.setStyleSheet(f"color: {style.TEXT}; font-size: 15px; font-weight: bold;")
+        lay.addWidget(title)
+
+        explain = QLabel(filetypes.describe(kind))
+        explain.setAlignment(Qt.AlignCenter)
+        explain.setWordWrap(True)
+        explain.setStyleSheet(f"color: {style.TEXT_MUTED}; font-size: 12px;")
+        lay.addWidget(explain)
+
+        path_lbl = QLabel(str(rel_path))
+        path_lbl.setAlignment(Qt.AlignCenter)
+        path_lbl.setStyleSheet(f"color: {style.TEXT_FAINT}; font-size: 11px;")
+        lay.addWidget(path_lbl)
+        lay.addStretch()
+
+    def activate(self):
+        """Same shape as EditorTab, so the workspace doesn't need to know the difference."""

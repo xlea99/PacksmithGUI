@@ -2,6 +2,8 @@
 log, fail, and step bindings/config (design 7.x)."""
 import pytest
 
+from packsmith.core.bindings import policy_key
+
 from packsmith.core.staging import L2Staging
 from packsmith.core.pack import Pack, ActionFailure
 
@@ -59,10 +61,53 @@ def test_query_reads_committed_store(pack):
     assert set(p.tags.query(REG, "remove", True)) == {ENTRY}
 
 
-def test_clear_stages_delete(pack):
+def test_an_action_may_retract_what_it_owns(pack):
+    """Clearing its own output is an action undoing itself, not erasing anybody."""
+    p, staging, tags = pack
+    p.tags.write(REG, ENTRY, TAG, True)
+    staging.commit()
+    p.tags.clear(REG, ENTRY, TAG)
+    staging.commit()
+    assert tags.get_ownership(REG, ENTRY, TAG) is None
+
+
+def test_an_action_cannot_delete_what_the_user_owns(pack):
+    """3.2.1: "actions cannot fully delete an assignment, only write over it." Returning a
+    cell to pristine destroys the record of a decision rather than superseding it, and
+    pristine is a state only the user can produce."""
     p, staging, tags = pack
     tags.assign(REG, ENTRY, TAG, True, owner="user")
-    p.tags.clear(REG, ENTRY, TAG)
+    with pytest.raises(ActionFailure, match="may not delete what it does not own"):
+        p.tags.clear(REG, ENTRY, TAG)
+    staging.commit()
+    assert tags.get_ownership(REG, ENTRY, TAG) == {"kind": "user", "action_ref": None}
+
+
+def test_an_action_cannot_delete_another_actions_assignment(pack):
+    p, staging, tags = pack
+    tags.assign(REG, ENTRY, TAG, True, owner="action", owner_action_ref="other:thing")
+    with pytest.raises(ActionFailure, match="'other:thing'"):
+        p.tags.clear(REG, ENTRY, TAG)
+
+
+def test_overwrite_policy_does_not_license_a_delete(pack):
+    """A declared policy governs WRITES. `overwrite` means "I may take this cell", never
+    "I may erase it" — there is no delete policy in 3.3 because deletes are user-only."""
+    p, staging, tags = pack
+    p.tags._policies = {policy_key("tag", REG, TAG): "overwrite"}
+    tags.assign(REG, ENTRY, TAG, True, owner="user")
+    p.tags.write(REG, ENTRY, TAG, False)                    # taking it: allowed
+    staging.commit()
+    assert tags.get_ownership(REG, ENTRY, TAG)["kind"] == "action"
+
+    tags.assign(REG, "minecraft:diamond", TAG, True, owner="user")
+    with pytest.raises(ActionFailure, match="may not delete"):
+        p.tags.clear(REG, "minecraft:diamond", TAG)
+
+
+def test_clearing_something_pristine_is_a_no_op(pack):
+    p, staging, tags = pack
+    p.tags.clear(REG, ENTRY, TAG)                           # nothing there; must not raise
     staging.commit()
     assert tags.get_ownership(REG, ENTRY, TAG) is None
 

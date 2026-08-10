@@ -181,7 +181,8 @@ def test_best_guess_never_suggests_a_schema_that_does_not_fit(stone):
     manifest = ActionManifest(package_name="p", action_id="a", file="a.star",
                               function="run",
                               mappings={"stones": _slot(required_shape=shape())})
-    assert best_guess_bindings(manifest, None, stone) == {"stones": "MyRockKind"}
+    assert best_guess_bindings(manifest, None, stone) == {
+        "stones": stone.id_of("MyRockKind")}
 
 
 def test_a_schema_that_drifts_after_binding_fails_the_step(stone):
@@ -318,7 +319,7 @@ def test_one_misfit_in_a_many_binding_fails_the_whole_step(stone):
 
 def test_conflict_policy_keys_by_blueprint_even_for_instance_mappings(stone):
     """`_may_write` asks per blueprint, so two instances of one schema are one policy."""
-    from packsmith.core.bindings import conflict_policies_for
+    from packsmith.core.bindings import conflict_policies_for, policy_key
     _instances(stone, "MyRockKind", "granite", "andesite")
     slot = MappingSlot(name="stones", kind="blueprint_instance", cardinality="many",
                        access="read_write", conflict_policy="skip", required_shape=shape())
@@ -326,7 +327,8 @@ def test_conflict_policy_keys_by_blueprint_even_for_instance_mappings(stone):
     mappings, _ = resolve_step(
         manifest, bindings={"stones": ["MyRockKind:granite", "MyRockKind:andesite"]},
         config={}, tag_store=None, blueprint_store=stone)
-    assert conflict_policies_for(manifest, mappings) == {"MyRockKind": "skip"}
+    assert conflict_policies_for(manifest, mappings) == {
+        policy_key("blueprint", None, "MyRockKind"): "skip"}
 
 
 def test_best_guess_for_many_offers_everything_that_qualifies(stone):
@@ -334,7 +336,8 @@ def test_best_guess_for_many_offers_everything_that_qualifies(stone):
     slot = MappingSlot(name="stones", kind="blueprint_instance", cardinality="many",
                        required_shape=shape())
     assert best_guess_bindings(_manifest(slot), None, stone) == {
-        "stones": ["MyRockKind:andesite", "MyRockKind:granite"]}
+        "stones": [stone.instance("MyRockKind", n).id
+                   for n in ("andesite", "granite")]}
 
 
 def test_an_invalid_cardinality_is_refused_at_load_time():
@@ -393,6 +396,6 @@ def test_best_guess_only_offers_a_likely_entry_the_pack_actually_has():
                          registry_type="minecraft:block",
                          likely_name="modded:nonsense")
     assert best_guess_bindings(_manifest(present), None, packdump=_Dump()) == {
-        "anchor": "minecraft:granite"}
+        "anchor": "minecraft:granite"}          # L1 entry ids stay strings
     assert best_guess_bindings(_manifest(absent), None, packdump=_Dump()) == {
         "anchor": None}

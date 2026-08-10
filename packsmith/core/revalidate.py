@@ -16,6 +16,7 @@ here writes.
 """
 from dataclasses import dataclass, replace
 
+from packsmith.core.bindings import binding_name
 from packsmith.core.shapes import mismatches
 
 
@@ -66,7 +67,8 @@ def project_retype(slots, path, type, *, registry_type=None, ref_blueprint=None,
             for slot in slots]
 
 
-def broken_steps(blueprint, projected_slots, *, job_store, package_index) -> list:
+def broken_steps(blueprint, projected_slots, *, job_store, package_index,
+                 blueprint_store=None) -> list:
     """Every step bound to ``blueprint`` that ``projected_slots`` would no longer satisfy.
 
     Scans all jobs rather than a subset: a mapping is bound per *step*, so "which steps
@@ -81,7 +83,8 @@ def broken_steps(blueprint, projected_slots, *, job_store, package_index) -> lis
             if manifest is None:
                 continue            # package uninstalled; the step is already unrunnable
             for name, slot in manifest.mappings.items():
-                if not _targets(slot, step.bindings.get(name), blueprint):
+                if not _targets(slot, step.bindings.get(name), blueprint,
+                                blueprint_store):
                     continue
                 problems = mismatches(slot.required_shape, projected_slots)
                 if problems:
@@ -101,21 +104,28 @@ def currently_broken(blueprint_store, *, job_store, package_index) -> list:
     broken = []
     for name in blueprint_store.names():
         broken += broken_steps(name, blueprint_store.slots(name),
-                               job_store=job_store, package_index=package_index)
+                               job_store=job_store, package_index=package_index,
+                               blueprint_store=blueprint_store)
     return broken
 
 
-def _targets(slot, bound, blueprint) -> bool:
-    """Is this binding pointed at ``blueprint``? Covers both blueprint kinds and both
-    cardinalities — an instance mapping names `Blueprint:instance`, and a `many` mapping
-    holds a list, so a plain equality check would miss most of the ways to depend on a
-    schema."""
+def _targets(slot, bound, blueprint, blueprint_store) -> bool:
+    """Is this binding pointed at ``blueprint``? Covers both blueprint kinds, both
+    cardinalities, and both storage forms — bindings hold ids now (design 3.2.1) but legacy
+    rows still hold names, so this has to compare through `binding_name` rather than
+    against the raw stored value."""
     if slot.kind not in ("blueprint", "blueprint_instance"):
         return False
     items = bound if isinstance(bound, (list, tuple)) else [bound]
-    if slot.kind == "blueprint":
-        return blueprint in items
-    return any(isinstance(i, str) and i.startswith(f"{blueprint}:") for i in items)
+    for item in items:
+        name = binding_name(slot, item, blueprint_store=blueprint_store)
+        if name is None:
+            continue
+        if slot.kind == "blueprint" and name == blueprint:
+            return True
+        if slot.kind == "blueprint_instance" and name.startswith(f"{blueprint}:"):
+            return True
+    return False
 
 
 def _manifest(package_index, action_ref):

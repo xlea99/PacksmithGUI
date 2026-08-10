@@ -1,4 +1,5 @@
 import sqlite3
+from contextlib import contextmanager
 from pathlib import Path
 from packsmith.common.logging import log
 
@@ -10,6 +11,7 @@ class UserDB:
 
     def __init__(self, db_path: Path):
         self._path = db_path
+        self._depth = 0            # open `transaction()` scopes; see execute()
         self._conn = sqlite3.connect(str(db_path))
         self._conn.execute("PRAGMA foreign_keys = ON")
         self._conn.row_factory = sqlite3.Row  # rows always behave like dicts cuz this is the 21st century
@@ -304,12 +306,43 @@ class UserDB:
     # Execute a write query (INSERT, UPDATE, DELETE) and commit.
     def execute(self, sql: str, params: tuple = ()) -> sqlite3.Cursor:
         cursor = self._conn.execute(sql, params)
-        self._conn.commit()
+        self._commit_unless_batched()
         return cursor
     # Execute a write query for many rows and commit.
     def execute_many(self, sql: str, params_list: list[tuple]):
         self._conn.executemany(sql, params_list)
-        self._conn.commit()
+        self._commit_unless_batched()
+
+    def _commit_unless_batched(self):
+        """Statement-at-a-time commits are the default, and inside `transaction()` they are
+        exactly the bug: a loop of them is a loop of transactions, so a failure halfway
+        through leaves the first half permanently applied."""
+        if self._depth == 0:
+            self._conn.commit()
+
+    @contextmanager
+    def transaction(self):
+        """Make everything inside one all-or-nothing SQLite transaction.
+
+        Design 3.3 promises "on failure the entire staging area is discarded; no real state
+        is touched… A failed step therefore touches nothing, for free". Flushing a staging
+        buffer through per-statement commits cannot keep that promise — this is what makes
+        the flush a single COMMIT so the promise is structural rather than hopeful.
+
+        Re-entrant: nested scopes join the outermost one, so a caller can wrap two stores
+        that share a connection and get one transaction across both.
+        """
+        self._depth += 1
+        try:
+            yield self
+        except Exception:
+            self._depth -= 1
+            if self._depth == 0:
+                self._conn.rollback()
+            raise
+        self._depth -= 1
+        if self._depth == 0:
+            self._conn.commit()
     # Execute a read query and return a single row (or None).
     def fetch_one(self, sql: str, params: tuple = ()) -> sqlite3.Row | None:
         return self._conn.execute(sql, params).fetchone()

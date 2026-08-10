@@ -14,6 +14,9 @@ from PySide6.QtWidgets import (
     QLabel, QCheckBox, QDialogButtonBox, QWidget, QFrame, QMessageBox,
 )
 
+from packsmith.core.query.language import (
+    QuerySyntaxError, format as format_query, parse as parse_query,
+)
 from packsmith.core.query import (
     Query, Registry, Id, Mod, Tag, Attribute, Cmp, Has, Not, And, Or, column_name,
 )
@@ -46,10 +49,22 @@ def _ops_for(field_type: str):
     if field_type == "bool":
         return [("is", "eq")]
     if field_type == "enum":
-        return [("is", "eq"), ("is not", "neq")]
+        return [("is", "eq"), ("is not", "neq"),
+                ("is one of", "in"), ("is none of", "not_in")]
     if field_type == "number":
         return [("=", "eq"), ("≠", "neq"), (">", "gt"), ("<", "lt"), ("≥", "gte"), ("≤", "lte")]
-    return [("=", "eq"), ("≠", "neq"), ("contains", "contains"), ("matches", "matches")]
+    return [("=", "eq"), ("≠", "neq"), ("contains", "contains"), ("matches", "matches"),
+            ("is one of", "in"), ("is none of", "not_in")]
+
+
+def _as_number(text):
+    try:
+        return int(text)
+    except ValueError:
+        try:
+            return float(text)
+        except ValueError:
+            return text
 
 
 def _node_field(node):
@@ -129,6 +144,13 @@ class ConditionRow(QWidget):
     def _rebuild_value(self):
         f = self._field()
         op = self._op()
+        if op in ("in", "not_in"):
+            # A list, not a value — even an enum needs several, which one combo can't hold.
+            self._value_combo.hide()
+            self._value_edit.show()
+            self._value_edit.setPlaceholderText("comma, separated, values")
+            return
+        self._value_edit.setPlaceholderText("")
         if op in ("has", "not_has"):
             self._value_edit.hide()
             self._value_combo.hide()
@@ -159,6 +181,13 @@ class ConditionRow(QWidget):
             return Has(f.node)
         if op == "not_has":
             return Not(Has(f.node))
+        if op in ("in", "not_in"):
+            items = [v.strip() for v in self._value_edit.text().split(",") if v.strip()]
+            if not items:
+                return None
+            if f.type == "number":
+                items = [_as_number(v) for v in items]
+            return Cmp(f.node, op, items)
         if f.type == "bool":
             return Cmp(f.node, op, self._value_combo.currentText() == "true")
         if f.type == "enum":
@@ -201,7 +230,9 @@ class ConditionRow(QWidget):
 
         if isinstance(node, Cmp):
             f = self._field()
-            if f.type == "bool":
+            if isinstance(node.value, (list, tuple)):
+                self._value_edit.setText(", ".join(str(v) for v in node.value))
+            elif f.type == "bool":
                 self._value_combo.setCurrentText("true" if node.value else "false")
             elif f.type == "enum":
                 self._value_combo.setCurrentText(str(node.value))
@@ -304,10 +335,41 @@ class QueryConstructorDialog(QDialog):
         root.addWidget(buttons)
 
         # Preload the current filter as editable rows (new views start empty)
-        combiner, nodes = _decompose(query.filter if query else None)
+        original = query.filter if query else None
+        combiner, nodes = _decompose(original)
         self._combiner.setCurrentIndex(0 if combiner == "AND" else 1)
         for n in nodes:
             self._add_row(preset=n)
+
+        # ...then check the rows can actually REPRODUCE it, by reading them straight back.
+        # A capability list would drift from the widgets; this asks the widgets. Anything
+        # the visual builder can't express — token matching from the filter bar, IN over a
+        # field type that doesn't offer it, groups nested deeper than one level — used to
+        # be silently rewritten into whatever the rows happened to hold, and saved on OK.
+        if original is not None and self.build_filter() != original:
+            self._enter_text_mode(original)
+
+    def _enter_text_mode(self, original):
+        """Show the filter as text instead of rows, when the rows would corrupt it.
+
+        Not a dead end: this is the same language the filter bar speaks, and it round-trips
+        every node the builder can't (§3.2.3 — "builder and text stay in sync"). So the
+        filter stays editable, just in the form that can hold it.
+        """
+        self._original_filter = original
+        for row in list(self._rows):
+            self._remove_row(row)
+        self._combiner.setEnabled(False)
+        self._text_edit = QLineEdit(format_query(original))
+        self._text_edit.setToolTip("The same syntax as the filter bar")
+        self._text_note = QLabel(
+            "This filter uses something the visual builder can't show (token matching, a "
+            "list, or nested groups), so it's shown as text — edit it here and nothing is "
+            "lost.")
+        self._text_note.setWordWrap(True)
+        self._text_note.setStyleSheet("color: #d0a050; font-size: 11px;")
+        self._rows_box.addWidget(self._text_note)
+        self._rows_box.addWidget(self._text_edit)
 
     def _add_row(self, preset=None):
         row = ConditionRow(self._fields, self)
@@ -344,7 +406,16 @@ class QueryConstructorDialog(QDialog):
                 self._name_edit.selectAll()
                 return
 
-        self.result_filter = self.build_filter()
+        if getattr(self, "_text_edit", None) is not None:
+            text = self._text_edit.text().strip()
+            try:
+                self.result_filter = parse_query(text) if text else None
+            except QuerySyntaxError as e:
+                QMessageBox.warning(self, "Can't read that filter", str(e))
+                self._text_edit.setFocus()
+                return
+        else:
+            self.result_filter = self.build_filter()
         if self._new_view:
             selected = [f.node for f in self._fields if self._col_checks[f.label].isChecked()]
             if not selected:

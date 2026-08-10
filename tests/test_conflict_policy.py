@@ -10,7 +10,7 @@ import pytest
 
 from packsmith.core.files import FileStore, FileStaging, FileOwnershipError
 from packsmith.core.packages import load_package
-from packsmith.core.bindings import conflict_policies_for
+from packsmith.core.bindings import conflict_policies_for, policy_key
 from packsmith.core.runner import run_action
 
 REG = "minecraft:item"
@@ -64,7 +64,7 @@ def test_rewriting_a_cell_this_action_already_owns_is_not_a_conflict(env):
 def test_overwrite_takes_the_cell_and_logs_it(env):
     tags, _ = env
     tags.assign(REG, "quark:rope", "queued", False, owner="user")
-    result = _run(env, policies={"queued": "overwrite"})
+    result = _run(env, policies={policy_key("tag", REG, "queued"): "overwrite"})
     assert result.ok
     assert tags.get_tag(REG, "quark:rope", "queued") is True
     assert tags.get_ownership(REG, "quark:rope", "queued")["kind"] == "action"
@@ -74,7 +74,7 @@ def test_overwrite_takes_the_cell_and_logs_it(env):
 def test_skip_leaves_the_cell_alone_and_logs_it(env):
     tags, _ = env
     tags.assign(REG, "quark:rope", "queued", False, owner="user")
-    result = _run(env, policies={"queued": "skip"})
+    result = _run(env, policies={policy_key("tag", REG, "queued"): "skip"})
     assert result.ok                                     # the step still succeeds
     assert tags.get_tag(REG, "quark:rope", "queued") is False
     assert tags.get_ownership(REG, "quark:rope", "queued") == {"kind": "user", "action_ref": None}
@@ -84,7 +84,7 @@ def test_skip_leaves_the_cell_alone_and_logs_it(env):
 def test_fail_halts_the_step_and_commits_nothing(env):
     tags, _ = env
     tags.assign(REG, "quark:rope", "queued", False, owner="user")
-    result = _run(env, policies={"queued": "fail"})
+    result = _run(env, policies={policy_key("tag", REG, "queued"): "fail"})
     assert not result.ok
     assert "owned by the user" in result.reason
     assert tags.get_tag(REG, "quark:rope", "queued") is False
@@ -105,7 +105,7 @@ def test_an_undeclared_policy_refuses_rather_than_guessing(env):
 def test_ask_is_declined_clearly_until_it_is_implemented(env):
     tags, _ = env
     tags.assign(REG, "quark:rope", "queued", False, owner="user")
-    result = _run(env, policies={"queued": "ask"})
+    result = _run(env, policies={policy_key("tag", REG, "queued"): "ask"})
     assert not result.ok
     assert "does not support" in result.reason
 
@@ -116,7 +116,7 @@ def test_conflict_with_another_action_uses_the_same_rules(env):
     blocked = _run(env, action_ref="second:act", fn=_writer(False))
     assert not blocked.ok                                # no policy declared
     allowed = _run(env, action_ref="second:act", fn=_writer(False),
-                   policies={"queued": "overwrite"})
+                   policies={policy_key("tag", REG, "queued"): "overwrite"})
     assert allowed.ok
     assert tags.get_ownership(REG, "quark:rope", "queued")["action_ref"] == "second:act"
 
@@ -164,7 +164,7 @@ def test_invalid_policy_is_rejected_at_load(tmp_path):
 def test_declared_policy_maps_onto_the_bound_tag(tmp_path):
     package = load_package(_write_package(tmp_path, "write", 'conflict_policy = "skip"'))
     manifest = package.actions[0]
-    assert conflict_policies_for(manifest, {"target": "queued"}) == {"queued": "skip"}
+    assert conflict_policies_for(manifest, {"target": "queued"}) == {policy_key("tag", REG, "queued"): "skip"}
 
 
 # --- the file engine: hard block, not policy --------------------------------

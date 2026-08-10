@@ -15,7 +15,7 @@ from PySide6.QtWidgets import (
     QAbstractItemView, QMessageBox, QListWidget, QListWidgetItem,
 )
 
-from packsmith.core.bindings import mapping_mismatches
+from packsmith.core.bindings import binding_id, binding_name, mapping_mismatches
 from packsmith.core.shapes import describe_shape
 from packsmith.gui.shell import style
 from packsmith.gui.shell.picker import PickerPopup, _token_match
@@ -172,9 +172,10 @@ class _MultiSelect(QWidget):
         root.addWidget(self._filter)
 
         self._list = QListWidget(self)
-        for value, reasons in candidates:
+        for value, artifact_id, reasons in candidates:
             item = QListWidgetItem(value if not reasons else f"{value} — doesn't fit")
-            item.setData(Qt.UserRole, value)
+            item.setData(Qt.UserRole, artifact_id)
+            item.setData(Qt.UserRole + 1, value)          # the label, for filtering
             if reasons:
                 item.setFlags(Qt.NoItemFlags)      # visible, inert, uncheckable
                 item.setToolTip("\n".join(reasons))
@@ -193,7 +194,7 @@ class _MultiSelect(QWidget):
     def _apply_filter(self, text):
         for row in range(self._list.count()):
             item = self._list.item(row)
-            item.setHidden(not _token_match(item.data(Qt.UserRole), text))
+            item.setHidden(not _token_match(item.data(Qt.UserRole + 1), text))
 
     def count(self) -> int:
         return self._list.count()
@@ -334,7 +335,7 @@ class StepEditorDialog(QDialog):
         Showing it greyed with "why" turns a dead end into a to-do.
         """
         if slot.kind == "registry_entry":
-            return [(e, []) for e in self._registry_entries(slot.registry_type)]
+            return [(e, e, []) for e in self._registry_entries(slot.registry_type)]
         if self._blueprints is None:
             return []
         if slot.kind == "blueprint_instance":
@@ -343,7 +344,12 @@ class StepEditorDialog(QDialog):
         else:
             values = list(self._blueprints.names())
         scored = [(v, mapping_mismatches(slot, v, self._blueprints)) for v in values]
-        return [s for s in scored if not s[1]] + [s for s in scored if s[1]]
+        ordered = [s for s in scored if not s[1]] + [s for s in scored if s[1]]
+        # Paired with the ID that actually gets stored (design 3.2.1) — the name is only
+        # what the row says.
+        return [(name, binding_id(slot, name, tag_store=self._tags,
+                                  blueprint_store=self._blueprints), reasons)
+                for name, reasons in ordered]
 
     def _fill_choice_combo(self, combo, slot, current, *, empty):
         candidates = self._candidates_for(slot)
@@ -352,9 +358,9 @@ class StepEditorDialog(QDialog):
             combo.setEnabled(False)
             return
 
-        fitting = [v for v, reasons in candidates if not reasons]
-        for value, reasons in candidates:
-            combo.addItem(value if not reasons else f"{value} — doesn't fit", value)
+        fitting = [v for v, _id, reasons in candidates if not reasons]
+        for value, artifact_id, reasons in candidates:
+            combo.addItem(value if not reasons else f"{value} — doesn't fit", artifact_id)
             if reasons:
                 item = combo.model().item(combo.count() - 1)
                 item.setEnabled(False)
@@ -532,7 +538,8 @@ class JobEditorTab(QWidget):
         for index, step in enumerate(job.steps, start=1):
             if step.is_action:
                 what = step.action_ref
-                configured = ", ".join(f"{k} → {v}" for k, v in sorted(step.bindings.items()))
+                configured = ", ".join(f"{k} → {self._binding_label(step, k, v)}"
+                                       for k, v in sorted(step.bindings.items()))
                 if step.config:
                     extra = ", ".join(f"{k}={v}" for k, v in sorted(step.config.items()))
                     configured = f"{configured}   [{extra}]" if configured else f"[{extra}]"
@@ -555,6 +562,21 @@ class JobEditorTab(QWidget):
         for col in range(self._tree.columnCount()):
             self._tree.resizeColumnToContents(col)
 
+    def _binding_label(self, step, mapping_name, stored):
+        """A binding is stored as an id; a human needs the name. Falls back to a visible
+        marker rather than a bare number when the artifact is gone."""
+        try:
+            slot = self._packages.get(step.action_ref).mappings.get(mapping_name)
+        except (KeyError, ValueError):
+            slot = None
+        if slot is None:
+            return stored
+        items = stored if isinstance(stored, list) else [stored]
+        labels = [binding_name(slot, i, tag_store=self._tags,
+                               blueprint_store=self._blueprints) or "(deleted)"
+                  for i in items]
+        return ", ".join(labels) if isinstance(stored, list) else labels[0]
+
     def _step_problems(self, step) -> list:
         """Why this step won't run, as sentences — empty when it's fine."""
         if not step.is_action or self._packages is None or self._blueprints is None:
@@ -572,8 +594,19 @@ class JobEditorTab(QWidget):
                 continue
             if slot.kind in ("blueprint", "blueprint_instance"):
                 for item in (bound if isinstance(bound, list) else [bound]):
+                    label = binding_name(slot, item, tag_store=self._tags,
+                                         blueprint_store=self._blueprints)
+                    if label is None:
+                        problems.append(
+                            f"'{name}' points at something that no longer exists")
+                        continue
                     problems += [f"'{name}': {why}" for why in
-                                 mapping_mismatches(slot, item, self._blueprints)]
+                                 mapping_mismatches(slot, label, self._blueprints)]
+            else:
+                if binding_name(slot, bound, tag_store=self._tags,
+                                blueprint_store=self._blueprints) is None:
+                    problems.append(
+                        f"'{name}' points at something that no longer exists")
         return problems
 
     def _selected_step(self):

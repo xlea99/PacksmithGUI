@@ -136,16 +136,16 @@ class RegistryTableView(QTableView):
             tag_name = source.column_tag_name(src_col)
             if entry_id is None or tag_name is None:
                 continue
-            old_value = source._tag_store.get_tag(source._registry_type, entry_id, tag_name)
+            prior = source._tag_store.assignment(source._registry_type, entry_id, tag_name)
 
-            if old_value == converted:
+            if prior is not None and prior.value == converted:
                 continue
 
             edits.append(TagEditCommand(
                 registry_type=source._registry_type,
                 entry_id=entry_id,
                 tag_name=tag_name,
-                old_value=old_value,
+                prior=prior,
                 new_value=converted,
             ))
 
@@ -219,16 +219,16 @@ class RegistryTableView(QTableView):
             tag_name = source.column_tag_name(src_col)
             if entry_id is None or tag_name is None:
                 continue
-            old_value = source._tag_store.get_tag(source._registry_type, entry_id, tag_name)
+            prior = source._tag_store.assignment(source._registry_type, entry_id, tag_name)
 
-            if old_value == new_value:
+            if prior is not None and prior.value == new_value:
                 continue
 
             edits.append(TagEditCommand(
                 registry_type=source._registry_type,
                 entry_id=entry_id,
                 tag_name=tag_name,
-                old_value=old_value,
+                prior=prior,
                 new_value=new_value,
             ))
 
@@ -260,16 +260,19 @@ class RegistryTableView(QTableView):
             tag_name = source.column_tag_name(src_col)
             if entry_id is None or tag_name is None:
                 continue
-            old_value = source._tag_store.get_tag(source._registry_type, entry_id, tag_name)
+            # Existence, not value: a pristine cell on a defaulted tag reads back as the
+            # default, so `is None` never fired and clearing it pushed a no-op edit whose
+            # undo materialised the very assignment the clear was meant to avoid.
+            prior = source._tag_store.assignment(source._registry_type, entry_id, tag_name)
 
-            if old_value is None:
+            if prior is None:
                 continue
 
             edits.append(TagEditCommand(
                 registry_type=source._registry_type,
                 entry_id=entry_id,
                 tag_name=tag_name,
-                old_value=old_value,
+                prior=prior,
                 new_value=None,
             ))
 

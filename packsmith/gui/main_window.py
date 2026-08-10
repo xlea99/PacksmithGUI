@@ -34,6 +34,7 @@ from packsmith.core.packages import (
     rename_file, create_folder, delete_folder, rename_folder, source_files,
 )
 from packsmith.core.bindings import best_guess_bindings, resolve_step
+from packsmith.core import filetypes
 from packsmith.core.files import FileStore
 from packsmith.core.history import StepRunStore, JobRunStore
 from packsmith.core.views import ViewStore
@@ -57,7 +58,7 @@ from packsmith.gui.shell.panels.views_panel import ViewsPanel
 from packsmith.gui.shell.panels.tags_panel import TagsPanel
 from packsmith.gui.shell.panels.jobs_panel import JobsPanel
 from packsmith.gui.shell.panels.files_panel import FilesPanel
-from packsmith.gui.editor.host import EditorHost, EditorTab
+from packsmith.gui.editor.host import EditorHost, EditorTab, UnsupportedFileTab
 from packsmith.gui.editor.sources import InstanceFileSource, PackageFileSource
 from packsmith.gui.shell.panels.actions_panel import ActionsPanel
 from packsmith.gui.shell.panels.blueprints_panel import BlueprintsPanel
@@ -287,7 +288,8 @@ class MainWindow(QMainWindow):
 
         self._bottom = BottomPanel()
         results = JobResultsView(self._history, self._job_history,
-                                 tag_store=self._tags, file_store=self._file_store)
+                                 tag_store=self._tags, file_store=self._file_store,
+                                 blueprint_store=self._blueprints)
         results.rolled_back.connect(self._on_rolled_back)
         self._bottom.set_panel("job_results", results)
         errors = ErrorsView(self._tags, self._packdump,
@@ -381,7 +383,8 @@ class MainWindow(QMainWindow):
         """
         return summarise(
             broken_steps(blueprint, projected_slots,
-                         job_store=self._jobs, package_index=self._packages),
+                         job_store=self._jobs, package_index=self._packages,
+                         blueprint_store=self._blueprints),
             mutation=mutation)
 
     def _save_renderer_config(self, view, config):
@@ -961,12 +964,35 @@ class MainWindow(QMainWindow):
         existing = self._open_tabs.get(("doc", key))
         if existing is not None and self._workspace.focus_widget(existing):
             return existing
+
+        # Design 6.0 Editor Dispatch. The text editor assumes UTF-8, and a modpack instance
+        # is mostly NOT that — `mods/` is nothing but jars, and the browser lists them, so
+        # double-clicking one is ordinary rather than perverse. The NBT and JAR editors are
+        # a sanctioned deferral; reaching them through a decode crash is not.
+        kind = self._file_kind(source, path)
+        if kind != filetypes.TEXT:
+            tab = UnsupportedFileTab(path, kind)
+            self._workspace.add_tab(tab, Path(path).name)
+            self._open_tabs[("doc", key)] = tab
+            self._set_status(f"{Path(path).name} — {filetypes.describe(kind)}")
+            return tab
+
         tab = EditorTab(self._editor_host, source, path)
         tab.unlock_requested.connect(self._request_unlock)
         self._workspace.add_tab(tab, Path(path).name)
         self._open_tabs[("doc", key)] = tab
         tab.activate()
         return tab
+
+    def _file_kind(self, source, path) -> str:
+        """Classify by extension plus a peek at the bytes, per 6.0's "content sniffing"."""
+        root = (self._file_store.root if source == "instance"
+                else self._packages.directory)
+        try:
+            full = Path(root) / path
+        except (TypeError, ValueError):
+            return filetypes.TEXT
+        return filetypes.classify(path, filetypes.probe_file(full))
 
     # --- packages: the declaration layer and the file layer ------------------
     #

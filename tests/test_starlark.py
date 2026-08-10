@@ -9,6 +9,8 @@ claim deserves tests rather than trust.
 """
 import pytest
 
+from packsmith.core.bindings import policy_key
+
 from packsmith.core.files import FileStore, FileStaging
 from packsmith.core.pack import Pack, ActionFailure
 from packsmith.core.staging import L2Staging
@@ -38,7 +40,7 @@ def pack(tags, user_db, tmp_path):
         tag_store=tags, packdump=FakeDump(), action_ref="demo:act",
         mappings={"source": "remove", "target": "queued"},
         config={"registry_type": REG, "loud": True, "limit": 5},
-        conflict_policies={"queued": "overwrite"},
+        conflict_policies={policy_key("tag", "minecraft:item", "queued"): "overwrite"},
     )
 
 

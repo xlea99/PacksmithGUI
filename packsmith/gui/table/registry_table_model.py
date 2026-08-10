@@ -156,8 +156,10 @@ class RegistryTableModel(QAbstractTableModel):
             return False
 
         tag_name = self.column_tag_name(col)
-        old_value = self._tag_store.get_tag(self._registry_type, row.entry_id, tag_name)
-        if old_value == value:
+        # The cell's whole prior STATE, not its displayed value: a pristine cell shows the
+        # tag's default, and re-writing that on undo would invent an assignment.
+        prior = self._tag_store.assignment(self._registry_type, row.entry_id, tag_name)
+        if prior is not None and prior.value == value:
             return False
         if not self.confirm_takeover_of([(row.entry_id, tag_name)]):
             return False
@@ -166,7 +168,7 @@ class RegistryTableModel(QAbstractTableModel):
             registry_type=self._registry_type,
             entry_id=row.entry_id,
             tag_name=tag_name,
-            old_value=old_value,
+            prior=prior,
             new_value=value,
         )
         self._edit_stack.execute(command)
