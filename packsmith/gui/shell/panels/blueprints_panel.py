@@ -38,7 +38,9 @@ def _button(text):
 
 class BlueprintsPanel(Panel):
 
-    blueprint_activated = Signal(str)              # open the schema's editor tab
+    # blueprint, instance-or-"": the tab is always the whole blueprint, but a click on
+    # one instance says which row you meant, and dropping that is dropping the click.
+    blueprint_activated = Signal(str, str)
     new_blueprint_requested = Signal()
     delete_blueprint_requested = Signal(str)
     rename_blueprint_requested = Signal(str)
@@ -127,7 +129,7 @@ class BlueprintsPanel(Panel):
     def _on_activated(self, item, _column=0):
         blueprint = item.data(0, _ROLE_BLUEPRINT)
         if blueprint:
-            self.blueprint_activated.emit(blueprint)
+            self.blueprint_activated.emit(blueprint, item.data(0, _ROLE_INSTANCE) or "")
 
     def _on_context_menu(self, pos):
         item = self._tree.itemAt(pos)
@@ -139,7 +141,8 @@ class BlueprintsPanel(Panel):
         instance = item.data(0, _ROLE_INSTANCE)
 
         menu = QMenu(self)
-        menu.addAction("Open", lambda: self.blueprint_activated.emit(blueprint))
+        menu.addAction("Open",
+                       lambda: self.blueprint_activated.emit(blueprint, instance or ""))
         menu.addSeparator()
         if instance:
             menu.addAction("Rename instance…",

@@ -167,3 +167,141 @@ def test_a_partial_commit_keeps_its_rollback_record(tags, tmp_path):
     recorded = json.loads(history.get(result.run_id)["rollback_data"])
     assert recorded["files"], "the way back was thrown away"
     assert "made.json" in recorded["files"]
+
+
+def test_a_rolled_back_transaction_records_nothing_to_undo(tags, tmp_path):
+    """The staging buffers build their inverse AS THEY GO, so on a mid-flush failure they
+    describe writes SQLite has already rolled back. Recording those makes a later rollback
+    try to undo what never happened."""
+    from packsmith.core.blueprints import BlueprintStore
+    from packsmith.core.files import FileStore
+    from packsmith.core.history import StepRunStore
+
+    class LateFail:
+        """Creating the instance works; the bind after it explodes."""
+        def __init__(self, real):
+            self._real, self._db = real, real._db
+
+        def __getattr__(self, name):
+            return getattr(self._real, name)
+
+        def bind(self, *a, **k):
+            raise RuntimeError("boom after the instance was created")
+
+    tags.define(REG, "remove", "bool", default=False)
+    bps = BlueprintStore(tags._db)
+    bps.define("StoneType")
+    bps.add_slot("StoneType", "base_block", "registry", registry_type="minecraft:block")
+    history = StepRunStore(tags._db)
+    store = FileStore(tags._db, tmp_path)
+
+    def action(pack):
+        pack.filesystem.resolve("made.json").write("{}")
+        pack.tags.write(REG, "quark:rope", "remove", True)
+        pack.blueprints.create("StoneType", "granite")
+        pack.blueprints.bind("StoneType", "granite", "base_block", "minecraft:granite")
+
+    result = run_action(action, tag_store=tags, packdump=FakeDump(["quark:rope"]),
+                        action_ref="pkg:act", file_store=store,
+                        blueprint_store=LateFail(bps), history=history)
+    assert not result.ok
+    import json
+    data = json.loads(history.get(result.run_id)["rollback_data"])
+    assert data["files"], "the file DID land and must stay undoable"
+    assert data["l2"] == [], "the database rolled back; nothing to undo there"
+    assert data["blueprints"] == []
+
+
+def test_the_partial_rollback_the_reason_promises_actually_works(tags, tmp_path):
+    """The failure reason says "roll this step back to undo them" — so it has to run
+    cleanly, not restore the files and then raise on a stale blueprint entry."""
+    from packsmith.core.blueprints import BlueprintStore
+    from packsmith.core.files import FileStore
+    from packsmith.core.history import StepRunStore, rollback_step
+
+    class LateFail:
+        def __init__(self, real):
+            self._real, self._db = real, real._db
+
+        def __getattr__(self, name):
+            return getattr(self._real, name)
+
+        def bind(self, *a, **k):
+            raise RuntimeError("boom")
+
+    bps = BlueprintStore(tags._db)
+    bps.define("StoneType")
+    bps.add_slot("StoneType", "base_block", "registry", registry_type="minecraft:block")
+    history = StepRunStore(tags._db)
+    store = FileStore(tags._db, tmp_path)
+
+    def action(pack):
+        pack.filesystem.resolve("made.json").write("{}")
+        pack.blueprints.create("StoneType", "granite")
+        pack.blueprints.bind("StoneType", "granite", "base_block", "minecraft:granite")
+
+    result = run_action(action, tag_store=tags, packdump=FakeDump([]),
+                        action_ref="pkg:act", file_store=store,
+                        blueprint_store=LateFail(bps), history=history)
+    assert "roll this step back" in result.reason
+    assert (tmp_path / "made.json").exists()
+
+    rollback_step(result.run_id, tag_store=tags, history=history, file_store=store,
+                  blueprint_store=bps)
+    assert not (tmp_path / "made.json").exists(), "the promised undo did not happen"
+
+
+def test_a_missing_required_file_leaves_no_half_applied_step(tags, tmp_path):
+    """FS-4: a `file_must_exist` failure used to happen mid-commit, after earlier files in
+    the same step had already been written — and the snapshots that could undo them were
+    discarded, so the step reported "failed" over a changed disk.
+
+    Both of the fixes that section suggested are in place, and the first makes the second
+    moot for this case: the check now runs at STAGING time (§7.3, where the hard-block
+    already lived), so the step dies before a single byte is written. The other kind of
+    commit-time failure — one that genuinely gets partway — keeps its rollback record; see
+    `test_a_partial_commit_keeps_its_rollback_record`.
+    """
+    import json
+    from packsmith.core.files import FileStore
+    from packsmith.core.history import StepRunStore
+
+    store = FileStore(tags._db, tmp_path)
+    history = StepRunStore(tags._db)
+    (tmp_path / "second.json").write_text("ORIGINAL", encoding="utf-8")
+
+    def action(pack):
+        pack.filesystem.resolve("first.json").write("made")
+        pack.filesystem.resolve("second.json").write("changed", file_must_exist=True)
+        pack.filesystem.resolve("third.json").write("x", file_must_exist=True)
+
+    result = run_action(action, tag_store=tags, packdump=FakeDump([]),
+                        action_ref="pkg:act", file_store=store, history=history)
+
+    assert not result.ok and "third.json" in result.reason
+    assert not (tmp_path / "first.json").exists(), "an earlier file in the step landed"
+    assert (tmp_path / "second.json").read_text() == "ORIGINAL", "an existing file changed"
+    assert json.loads(history.get(result.run_id)["rollback_data"])["files"] == {}
+
+
+def test_a_file_commit_failure_reports_itself_not_an_internal_error(tags, tmp_path):
+    """A failure in `files.commit()` happens BEFORE the database transaction is opened, so
+    the handler that inspects that transaction must not assume it exists. It did, and the
+    UnboundLocalError replaced the real reason — hiding what actually went wrong behind an
+    internal one."""
+    from packsmith.core.files import FileStore
+
+    class Exploding(FileStore):
+        def write(self, *a, **k):
+            raise PermissionError("disk says no")
+
+    store = Exploding(tags._db, tmp_path)
+
+    def action(pack):
+        pack.filesystem.resolve("out.json").write("{}")
+
+    result = run_action(action, tag_store=tags, packdump=FakeDump([]),
+                        action_ref="pkg:act", file_store=store)
+    assert not result.ok
+    assert "disk says no" in result.reason
+    assert "UnboundLocalError" not in result.reason

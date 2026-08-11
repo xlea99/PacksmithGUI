@@ -15,7 +15,7 @@ import re
 
 from packsmith.core.query.ast import (
     Query, Registry, Blueprint, Cmp, Has, And, Or, Not, VALID_OPS, QueryError,
-    AGGREGATES, Collect, CountDistinct, Slot, _AllSlots, _Count,
+    AGGREGATES, Collect, CountDistinct, Slot, _AllSlots, _Count, _Id,
 )
 from packsmith.core.query.catalog import (
     BlueprintFieldCatalog, RegistryFieldCatalog, _Resolver, column_name,
@@ -80,8 +80,14 @@ def evaluate(query, *, packdump=None, tag_store=None, blueprint_store=None) -> R
         records = records[: query.limit]
 
     columns = [Column(name, res.type) for name, res in select_cols]
+    # DISTINCT drops entry_id because a deduplicated row generally stands for several
+    # entries, and editing it would be ambiguous. That is not true when `id` is projected:
+    # ids are unique, so no two rows can have collapsed and each still names exactly one
+    # entry. Blanket-stripping made those views needlessly read-only.
+    identifies_one = any(isinstance(f, _Id) for f in query.select)
+    anonymous = query.distinct and not identifies_one
     rows = [
-        Row(values=values, entry_id=(None if query.distinct else entry_id))
+        Row(values=values, entry_id=(None if anonymous else entry_id))
         for (entry_id, values, _keys) in records
     ]
     return Result(columns=columns, rows=rows)

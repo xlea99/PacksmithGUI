@@ -510,8 +510,18 @@ class BlueprintStore:
 
         # Rewrite what survives, displace what doesn't. Values are re-encoded because a
         # stored form is type-specific — number 3 is "3.0", the same 3 as a string is "3".
+        #
+        # ...unless the user picked **Retype & Orphan**, which 3.2.2 defines as "orphan all
+        # instances anyway (explicit user choice to re-bind manually)". Converting the
+        # survivors there contradicts the choice AND the label: the instance is orphaned
+        # for the user to re-bind, but there is nothing left to re-bind and the originals
+        # are gone. Displacing everything into limbo keeps the values recoverable and makes
+        # "re-bind manually" mean something.
+        orphaning = mutation_id is not None
         for instance, binding in self._bindings_to(slot):
             try:
+                if orphaning:
+                    raise BlueprintError("retype & orphan: displace rather than convert")
                 restored = self._validate(proposed, self._decode(slot, binding["value"]))
             except BlueprintError:
                 self._db.execute(

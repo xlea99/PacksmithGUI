@@ -228,3 +228,33 @@ def test_the_user_can_always_write_their_own_file(store):
     staging.write("f.txt", "edited", owner="user")       # not an action — no block
     staging.commit()
     assert (root / "f.txt").read_text(encoding="utf-8") == "edited"
+
+
+def test_one_action_taking_a_file_from_another_is_allowed_but_logged(tags, tmp_path):
+    """Files are open-world, so §6.1 hard-blocks only the USER — action-to-action takeover
+    is correct to allow. Silent is the problem: with declaration-time detection deferred,
+    two actions fighting over one file is otherwise invisible and simply last-run-wins,
+    while the L2 engine logs exactly this case."""
+    from packsmith.core.files import FileStore, FileStaging
+    store = FileStore(tags._db, tmp_path)
+    store.write("shared.json", "{}", owner="action", owner_action_ref="alpha:write")
+
+    said = []
+    staging = FileStaging(store, log=lambda level, msg: said.append((level, msg)))
+    staging.write("shared.json", "new", owner="action", owner_action_ref="beta:write")
+
+    assert said, "the takeover was silent"
+    level, message = said[0]
+    assert level == "info"
+    assert "alpha:write" in message and "shared.json" in message
+
+
+def test_an_action_rewriting_its_own_file_says_nothing(tags, tmp_path):
+    """Re-asserting your own output is not a conflict and must not be noise."""
+    from packsmith.core.files import FileStore, FileStaging
+    store = FileStore(tags._db, tmp_path)
+    store.write("mine.json", "{}", owner="action", owner_action_ref="alpha:write")
+    said = []
+    staging = FileStaging(store, log=lambda level, msg: said.append((level, msg)))
+    staging.write("mine.json", "new", owner="action", owner_action_ref="alpha:write")
+    assert said == []

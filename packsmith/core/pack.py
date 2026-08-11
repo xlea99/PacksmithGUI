@@ -58,7 +58,7 @@ class _Registry:
         return self._dump.attribute(registry_type, entry_id, name)
 
 
-def _refuse_foreign_delete(current, action_ref, *, cell):
+def _refuse_foreign_delete(current, action_ref, *, cell, taken=()):
     """Deletes are not writes, and conflict policy does not cover them (design 3.2.1).
 
     "**Delete assignment** — fully remove an assignment row, returning the (entry, tag)
@@ -77,7 +77,16 @@ def _refuse_foreign_delete(current, action_ref, *, cell):
     if current is None:
         return                                            # already pristine; nothing to do
     if current["kind"] == "action" and current["action_ref"] == action_ref:
-        return                                            # ours to retract
+        if cell in taken:
+            # Taken from someone else EARLIER IN THIS STEP. Each call was legal on its own
+            # — the policy allowed the write, and an action may retract its own work — but
+            # together they launder "user-owned" into "pristine", which 3.2.1 reserves for
+            # the user. The rule is about the step's net effect, so it needs the memory.
+            raise ActionFailure(
+                f"{cell} was taken from its previous owner during this step; clearing it "
+                f"now would erase their record rather than supersede it. Write a value "
+                f"instead, or leave it alone.")
+        return                                            # genuinely ours to retract
     who = "the user" if current["kind"] == "user" else f"'{current['action_ref']}'"
     raise ActionFailure(
         f"{cell} is owned by {who}, and an action may not delete what it does not own — "
@@ -104,6 +113,7 @@ class _Tags:
         self._action_ref = action_ref
         self._policies = dict(conflict_policies or {})
         self._log = log or (lambda level, message: None)
+        self._taken = set()          # cells this step took from someone else
 
     def query(self, registry_type, tag_name, value):
         """Entry IDs whose ``tag_name`` equals ``value`` in the committed store."""
@@ -116,8 +126,13 @@ class _Tags:
         return self._staging.read_ownership(registry_type, entry_id, tag_name)
 
     def write(self, registry_type, entry_id, tag_name, value):
+        current = self._staging.read_ownership(registry_type, entry_id, tag_name)
         if not self._may_write(registry_type, entry_id, tag_name):
             return
+        if current is not None and not (
+                current["kind"] == "action"
+                and current["action_ref"] == self._action_ref):
+            self._taken.add(f"{tag_name} on {entry_id}")
         self._staging.write(registry_type, entry_id, tag_name, value,
                             owner="action", owner_action_ref=self._action_ref)
 
@@ -156,7 +171,7 @@ class _Tags:
     def clear(self, registry_type, entry_id, tag_name):
         _refuse_foreign_delete(
             self._staging.read_ownership(registry_type, entry_id, tag_name),
-            self._action_ref, cell=f"{tag_name} on {entry_id}")
+            self._action_ref, cell=f"{tag_name} on {entry_id}", taken=self._taken)
         self._staging.delete(registry_type, entry_id, tag_name)
 
 
@@ -186,6 +201,7 @@ class _Blueprints:
         self._action_ref = action_ref
         self._policies = dict(conflict_policies or {})
         self._log = log or (lambda level, message: None)
+        self._taken = set()          # bindings this step took from someone else
 
     # --- reads -------------------------------------------------------------
 
@@ -256,8 +272,13 @@ class _Blueprints:
 
     def bind(self, blueprint, instance, slot_path, value):
         self._require_healthy(blueprint)
+        current = self._staging.read_ownership(blueprint, instance, slot_path)
         if not self._may_write(blueprint, instance, slot_path):
             return
+        if current is not None and not (
+                current["kind"] == "action"
+                and current["action_ref"] == self._action_ref):
+            self._taken.add(f"{blueprint}:{instance}.{slot_path}")
         if not self._staging.instance_exists(blueprint, instance):
             raise ActionFailure(
                 f"'{blueprint}' has no instance '{instance}' — create it first.")
@@ -268,7 +289,8 @@ class _Blueprints:
         self._require_healthy(blueprint)
         _refuse_foreign_delete(
             self._staging.read_ownership(blueprint, instance, slot_path),
-            self._action_ref, cell=f"{blueprint}:{instance}.{slot_path}")
+            self._action_ref, cell=f"{blueprint}:{instance}.{slot_path}",
+            taken=self._taken)
         self._staging.delete(blueprint, instance, slot_path)
 
     def _may_write(self, blueprint, instance, slot_path) -> bool:

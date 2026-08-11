@@ -1,3 +1,4 @@
+import os
 import sys
 import tomllib
 from pathlib import Path
@@ -29,17 +30,47 @@ class ProjectPaths:
 
 
     @staticmethod
+    def data_root() -> Path:
+        """Where USER DATA lives — profiles, logs, config. Never where the code lives.
+
+        `_MEIPASS` is PyInstaller's extraction directory: a temp folder, recreated on every
+        launch and deleted on exit (and read-only in onefile builds). Rooting `userdata/`
+        there meant a frozen PackSmith would lose every profile, every tag and every
+        blueprint each time it closed — the whole L2 database, silently, with the app
+        looking like it started fresh. Nothing in dev catches it, because dev is never
+        frozen.
+
+        Three cases, in order:
+        1. **Portable** — a `userdata/` sitting next to the executable wins. Modpack devs
+           keep tools on the same drive as their instances and expect them to move; this
+           is also the escape hatch if the per-user location is ever wrong.
+        2. **Frozen** — the platform's per-user application data directory.
+        3. **Source checkout** — the repo root, which is what every dev profile already
+           uses. Unchanged deliberately: `userdata/` is in .gitignore and moving it would
+           strand the profiles people already have.
+        """
+        if getattr(sys, "frozen", False):
+            beside_exe = Path(sys.executable).resolve().parent / "userdata"
+            if beside_exe.is_dir():
+                return beside_exe.parent
+            if sys.platform == "win32":
+                base = os.environ.get("APPDATA") or (Path.home() / "AppData" / "Roaming")
+            elif sys.platform == "darwin":
+                base = Path.home() / "Library" / "Application Support"
+            else:
+                base = os.environ.get("XDG_DATA_HOME") or (Path.home() / ".local" / "share")
+            return Path(base) / "PackSmith"
+        return Path(__file__).resolve().parents[2]
+
+    @staticmethod
     def build():
-        # For frozen apps, PyInstaller unpacks resources to _MEIPASS - handle that case here
-        if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
-            # noinspection PyProtectedMember
-            root = Path(sys._MEIPASS)
-        # Otherwise, rely on strict 3up root policy
-        else:
-            root = Path(__file__).resolve().parents[2]
+        root = ProjectPaths.data_root()
 
         userdata = ensure_directory(root / "userdata")
-        config = ensure_directory(userdata / "config", must_exist=True)
+        # NOT must_exist: a fresh clone has no userdata/ at all, and crashing at *import
+        # time* on a missing empty directory means the app cannot start until someone
+        # mkdir's it — with a traceback that doesn't say so.
+        config = ensure_directory(userdata / "config")
         logs = ensure_directory(userdata / "logs")
         profiles = ensure_directory(userdata / "profiles")
 
@@ -50,7 +81,28 @@ class ProjectPaths:
             logs = logs,
             profiles = profiles
         )
+def load_config(path: Path) -> dict:
+    """App-wide config (§9.1: `userdata/config/main.toml`).
+
+    Absent means "all defaults" — the correct reading of a file that isn't there, and the
+    only reading that lets a fresh clone start. This used to be an unguarded `open()` at
+    import time, so a checkout without the file died before `main()` with a
+    FileNotFoundError naming a path nobody had been told to create.
+
+    A *malformed* file is different and does raise: the user wrote it and meant something,
+    and silently ignoring it would apply defaults they explicitly overrode.
+
+    Nothing reads the result yet. Every setting that exists today is per-PROFILE (see
+    `max_packdump_snapshot_count`), which is where anything about a specific pack belongs.
+    """
+    try:
+        with open(path, "rb") as f:
+            return tomllib.load(f)
+    except FileNotFoundError:
+        return {}
+    except tomllib.TOMLDecodeError as e:
+        raise ValueError(f"{path} is not valid TOML: {e}") from e
+
+
 GLOBAL_PATHS = ProjectPaths.build()
-# Build config
-with open(GLOBAL_PATHS.config / "main.toml","rb") as f:
-    CONFIG = tomllib.load(f)
+CONFIG = load_config(GLOBAL_PATHS.config / "main.toml")

@@ -11,9 +11,14 @@ Execution **recurses** rather than consuming a flat step list, because §3.3.2 s
 then the parent's `on_error` for that job-reference step decides whether the parent
 carries on. A flat list throws away the nesting that rule needs.
 
-Runs are synchronous for now. §3.3.2 wants them on a background thread with a global
-queue; that waits until something actually runs long enough to hurt (SQLite connections
-are per-thread, so it isn't free).
+Runs are synchronous for now, and it is worth being precise about what that does and
+doesn't satisfy. §3.3 asks for two things: only one step executing at a time, and *"if the
+user triggers a second job while one is already running, the new run is queued"*. The first
+holds — but by paralysis, not by mechanism: the UI thread blocks, so a second trigger
+cannot arrive. **There is no queue.** §3.3.2 wants a background thread with a global one;
+that waits until something actually runs long enough to hurt (SQLite connections are
+per-thread, so it isn't free), and whoever builds it is implementing the queue for the
+first time rather than moving an existing one.
 """
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -136,7 +141,7 @@ def _record_failure(ctx, step, action_ref, reason) -> StepResult:
         run_id = ctx.history.record(
             action_ref=action_ref, status="failed", reason=reason,
             started_at=now, finished_at=now,
-            rollback_data={"l2": [], "files": {}}, log_output=[],
+            rollback_data={"l2": [], "files": {}, "blueprints": []}, log_output=[],
             job_run_id=ctx.job_run_id, step_id=step.id, position_in_run=ctx.position,
         )
     return StepResult(action_ref=action_ref, status="failed", reason=reason, run_id=run_id)

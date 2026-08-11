@@ -3,7 +3,7 @@ import shutil
 from dataclasses import dataclass, field
 from pathlib import Path
 from datetime import datetime, timezone
-#from types import MappingProxyType
+from types import MappingProxyType
 from packsmith.common.logging import log
 from packsmith.util.misc import raise_log, write_json
 from packsmith.core.profile import Profile
@@ -70,6 +70,15 @@ class Packdump:
             if (set(self._registries[reg_type]["values"])
                     != set(other._registries[reg_type]["values"])):
                 return False
+
+        # Localizations are L1 data too, and they are what the user actually READS: the
+        # table shows display names, not ids. Leaving them out meant a mod that renamed
+        # "Rose Quartz Block" to "Rose Quartz" was "identical" — no import, and the old
+        # name persisted in the GUI for the life of the profile with no way to refresh
+        # short of deleting the packdump. Staleness the user cannot see a reason for is
+        # worse than an extra snapshot.
+        if self._localizations != other._localizations:
+            return False
 
         return True
     # For comparing GT/LT for packdumps, we simply use its timestamp and assume they're already different
@@ -242,8 +251,24 @@ class Packdump:
                     reg_data = json.load(f)
                 result._registries[entry["type"]] = {**entry,"values": reg_data["values"]}
 
-            # Now we load each attribute individually since attributes aren't discovered
-            result._load_localizations(snapshot_path / "attributes" / "localization.json")
+            # Now we load each attribute individually since attributes aren't discovered.
+            # Locales ARE discovered, by glob: a snapshot holds one file per locale, and
+            # which locales a pack dumped is not something the reader can know in advance.
+            # `localization.json` (no locale in the name) is the old single-locale layout —
+            # still read, because snapshots already on disk are archives, not caches.
+            attr_dir_in = snapshot_path / "attributes"
+            locale_files = sorted(attr_dir_in.glob("localization.*.json"))
+            legacy = attr_dir_in / "localization.json"
+            if legacy.is_file():
+                locale_files.insert(0, legacy)
+            if not locale_files:
+                raise FileNotFoundError(f"no localization files in {attr_dir_in}")
+            for path in locale_files:
+                result._load_localizations(path)
+            # Which locale is *active* must not depend on filename sort order, or adding a
+            # German dump would silently re-language the whole GUI.
+            if "en_us" in result._localizations:
+                result._active_locale = "en_us"
 
         except (KeyError, TypeError, json.JSONDecodeError, FileNotFoundError) as e:
             raise_log(ValueError, f"Packsmith dump appears to be corrupted: {e}")
@@ -297,15 +322,18 @@ class Packdump:
         }
         write_json(snapshot_path / "meta.json", meta)
 
-        # Write attribute files
+        # Write attribute files. One file PER LOCALE: this used to write every locale to
+        # the same localization.json, so the last one out of the dict won and every other
+        # locale was silently dropped from the snapshot. Latent while the mod dumps only
+        # en_us — but archived snapshots are the thing you cannot go back and re-dump, so
+        # a silent loss there is permanent.
         for locale, values in self._localizations.items():
-            loc_file = {
+            write_json(attr_dir / f"localization.{locale}.json", {
                 "schema_version": self._schema,
                 "type": "localization",
                 "locale": locale,
                 "values": values,
-            }
-            write_json(attr_dir / "localization.json", loc_file)
+            })
 
         log.info(f"Packdump saved to {snapshot_path}")
 
@@ -330,25 +358,29 @@ class Packdump:
     def loader_version(self) -> str:
         return self._loader_version
 
-    # Read only views of the dicts cause we aint about dirty editing
-    #@property
-    #def mods(self) -> MappingProxyType:
-    #    return MappingProxyType(self._mods)
-    #@property
-    #def registry(self) -> MappingProxyType:
-    #    return MappingProxyType(self._registries)
-    # (temp disabling it for ease of debug)
+    # Read only views of the dicts cause we aint about dirty editing.
+    #
+    # These were commented out "temp… for ease of debug" and stayed that way, which made
+    # L1's central promise — "read-only, PackSmith never writes it" (§3.1) — a convention
+    # rather than a property. Starlark was insulated because the bridge hands actions
+    # copies; every Python caller in the GUI was on the honour system, and an accidental
+    # `dump.registry[...]["values"].append(...)` would have corrupted the in-memory L1 for
+    # the rest of the session with nothing on disk to explain it.
+    #
+    # MappingProxyType is shallow: it stops rebinding keys of the outer dict, not mutation
+    # of the inner ones. That's the cheap 90% — it catches the accidents — and paying for
+    # deep immutability by copying an 18k-entry registry on every access is not worth it.
     @property
-    def mods(self) -> dict:
-        return self._mods
+    def mods(self) -> MappingProxyType:
+        return MappingProxyType(self._mods)
     @property
-    def registry(self) -> dict:
-        return self._registries
+    def registry(self) -> MappingProxyType:
+        return MappingProxyType(self._registries)
 
     # Convenience localizations getter
     @property
-    def localization(self) -> dict:
-        return self._localizations[self._active_locale]
+    def localization(self) -> MappingProxyType:
+        return MappingProxyType(self._localizations[self._active_locale])
 
     # Handles getting and setting the active locale that localizations is serving from.
     @property
@@ -379,7 +411,9 @@ class Packdump:
     #endregion === Helpers
 
 # This helper method imports a packdump from the minecraft instance (or a given path) as the local, current
-# packdump snapshot, rotating out previous dumps as specified by the user's `packdump_snapshot_count` in main.toml.
+# packdump snapshot, rotating out previous dumps as specified by `max_packdump_snapshot_count` in the
+# PROFILE's settings (profile.json) — not main.toml, which holds app-wide config. Retention is per-profile
+# because it's a property of the pack being worked on, not of the app: a 300-mod pack's snapshot is ~4 MB.
 # This is all skipped if the incoming dump is identical to the current dump
 @dataclass
 class ImportResult:

@@ -709,6 +709,23 @@ class BlueprintEditorTab(QWidget):
             self._on_cell_changed(current.row(), current.column())
         self.save_config()
 
+    def focus_instance(self, name: str) -> bool:
+        """Put the cursor on one instance's row, scrolling it into view.
+
+        A blueprint tab renders the whole blueprint — there is no such thing as a
+        one-instance tab, and there shouldn't be: the grid is the point. But clicking a
+        *specific* instance in the panel and landing on row 0 of a 40-row palette throws
+        away the only thing that click said. Returns False if the instance isn't in this
+        grid (a filtered view may legitimately exclude it), so the caller can say so.
+        """
+        for row, instance in enumerate(self._instances):
+            if instance.name == name:
+                self._grid.setCurrentCell(row, 0)
+                self._grid.scrollToItem(self._grid.item(row, 0),
+                                        QAbstractItemView.PositionAtCenter)
+                return True
+        return False
+
     def renderer_config(self) -> dict:
         """Everything about *how this view is rendered*, as opposed to what it selects.
 

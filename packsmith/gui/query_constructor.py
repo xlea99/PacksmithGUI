@@ -252,10 +252,11 @@ class QueryConstructorDialog(QDialog):
     """
 
     def __init__(self, tag_store, registry_type, *, query=None, new_view=False,
-                 view_store=None, parent=None):
+                 view_store=None, parent=None, registries=None):
         super().__init__(parent)
         self._new_view = new_view
         self._registry_type = registry_type
+        self._tags = tag_store
         # Given a store, the dialog checks the name itself rather than closing and failing
         # afterwards — losing a query you just built would be a miserable way to learn the
         # name was taken.
@@ -273,9 +274,26 @@ class QueryConstructorDialog(QDialog):
         root = QVBoxLayout(self)
         root.setSpacing(8)
 
-        scope_lbl = QLabel(f"Registry:  <b>{registry_type}</b>")
-        scope_lbl.setTextFormat(Qt.RichText)
-        root.addWidget(scope_lbl)
+        # A new view has to be able to target any registry — hard-coding minecraft:item
+        # made 134 of the pack's 135 registries unreachable from this wizard. Editing an
+        # existing view still shows its scope read-only: changing it would invalidate every
+        # column and filter already chosen.
+        self._registry_combo = None
+        if new_view and registries:
+            scope_row = QHBoxLayout()
+            scope_row.addWidget(QLabel("Registry"))
+            self._registry_combo = QComboBox()
+            for name in registries:
+                self._registry_combo.addItem(name, name)
+            index = self._registry_combo.findData(registry_type)
+            self._registry_combo.setCurrentIndex(max(0, index))
+            self._registry_combo.currentIndexChanged.connect(self._on_registry_changed)
+            scope_row.addWidget(self._registry_combo, 1)
+            root.addLayout(scope_row)
+        else:
+            scope_lbl = QLabel(f"Registry:  <b>{registry_type}</b>")
+            scope_lbl.setTextFormat(Qt.RichText)
+            root.addWidget(scope_lbl)
 
         if new_view:
             name_row = QHBoxLayout()
@@ -385,6 +403,29 @@ class QueryConstructorDialog(QDialog):
             self._rows.remove(row)
             self._rows_box.removeWidget(row)
             row.deleteLater()
+
+    def _on_registry_changed(self):
+        """Switching registry invalidates the conditions, which name the old registry's
+        fields. Cleared rather than silently kept pointing at fields that no longer exist.
+        """
+        self._registry_type = self._registry_combo.currentData()
+        self._fields = registry_fields(self._tags, self._registry_type)
+        for row in list(self._rows):
+            self._remove_row(row)
+        self._rebuild_columns()
+
+    def _rebuild_columns(self):
+        """Re-label the column checkboxes for the current registry's fields."""
+        if not self._col_checks:
+            return
+        checks = list(self._col_checks.values())
+        for i, check in enumerate(checks):
+            visible = i < len(self._fields)
+            check.setVisible(visible)
+            if visible:
+                check.setText(self._fields[i].label)
+                check.setChecked(self._fields[i].label in ("id", "localization"))
+        self._col_checks = {f.label: c for f, c in zip(self._fields, checks)}
 
     def build_filter(self):
         nodes = [n for n in (r.to_node() for r in self._rows) if n is not None]

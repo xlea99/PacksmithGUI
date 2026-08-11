@@ -99,3 +99,7 @@ class Workspace(QWidget):
         idx = self._tabs.indexOf(widget)
         if idx >= 0:
             self._tabs.setTabText(idx, title)
+
+    def tab_title(self, widget) -> str:
+        idx = self._tabs.indexOf(widget)
+        return self._tabs.tabText(idx) if idx >= 0 else ""

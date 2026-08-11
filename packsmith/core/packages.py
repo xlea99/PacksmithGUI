@@ -66,7 +66,6 @@ class ActionManifest:
     description: str = ""
     mappings: dict = field(default_factory=dict)   # dict[str, MappingSlot]
     config: dict = field(default_factory=dict)      # dict[str, ConfigParam]
-    # conflict_policies deferred to Phase 4
 
     @property
     def ref(self) -> str:

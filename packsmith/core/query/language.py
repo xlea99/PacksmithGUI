@@ -46,13 +46,26 @@ _WORD_OPS = {
     "contains": "contains", "matches": "matches", "matches_tokens": "matches_tokens",
     "in": "in",
 }
+# The case-insensitive spellings of the text operators; they carry ci=True.
+_CI_WORD_OPS = {"contains_i": "contains", "matches_i": "matches",
+                "matches_tokens_i": "matches_tokens"}
 _SYMBOL_OPS = {"==": "eq", "!=": "neq", ">=": "gte", "<=": "lte", ">": "gt", "<": "lt",
                "~": "matches_tokens"}
 _OP_TEXT = {"eq": "==", "neq": "!=", "gte": ">=", "lte": "<=", "gt": ">", "lt": "<",
             "contains": "CONTAINS", "matches": "MATCHES",
             "matches_tokens": "MATCHES_TOKENS", "in": "IN", "not_in": "NOT IN"}
 _KEYWORDS = {"and", "or", "not", "has", "in", "contains", "matches", "matches_tokens",
-             "true", "false"}
+             "true", "false"} | set(_CI_WORD_OPS)
+
+# `Cmp.ci` is engine-legal but had no spelling, so `format` silently dropped it and a
+# case-insensitive filter came back case-sensitive — quietly changing which rows match,
+# including through the ⚙ dialog's text fallback.
+#
+# Spelled as a distinct operator (`CONTAINS_I`) rather than a `/i` suffix: `_WORD` swallows
+# `/` on purpose, because ids look like `minecraft:worldgen/biome`, so `CONTAINS/i` would
+# lex as a single word. One more keyword costs nothing and round-trips cleanly.
+_CI_OPS = {"contains": "CONTAINS_I", "matches": "MATCHES_I",
+           "matches_tokens": "MATCHES_TOKENS_I"}
 _LIST_OPS = {"in", "not_in"}
 
 # A bare word: ids carry colons, dots, slashes and dashes, so they all belong in one token.
@@ -98,11 +111,19 @@ def _lex(text):
             i += 1
             continue
         if ch in "\"'":
-            end = text.find(ch, i + 1)
-            if end == -1:
+            # Backslash escaping, so a value containing the quote character is sayable at
+            # all. Without it `format` emits a string the tokenizer then cuts short, which
+            # breaks the round-trip the ⚙ dialog relies on to edit a filter as text.
+            chars, j = [], i + 1
+            while j < len(text) and text[j] != ch:
+                if text[j] == "\\" and j + 1 < len(text):
+                    j += 1                      # take the next character literally
+                chars.append(text[j])
+                j += 1
+            if j >= len(text):
                 raise QuerySyntaxError("unterminated string", i, text)
-            tokens.append(_Token("string", text[i + 1:end], i))
-            i = end + 1
+            tokens.append(_Token("string", "".join(chars), i))
+            i = j + 1
             continue
         two = text[i:i + 2]
         if two in _SYMBOL_OPS:
@@ -221,11 +242,15 @@ class _Parser:
             return False
         if after.kind == "op":
             return True
-        return after.kind == "keyword" and after.value in ("in", "contains", "matches",
-                                                           "matches_tokens", "not")
+        # Derived from the operator tables rather than re-listed: a spelling added there
+        # and forgotten here parses as a bare phrase instead, which fails as a confusing
+        # "unexpected 'contains_i'" rather than as an unknown operator.
+        return after.kind == "keyword" and after.value in (
+            set(_WORD_OPS) | set(_CI_WORD_OPS) | {"not"})
 
     def parse_comparison(self):
         field = self.parse_field()
+        ci = False
         token = self.next()
         if token.kind == "op":
             op = token.value
@@ -236,9 +261,11 @@ class _Parser:
             op = "not_in"
         elif token.kind == "keyword" and token.value in _WORD_OPS:
             op = _WORD_OPS[token.value]
+        elif token.kind == "keyword" and token.value in _CI_WORD_OPS:
+            op, ci = _CI_WORD_OPS[token.value], True
         else:
             self.fail("expected a comparison operator", token)
-        return Cmp(field, op, self.parse_value(op))
+        return Cmp(field, op, self.parse_value(op), ci=ci)
 
     def parse_field(self):
         token = self.next()
@@ -428,7 +455,10 @@ def _format(node, parent_precedence):
     if isinstance(node, Has):
         return f"HAS {_field_text(node.field)}"
     if isinstance(node, Cmp):
-        return f"{_field_text(node.field)} {_OP_TEXT[node.op]} {_value_text(node)}"
+        ci = getattr(node, "ci", False)
+        operator = (_CI_OPS[node.op] if ci and node.op in _CI_OPS
+                    else _OP_TEXT[node.op])
+        return f"{_field_text(node.field)} {operator} {_value_text(node)}"
     raise QueryError(f"cannot format {node!r}")
 
 
@@ -465,7 +495,8 @@ def _scalar_text(value) -> str:
         return "true" if value else "false"
     if isinstance(value, (int, float)):
         return repr(value)
-    return f'"{value}"'
+    escaped = str(value).replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
 
 
 def _quote_word(word) -> str:

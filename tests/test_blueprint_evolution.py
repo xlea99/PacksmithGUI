@@ -178,13 +178,40 @@ def test_a_problematic_value_is_displaced_and_rebindable(store):
 
 
 def test_a_surviving_value_is_re_encoded_not_displaced(store):
-    """Stored form is type-specific — 3 as a number is "3.0", as a string it's "3"."""
+    """Stored form is type-specific — 3 as a number is "3.0", as a string it's "3".
+
+    Exercised through auto-coerce, which is the path that converts. (It used to be
+    reachable by the default path too, but that path is "Retype & Orphan", which 3.2.2
+    defines as the user declining conversion — see the test below.)
+    """
     store.define("N")
     store.add_slot("N", "amount", "string")
     store.create_instance("N", "one")
     store.bind("N", "one", "amount", "3")
-    store.retype_slot("N", "amount", "number")
+    store.retype_slot("N", "amount", "number", auto_coerce=True)
     assert store.value_of("N", "one", "amount") == 3
+
+
+def test_retype_and_orphan_does_not_convert_what_it_orphans(store):
+    """3.2.2: "*Retype & Orphan* — apply the type change, orphan all instances anyway
+    (explicit user choice to re-bind manually)."
+
+    Converting the survivors anyway contradicts both the choice and the label: the user is
+    told to re-bind, there is nothing left to re-bind, and the originals are gone. The
+    values go to limbo instead, where Discard / Preserve / re-bind can reach them.
+    """
+    store.define("N")
+    store.add_slot("N", "amount", "number")
+    store.create_instance("N", "one")
+    store.bind("N", "one", "amount", 3)
+
+    impact = store.preview_retype_slot("N", "amount", "string")
+    assert impact.can_coerce, "everything COULD convert — the user chose not to"
+
+    store.retype_slot("N", "amount", "string", auto_coerce=False)
+    assert store.value_of("N", "one", "amount") is None, "it was converted anyway"
+    assert [l.value for l in store.limbo("N", "one")] == ["3.0"], "the original is kept"
+    assert [o.instance for o in store.orphans("N")] == ["one"]
 
 
 def test_retyping_between_registries_is_checked_against_the_packdump(store):

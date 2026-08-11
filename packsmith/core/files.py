@@ -24,6 +24,15 @@ class FileOwnershipError(Exception):
     """
 
 
+def _like_prefix(key: str) -> str:
+    """Escape a stored path key for use as a LIKE prefix.
+
+    Filenames legitimately contain ``%`` and ``_`` — a mod called ``some_mod`` would
+    otherwise match ``someXmod`` and take an unrelated file's ownership record with it.
+    """
+    return key.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
 class FileStore:
     """Reads/writes files under the instance root and tracks whole-file ownership.
 
@@ -62,7 +71,12 @@ class FileStore:
                 parts.pop()
                 continue
             parts.append(part)
-        return os.path.normcase("/".join(parts))
+        text = "/".join(parts)
+        # normcase is used to *detect* a case-insensitive filesystem, not to transform the
+        # path: on Windows it also rewrites "/" to "\\", which would undo the separator
+        # normalisation two lines up and make the stored key platform-specific. Keys must
+        # be portable — a profile is a folder a user can move between machines.
+        return text.lower() if os.path.normcase("A") == "a" else text
 
     def _abs(self, rel_path: str) -> Path:
         p = (self._root / rel_path).resolve()
@@ -161,6 +175,51 @@ class FileStore:
         self._db.execute("DELETE FROM file_ownership WHERE path = ?",
                          (self.key(rel_path),))
 
+    def rename(self, rel_path: str, new_rel_path: str):
+        """Move a file or directory, taking its ownership records with it.
+
+        Ownership belongs to the artifact, not to the string naming it — a file an action
+        manages is still that action's file after the user renames it. Dropping the record
+        instead would silently launder an action-owned file into an untouched one, which
+        is exactly the transition §6.1 refuses to make quietly.
+        """
+        src, dst = self._abs(rel_path), self._abs(new_rel_path)
+        if not src.exists():
+            raise FileNotFoundError(f"No such file: {rel_path}")
+        if dst.exists():
+            raise FileExistsError(f"Already exists: {new_rel_path}")
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        src.rename(dst)
+
+        old_key, new_key = self.key(rel_path), self.key(new_rel_path)
+        # A directory rename moves every record beneath it too. The trailing separator
+        # keeps "cfg" from also matching "cfgold/x.json".
+        self._db.execute(
+            """UPDATE file_ownership
+                  SET path = ? || substr(path, ?)
+                WHERE path LIKE ? ESCAPE '\\'""",
+            (new_key, len(old_key) + 1, _like_prefix(old_key) + "/%"))
+        self._db.execute("UPDATE file_ownership SET path = ? WHERE path = ?",
+                         (new_key, old_key))
+
+    def delete_tree(self, rel_path: str):
+        """Recursively remove a directory and forget everything owned beneath it."""
+        import shutil
+        p = self._abs(rel_path)
+        if p.is_dir():
+            shutil.rmtree(p)
+        self._db.execute("DELETE FROM file_ownership WHERE path = ? OR path LIKE ? ESCAPE '\\'",
+                         (self.key(rel_path), _like_prefix(self.key(rel_path)) + "/%"))
+
+    def owned_under(self, rel_path: str) -> dict:
+        """Ownership records at or beneath a path — what a recursive delete would destroy."""
+        key = self.key(rel_path)
+        return {row["path"]: {"kind": row["owner_kind"], "action_ref": row["owner_action_ref"]}
+                for row in self._db.fetch_all(
+                    "SELECT path, owner_kind, owner_action_ref FROM file_ownership "
+                    "WHERE path = ? OR path LIKE ? ESCAPE '\\'",
+                    (key, _like_prefix(key) + "/%"))}
+
     def restore(self, rel_path: str, prior_content, prior_ownership):
         """Return a file to a prior state (for rollback). A None prior_content means
         the file didn't exist before — so delete it; otherwise rewrite the old bytes
@@ -194,10 +253,20 @@ class FileStaging:
     for store-by-path rollback — recorded by the runner into the step run.
     """
 
-    def __init__(self, file_store: FileStore):
+    def __init__(self, file_store: FileStore, log=None):
         self._store = file_store
-        self._pending = {}   # rel_path -> {"content", "owner", "owner_action_ref", "file_must_exist"}
-        self.snapshots = {}  # rel_path -> prior content (or None), populated at commit
+        self._log = log or (lambda level, message: None)
+        # Keyed by the STORE's canonical key, not the caller's spelling. Staging under two
+        # spellings of one file in a single step otherwise produces two pending writes and
+        # two rollback snapshots — and the second snapshot captures the FIRST write's
+        # content, so rolling back would restore mid-step state rather than the prior file.
+        self._pending = {}   # key -> {"path", "content", "owner", "owner_action_ref", …}
+        self.snapshots = {}  # key -> prior content (or None), populated at commit
+
+    def logs_to(self, log):
+        """Send this buffer's notices to the action's own log. Set after construction
+        because the runner builds staging before the `pack` that owns the log."""
+        self._log = log
 
     def write(self, rel_path, content, *, owner, owner_action_ref=None, file_must_exist=False):
         # Hard-block user-owned files (design 6.1) at STAGING time rather than commit, so
@@ -209,29 +278,41 @@ class FileStaging:
                     f"'{rel_path}' is owned by you — actions are blocked from writing it. "
                     f"Release ownership in the Files panel to let '{owner_action_ref}' "
                     f"write it.")
+            if (current is not None and current["kind"] == "action"
+                    and current["action_ref"] != owner_action_ref):
+                # Taking a file from ANOTHER ACTION is allowed — files are open-world and
+                # §6.1 hard-blocks only the user. But allowed is not the same as unremarked:
+                # the L2 engine logs exactly this ("took {cell} from {who}"), and with
+                # declaration-time detection deferred, two actions fighting over one file
+                # is otherwise invisible and simply last-run-wins.
+                self._log("info", f"took '{rel_path}' from "
+                                  f"'{current['action_ref']}' — both actions write it")
         # §7.3: the existence flags "guard the write at the moment of the call". Checking
         # at commit told the author their file was missing long after the line that assumed
         # it, in a traceback about flushing a buffer — same reasoning as the hard-block
         # above, which is why both now live here. A file this step staged earlier counts as
         # existing: an action that writes a file and then edits it is doing so on purpose.
-        if file_must_exist and not (rel_path in self._pending
+        key = self._store.key(rel_path)
+        if file_must_exist and not (key in self._pending
                                     or self._store.exists(rel_path)):
             raise FileNotFoundError(f"Expected file to exist: {rel_path}")
-        self._pending[rel_path] = {
-            "content": content, "owner": owner, "owner_action_ref": owner_action_ref,
-            "file_must_exist": file_must_exist,
+        self._pending[key] = {
+            "path": rel_path, "content": content, "owner": owner,
+            "owner_action_ref": owner_action_ref, "file_must_exist": file_must_exist,
         }
 
     def read(self, rel_path):
-        if rel_path in self._pending:
-            return self._pending[rel_path]["content"]
+        staged = self._pending.get(self._store.key(rel_path))
+        if staged is not None:
+            return staged["content"]
         return self._store.read(rel_path)
 
     def exists(self, rel_path):
-        return rel_path in self._pending or self._store.exists(rel_path)
+        return (self._store.key(rel_path) in self._pending
+                or self._store.exists(rel_path))
 
     def ownership(self, rel_path):
-        staged = self._pending.get(rel_path)
+        staged = self._pending.get(self._store.key(rel_path))
         if staged is not None:
             return {"kind": staged["owner"], "action_ref": staged["owner_action_ref"]}
         return self._store.ownership(rel_path)
@@ -249,7 +330,8 @@ class FileStaging:
         # better than failing during the flush: nothing has been written yet either way,
         # but the traceback names the author's own line.
 
-        for rel_path, staged in self._pending.items():
+        for key, staged in self._pending.items():
+            rel_path = staged["path"]      # the spelling the action used, for the message
             prior_owner = self._store.ownership(rel_path)          # capture before overwrite
             prior_content = self._store.write(
                 rel_path, staged["content"],
@@ -258,7 +340,11 @@ class FileStaging:
                 # mid-loop, which is the partial-commit hole this engine can't roll back.
                 file_must_exist=False,
             )
-            self.snapshots[rel_path] = {"content": prior_content, "ownership": prior_owner}
+            # Snapshot under the canonical key too, so two spellings of one file cannot
+            # produce two rollback entries — the second of which would hold the FIRST
+            # write's content and restore mid-step state.
+            self.snapshots.setdefault(
+                key, {"content": prior_content, "ownership": prior_owner})
         self._pending.clear()
 
     def discard(self):

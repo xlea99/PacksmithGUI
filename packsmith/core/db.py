@@ -37,13 +37,6 @@ class UserDB:
             self._conn.commit()
             log.info("Dropped the pre-3.2.2 blueprint stub tables")
 
-    # Releases the sqlite connection. Needed when switching profiles: on Windows an open
-    # connection holds a file lock, so a profile you're still connected to can't be deleted
-    # and its db can't be replaced.
-    def close(self):
-        self._conn.close()
-        log.info(f"UserDB closed: {self._path}")
-
     # Creates any/all tables that don't exist. Safe to call repeatedly
     def _ensure_tables(self):
         c = self._conn
@@ -350,7 +343,11 @@ class UserDB:
     def fetch_all(self, sql: str, params: tuple = ()) -> list[sqlite3.Row]:
         return self._conn.execute(sql, params).fetchall()
 
-    # Simply closes the connection to the db.
+    # Releases the sqlite connection. Needed when switching profiles: on Windows an open
+    # connection holds a file lock, so a profile you're still connected to can't be deleted
+    # and its db can't be replaced. (There were two identical copies of this method; the
+    # later definition silently won, so the docs on the earlier one described code that
+    # never ran.)
     def close(self):
         self._conn.close()
         log.info(f"UserDB closed: {self._path}")

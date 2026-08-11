@@ -81,3 +81,35 @@ def test_invalid_op_raises(stocked):
     with pytest.raises(ValueError):
         stocked.query(REG, filters=[{"tag": "tier", "op": "sideways", "value": "x"}])
 
+
+
+def test_the_legacy_query_cannot_see_fully_pristine_entries(tags):
+    """Pinning a real limit so it can't be mistaken for a bug or for completeness.
+
+    `TagStore.query` selects FROM tag_assignments and the store has no packdump, so its
+    universe is "entries with at least one assignment". `not_exists` therefore means
+    "tagged with something else", not "every entry lacking this tag" — and `untouched`,
+    which has no rows anywhere, is invisible to it either way.
+    """
+    tags.define(REG, "tier", "enum", ["early"])
+    tags.define(REG, "notes", "string")
+    tags.assign(REG, "tagged", "tier", "early")
+    # "untouched" is deliberately never assigned anything
+
+    found = tags.query(REG, filters=[{"tag": "notes", "op": "not_exists"}])
+    assert set(found) == {"tagged"}
+    assert "untouched" not in found
+
+    # ...and the AST engine, which IS given the registry, answers the whole-registry
+    # question correctly — that is the path to use for it.
+    from packsmith.core.query import Query, Registry, Id, Tag, Has, Not, evaluate
+
+    class Dump:
+        registry = {REG: {"values": ["tagged", "untouched"]}}
+
+        def attribute(self, *a):
+            return None
+
+    q = Query(scope=Registry(REG), select=[Id], filter=Not(Has(Tag("notes"))))
+    everything = [r.values["id"] for r in evaluate(q, packdump=Dump(), tag_store=tags).rows]
+    assert set(everything) == {"tagged", "untouched"}

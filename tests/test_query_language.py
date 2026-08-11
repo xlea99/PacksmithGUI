@@ -184,3 +184,43 @@ def test_errors_carry_a_position_for_the_bar_to_point_at():
         parse("t:remove = true")
     assert caught.value.position == 9
     assert "^" in str(caught.value)
+
+
+# --- round-trip completeness (Q-6) -----------------------------------------
+
+def test_a_value_containing_a_quote_survives_the_round_trip():
+    """Without escaping, `format` emits a string the tokenizer then cuts short — and the
+    ⚙ dialog edits filters as text, so an unrepresentable value is a corrupted filter."""
+    node = Cmp(Id, "eq", 'say "hi"')
+    assert parse(format(node)) == node
+
+
+def test_a_backslash_in_a_value_survives_too():
+    node = Cmp(Id, "eq", r"back\slash")
+    assert parse(format(node)) == node
+
+
+@pytest.mark.parametrize("text, op", [
+    ('id CONTAINS_I "Gran"', "contains"),
+    ('a:localization MATCHES_I "brick"', "matches"),
+    ('id MATCHES_TOKENS_I ("gran")', "matches_tokens"),
+])
+def test_case_insensitivity_has_a_spelling_and_round_trips(text, op):
+    """`Cmp.ci` was engine-legal with no surface form, so `format` dropped it silently and
+    a case-insensitive filter came back case-sensitive — quietly changing what matches."""
+    node = parse(text)
+    assert node.op == op and node.ci is True
+    assert parse(format(node)) == node
+
+
+def test_the_case_sensitive_spelling_is_unaffected():
+    node = parse('id CONTAINS "gran"')
+    assert node.ci is False
+    assert format(node) == 'id CONTAINS "gran"'
+
+
+def test_a_hand_built_ci_node_can_be_printed():
+    """The engine can produce these even if the bar never has; `format` must not lie."""
+    node = Cmp(Id, "contains", "Gran", True)
+    assert "CONTAINS_I" in format(node)
+    assert parse(format(node)) == node

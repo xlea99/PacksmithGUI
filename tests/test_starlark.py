@@ -494,3 +494,18 @@ def test_a_refused_write_leaves_nothing_behind(tags, tmp_path):
     result, store = _fs_action(src, tags, tmp_path)
     assert not result.ok
     assert not (tmp_path / "ok.json").exists()
+
+
+def test_print_reaches_the_run_log_instead_of_vanishing(pack):
+    """§7.6 said print should not be a free builtin, optionally redirected to
+    `pack.log("debug", …)`. It was registered as the real builtin instead, whose output
+    goes to the interpreter's own sink — allowed but invisible, so an author debugging
+    with print sees nothing and concludes their code never ran."""
+    run('def run(pack):\n    print("hello", 3, True, None)\n', pack)
+    assert ("debug", "hello 3 True None") in pack.log_lines
+
+
+def test_print_does_not_bypass_the_action_log_for_the_run_record(pack):
+    """It has to be the same channel, or rollback/history show a run that said nothing."""
+    run('def run(pack):\n    pack.log("info", "real")\n    print("debug line")\n', pack)
+    assert [level for level, _ in pack.log_lines] == ["info", "debug"]

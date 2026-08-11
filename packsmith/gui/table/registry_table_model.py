@@ -142,6 +142,11 @@ class RegistryTableModel(QAbstractTableModel):
             # make `HAS a:localization` true for every entry, which is exactly the bug
             # Q-3 was. Display is display; existence is existence.
             return row.entry_id
+        if isinstance(value, bool):
+            # §3.2.1 spells bools `true` / `false`. `str(True)` is Python's spelling, and
+            # DisplayRole is what Copy puts on the clipboard — so external TSV consumers
+            # were getting capitalised values that don't match the language or the store.
+            return "true" if value else "false"
         return "" if value is None else str(value)
 
     def _is_localization_fallback(self, row, col: int) -> bool:

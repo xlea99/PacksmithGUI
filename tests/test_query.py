@@ -280,3 +280,49 @@ def test_has_on_intrinsics_and_attributes_is_unchanged(world):
     dump, tags = world
     q = Query(scope=Registry(REG), filter=Not(Has(Attribute("localization"))), select=[Id])
     assert _ids(evaluate(q, packdump=dump, tag_store=tags)) == ["minecraft:diamond"]
+
+
+def test_a_value_comparison_DOES_see_the_default(world):
+    """RULING (2026-08-10, user): comparisons see defaults; Has does not.
+
+    `t:remove == false` matches a pristine cell that defaults to false, because that is
+    what the table shows — filtering agrees with your eyes. `HAS` answers the different
+    question of whether a decision was recorded. Both readings pass a suite that doesn't
+    pin this, so this test is the pin.
+    """
+    dump, tags = world
+    q = Query(scope=Registry(REG), filter=Cmp(Tag("remove"), "eq", False), select=[Id])
+    matched = set(_ids(evaluate(q, packdump=dump, tag_store=tags)))
+    assert "minecraft:diamond" in matched, "pristine cells take the tag's default"
+    assert "alexscaves:galena" not in matched, "explicitly true is still true"
+
+
+def test_the_two_questions_stay_distinct(world):
+    """The whole point of the split: same tag, same entries, different answers."""
+    dump, tags = world
+    defaults_to_false = set(_ids(evaluate(
+        Query(scope=Registry(REG), filter=Cmp(Tag("remove"), "eq", False), select=[Id]),
+        packdump=dump, tag_store=tags)))
+    actually_assigned = set(_ids(evaluate(
+        Query(scope=Registry(REG), filter=Has(Tag("remove")), select=[Id]),
+        packdump=dump, tag_store=tags)))
+    assert defaults_to_false and actually_assigned
+    assert not (defaults_to_false & actually_assigned)
+
+
+def test_distinct_keeps_entry_id_when_the_projection_still_names_one_entry(world):
+    """DISTINCT drops entry_id because a deduplicated row usually stands for several
+    entries — but not when `id` is projected: ids are unique, so nothing can have
+    collapsed. Blanket-stripping made those views needlessly read-only."""
+    dump, tags = world
+    with_id = evaluate(Query(scope=Registry(REG), select=[Id, Tag("tier")],
+                             distinct=True), packdump=dump, tag_store=tags)
+    assert all(row.entry_id is not None for row in with_id.rows)
+
+
+def test_distinct_still_anonymises_a_genuinely_collapsed_row(world):
+    dump, tags = world
+    without_id = evaluate(Query(scope=Registry(REG), select=[Tag("tier")], distinct=True),
+                          packdump=dump, tag_store=tags)
+    assert all(row.entry_id is None for row in without_id.rows)
+    assert len(without_id.rows) < len(dump.registry[REG]["values"])

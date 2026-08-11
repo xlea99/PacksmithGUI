@@ -1,4 +1,4 @@
-from PySide6.QtWidgets import QTableView, QApplication
+from PySide6.QtWidgets import QTableView, QApplication, QMenu
 from PySide6.QtCore import Qt, QSortFilterProxyModel, QMimeData
 
 from packsmith.gui.table.edit_commands import TagEditCommand, BatchEditCommand
@@ -10,7 +10,37 @@ class RegistryTableView(QTableView):
     Space: Gmail-style bool toggle on selected bool cells.
     Delete/Backspace: Clear selected tag cells to unset.
     Ctrl+C: Copy selected cells as TSV (plain text) + HTML table (rich paste).
+    Right-click: the same operations, for people who don't know the keys yet.
     All keyboard editing respects per-column edit mode."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        # §3.2.1 names a context menu for clearing an assignment. Keyboard-only meant the
+        # operation existed but was undiscoverable — Delete is obvious once you know it,
+        # and invisible until then.
+        self.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.customContextMenuRequested.connect(self._on_context_menu)
+
+    def _on_context_menu(self, pos):
+        index = self.indexAt(pos)
+        if not index.isValid():
+            return
+        source = self._source_model()
+        editable = [i for i in self.selectionModel().selectedIndexes()
+                    if source.is_editing(self._source_col(i))
+                    and source.tag_type_for_column(self._source_col(i)) is not None]
+        menu = QMenu(self)
+        clear = menu.addAction(f"Clear {len(editable)} assignment(s)"
+                               if len(editable) != 1 else "Clear assignment")
+        clear.setEnabled(bool(editable))
+        clear.triggered.connect(self._bulk_clear)
+        copy = menu.addAction("Copy")
+        copy.triggered.connect(self._copy_selection)
+        if not editable:
+            menu.addSeparator()
+            hint = menu.addAction("Turn on editing for this column to change values")
+            hint.setEnabled(False)
+        menu.exec(self.viewport().mapToGlobal(pos))
 
     def keyPressEvent(self, event):
         key = event.key()

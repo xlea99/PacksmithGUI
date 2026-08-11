@@ -89,8 +89,13 @@ class JobResultsView(_SummaryView):
         step = item.data(0, Qt.UserRole) if item else None
         if not step or self._tags is None:
             return
-        if step.get("status") != "success":
-            return                          # nothing committed, nothing to reverse
+        # Offer rollback when there is something recorded to undo, not when the step
+        # "succeeded". A step can fail at commit having already written files — the runner
+        # records how to reverse those and its failure reason literally says to — and
+        # gating on status made that instruction impossible to follow. An already
+        # rolled-back step has its record cleared, so this excludes it for free.
+        if not _has_rollback(step):
+            return
         menu = QMenu(self)
         menu.addAction("Roll back this step…", lambda: self._rollback(step, item))
         menu.exec(self._tree.mapToGlobal(pos))
@@ -511,6 +516,17 @@ def _reason_lines(reason) -> list[str]:
         if line:
             lines.append(line)
     return lines or [str(reason)]
+
+
+def _has_rollback(step) -> bool:
+    """Does this run have anything recorded to undo?"""
+    if step.get("status") == "rolled_back":
+        return False
+    try:
+        data = json.loads(step.get("rollback_data") or "{}")
+    except (TypeError, ValueError):
+        return False
+    return any(data.get(key) for key in ("l2", "files", "blueprints"))
 
 
 def _describe_changes(rollback_json) -> str:

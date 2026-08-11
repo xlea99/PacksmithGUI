@@ -140,3 +140,26 @@ def test_step_exposes_bindings_and_config(pack):
     p, _, _ = pack
     assert p.step.mappings["target_items"] == "remove"
     assert p.step.config["dry_run"] is True
+
+
+def test_an_action_cannot_take_a_cell_and_then_clear_it(pack):
+    """Two individually-legal calls composing into something §3.2.1 forbids: `overwrite`
+    licenses TAKING a user cell, and an action may retract its own work — but together
+    they turn user-owned into pristine, which only the user may produce."""
+    p, staging, tags = pack
+    p.tags._policies = {policy_key("tag", REG, TAG): "overwrite"}
+    tags.assign(REG, ENTRY, TAG, True, owner="user")
+
+    p.tags.write(REG, ENTRY, TAG, False)            # legal: policy allows the take
+    with pytest.raises(ActionFailure, match="taken from its previous owner"):
+        p.tags.clear(REG, ENTRY, TAG)               # would erase the user's record
+
+
+def test_an_action_can_still_retract_what_it_created_this_step(pack):
+    """The carve-out has to survive: writing to a PRISTINE cell and then clearing it
+    leaves the world exactly as it was, and erases nobody."""
+    p, staging, tags = pack
+    p.tags.write(REG, ENTRY, TAG, True)
+    p.tags.clear(REG, ENTRY, TAG)
+    staging.commit()
+    assert tags.get_ownership(REG, ENTRY, TAG) is None

@@ -31,17 +31,33 @@ from starlark import FileLoader, Globals, LibraryExtension, Module, StarlarkErro
 from packsmith.core.pack import ActionFailure
 
 # The language surface actions get. `struct` and `partial` are load-bearing (they build
-# `pack` itself); `json` is a genuine convenience; `print` keeps a stray debugging print
-# from being a hard error. Everything omitted here simply does not exist for an action.
+# `pack` itself) and `json` is a genuine convenience. Everything omitted here simply does
+# not exist for an action.
+#
+# `LibraryExtension.Print` is deliberately ABSENT: its `print` writes to the interpreter's
+# own sink, so a stray debugging print was accepted and then vanished — allowed but
+# invisible, the one combination §7.6's TBD didn't consider, and the reading of "my code
+# didn't run" that follows is worse than an error. A `print` that routes to `pack.log`
+# is injected per-run instead (see `_inject`), which is the redirect §7.6 contemplates.
 _EXTENSIONS = [
     LibraryExtension.StructType,
     LibraryExtension.Partial,
     LibraryExtension.Json,
-    LibraryExtension.Print,
     LibraryExtension.Typing,
 ]
 
 _GLOBALS = Globals.extended_by(_EXTENSIONS)
+
+
+def _render(value) -> str:
+    """Starlark values as an author expects to see them in a log line."""
+    if value is True:
+        return "True"
+    if value is False:
+        return "False"
+    if value is None:
+        return "None"
+    return str(value)
 
 
 def _literal(value) -> str:
@@ -299,6 +315,11 @@ def _inject(module: Module, pack):
                 obj, file_must_exist=file_must_exist),
         "_fs_exists": lambda path: pack.filesystem.resolve(path).exists(),
         "_fs_ownership": lambda path: pack.filesystem.resolve(path).ownership(),
+        # §7.6: "print could be redirected to pack.log("debug", ...) for author-convenience
+        # during development." It lands in the run log with everything else the action
+        # said, so debugging output is visible where the author is already looking.
+        "print": lambda *parts: pack.log(
+            "debug", " ".join(_render(part) for part in parts)),
     }.items():
         module.add_callable(name, fn)
 

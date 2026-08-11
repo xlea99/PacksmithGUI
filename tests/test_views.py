@@ -173,3 +173,42 @@ def test_an_aggregate_view_survives_a_save_and_reload(views):
     reloaded = [v for v in views.all() if v.name == "duplicate names"][0]
     assert reloaded.query == query
     assert views.unreadable() == []
+
+
+# --- the rollback menu gate (design 3.3) ------------------------------------
+
+@pytest.mark.parametrize("status, data, offered", [
+    ("success",     {"files": {"a.json": {}}, "l2": [], "blueprints": []}, True),
+    ("failed",      {"files": {"a.json": {}}, "l2": [], "blueprints": []}, True),
+    ("failed",      {"files": {}, "l2": [], "blueprints": []},             False),
+    ("success",     {"files": {}, "l2": [{"key": ["r", "e", "t"]}], "blueprints": []}, True),
+    ("rolled_back", {"files": {"a.json": {}}, "l2": [], "blueprints": []}, False),
+])
+def test_rollback_is_offered_when_there_is_something_to_undo(status, data, offered):
+    """Not when the step "succeeded". A commit can fail having already written files —
+    the runner records how to reverse them and its reason tells the user to — and gating
+    on status made that instruction impossible to follow."""
+    import json
+    from packsmith.gui.shell.bottom_views import _has_rollback
+    step = {"status": status, "rollback_data": json.dumps(data)}
+    assert _has_rollback(step) is offered
+
+
+def test_a_missing_or_unreadable_rollback_record_offers_nothing():
+    from packsmith.gui.shell.bottom_views import _has_rollback
+    assert _has_rollback({"status": "failed", "rollback_data": None}) is False
+    assert _has_rollback({"status": "success", "rollback_data": "{not json"}) is False
+
+
+def test_unreadable_views_are_reported_not_just_skipped(views):
+    """Skipping a broken row keeps the panel alive (Q-1); reporting it is what stops the
+    view merely *vanishing*."""
+    import json
+    views.create("fine", Query(scope=Registry("minecraft:item"), select=[Id]))
+    doomed = views.create("doomed", Query(scope=Registry("minecraft:item"), select=[Id]))
+    views._db.execute("UPDATE views SET query_json = ? WHERE id = ?",
+                      (json.dumps({"node": "Nope"}), doomed.id))
+    assert [v.name for v in views.all()] == ["fine"]
+    reported = views.unreadable()
+    assert [name for _id, name, _why in reported] == ["doomed"]
+    assert reported[0][2], "the reason must be carried, not just the fact"

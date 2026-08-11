@@ -154,6 +154,21 @@ class TagStore:
     _VALID_OPS = {"eq", "neq", "in", "not_in", "gt", "lt", "gte", "lte", "exists", "not_exists"}
 
     def query(self, registry_type: str, filters: list[dict] = None, **kwargs) -> list[str]:
+        """Entry ids matching every filter — **among entries that already carry at least
+        one assignment on this registry**.
+
+        That scope is the thing to know. The SQL selects FROM ``tag_assignments``, and this
+        store has no packdump, so it does not know the universe of entries and cannot
+        return one that has no rows at all. Positive operators are unaffected (a match
+        needs a row anyway). Negative ones — ``neq``, ``not_in``, ``not_exists`` — read as
+        "…among tagged entries", NOT "…including every untagged entry": `not_exists` on a
+        tag finds entries tagged with something *else*, and a fully-pristine entry appears
+        in no result here.
+
+        Combined filters over the tagged set are exactly what this is for and are correct.
+        For a question about the whole registry, use the query engine
+        (``packsmith.core.query``) — it is given the packdump and answers over all entries.
+        """
         all_filters = list(filters) if filters else []
 
         # Convert kwargs into eq filters

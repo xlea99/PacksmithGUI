@@ -15,6 +15,7 @@ from contextlib import ExitStack
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
+from packsmith.common.logging import log
 from packsmith.core.staging import BlueprintStaging, L2Staging
 from packsmith.core.files import FileStaging
 from packsmith.core.pack import Pack, ActionFailure
@@ -59,6 +60,8 @@ def run_action(action_fn, *, tag_store, packdump, action_ref,
                 action_ref=action_ref, mappings=mappings, config=config,
                 conflict_policies=conflict_policies,
                 blueprint_staging=blueprints, blueprint_store=blueprint_store)
+    if files is not None:
+        files.logs_to(pack.log)     # its notices belong with the action's own output
 
     def _joint_transaction(l2_staging, blueprint_staging):
         """One transaction spanning every distinct database these stores write through.
@@ -68,11 +71,22 @@ def run_action(action_fn, *, tag_store, packdump, action_ref,
         that fails halfway leave nothing behind.
         """
         stack = ExitStack()
-        seen = []
-        for store in (getattr(l2_staging, "_tags", None),
-                      getattr(blueprint_staging, "_store", None)):
+        stack.covered = []      # which databases this actually wrapped
+        seen = stack.covered
+        # Duck-typed through private attributes, so a rename would silently drop the
+        # transaction and put per-statement commits back — the exact bug L3-2 fixed, with
+        # no test failing. Log it instead of degrading quietly.
+        for label, store in (("l2", getattr(l2_staging, "_tags", None)),
+                             ("blueprints", getattr(blueprint_staging, "_store", None))):
+            if store is None:
+                if label == "l2" or blueprint_staging is not None:
+                    log.warning("No %s store behind its staging — the step's flush will "
+                                "not be transactional", label)
+                continue
             db = getattr(store, "_db", None)
             if db is None or not hasattr(db, "transaction"):
+                log.warning("The %s store exposes no transactional database — the step's "
+                            "flush will not be atomic", label)
                 continue
             if any(db is other for other in seen):
                 continue
@@ -94,17 +108,29 @@ def run_action(action_fn, *, tag_store, packdump, action_ref,
         # Commit — file (open-world) engine first, so a commit-time failure leaves the
         # database untouched and cleanly discardable. Files pre-flight their existence
         # requirements, so by the time bytes are written the likely failures are gone.
-        try:
+        transaction = None      # bound before use: files.commit() can raise first, and
+        try:                    # the handler below inspects this to decide what landed
             if files is not None:
                 files.commit()
             # L2 and blueprints flush inside ONE transaction. They usually share a
             # connection, in which case this is a single COMMIT across both; when they
             # don't, each is still individually all-or-nothing instead of per-statement.
-            with _joint_transaction(l2, blueprints):
+            transaction = _joint_transaction(l2, blueprints)
+            with transaction:
                 l2.commit()
                 if blueprints is not None:
                     blueprints.commit()
         except Exception as e:
+            # A staging buffer builds its inverse AS IT GOES, so on a mid-flush failure it
+            # describes writes that SQLite has just rolled back. Recording those would make
+            # a later rollback try to undo things that never happened — and the blueprint
+            # replay does that by DELETING an instance it believes the step created, which
+            # raises after L2 and files have already been restored. Under a transaction
+            # nothing on the database side landed, so the honest record is empty.
+            if getattr(transaction, "covered", None):
+                l2.inverse = []
+                if blueprints is not None:
+                    blueprints.inverse = []
             # Buffers are dropped, but NOT the inverse records: whatever did land is
             # exactly what those describe, and they are the only way back. The database
             # side rolls itself back; files cannot, so anything already written stays and

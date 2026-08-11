@@ -24,6 +24,20 @@ from packsmith.gui.shell.tree import PanelTree
 _INHERIT = "(inherit from job)"
 
 
+def _refers_to(stored, artifact_id, label) -> bool:
+    """Does a stored binding point at this candidate?
+
+    Bindings hold ids (design 3.2.1) but legacy rows hold names, so every widget that has
+    to find "the currently bound one" must accept both. Comparing against the LABEL alone
+    is what silently unchecked every id-bound row and let OK save an empty selection.
+    """
+    if stored is None:
+        return False
+    if stored == artifact_id:
+        return True
+    return isinstance(stored, str) and stored == label
+
+
 # --- picking an action ------------------------------------------------------
 
 class ActionPickerDialog(QDialog):
@@ -108,6 +122,20 @@ class JobPickerDialog(QDialog):
         super().accept()
 
 
+def _select_stored(combo, stored):
+    """Select the row a stored binding refers to, by id or by legacy name.
+
+    `findData` alone missed every legacy name-binding and fell through to index 0 — which
+    is not "nothing selected", it is *the alphabetically first artifact*, so pressing OK
+    retargeted the step to whatever happened to sort first.
+    """
+    for i in range(combo.count()):
+        if _refers_to(stored, combo.itemData(i), combo.itemText(i)):
+            combo.setCurrentIndex(i)
+            return
+    combo.setCurrentIndex(0)
+
+
 class _EntryField(QWidget):
     """Bind one Layer 1 entry: a typed field with a browse button.
 
@@ -161,7 +189,8 @@ class _MultiSelect(QWidget):
 
     def __init__(self, candidates, current):
         super().__init__()
-        chosen = set(current or ())
+        chosen = list(current or ())
+        self._original = list(chosen)
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(3)
@@ -182,7 +211,8 @@ class _MultiSelect(QWidget):
                 item.setForeground(style.qt_colour(style.TEXT_FAINT))
             else:
                 item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
-                item.setCheckState(Qt.Checked if value in chosen else Qt.Unchecked)
+                bound = any(_refers_to(c, artifact_id, value) for c in chosen)
+                item.setCheckState(Qt.Checked if bound else Qt.Unchecked)
             self._list.addItem(item)
         self._list.setUniformItemSizes(True)
         self._list.setMaximumHeight(150)
@@ -200,9 +230,16 @@ class _MultiSelect(QWidget):
         return self._list.count()
 
     def chosen(self) -> list:
-        """Every checked row, hidden or not — filtering narrows the view, not the binding."""
-        return [self._list.item(r).data(Qt.UserRole) for r in range(self._list.count())
-                if self._list.item(r).checkState() == Qt.Checked]
+        """Every checked row, hidden or not — filtering narrows the view, not the binding.
+
+        Ordered by what was already stored, then by the list. Opening a dialog and pressing
+        OK should not rewrite a binding just because the widget enumerates candidates in a
+        different order than they were saved in.
+        """
+        picked = [self._list.item(r).data(Qt.UserRole) for r in range(self._list.count())
+                  if self._list.item(r).checkState() == Qt.Checked]
+        kept = [v for v in self._original if v in picked]
+        return kept + [v for v in picked if v not in kept]
 
 
 # --- editing one step -------------------------------------------------------
@@ -313,13 +350,11 @@ class StepEditorDialog(QDialog):
         for tag_name, definition in sorted(definitions.items()):
             if slot.tag_type and definition["type"] != slot.tag_type:
                 continue
-            combo.addItem(tag_name, tag_name)
+            combo.addItem(tag_name, binding_id(slot, tag_name, tag_store=self._tags))
         if combo.count() == 0:
             combo.addItem(f"(no {slot.tag_type or ''} tags on {slot.registry_type})", None)
             combo.setEnabled(False)
-        index = combo.findData(current)
-        if index >= 0:
-            combo.setCurrentIndex(index)
+        _select_stored(combo, current)
         return combo
 
     def _registry_entries(self, registry_type) -> list:
@@ -376,8 +411,7 @@ class StepEditorDialog(QDialog):
             combo.setEnabled(False)
         # An existing binding stays selected even if it no longer fits: opening this dialog
         # shouldn't quietly unbind a step. The run refuses instead, and says why.
-        index = combo.findData(current)
-        combo.setCurrentIndex(max(0, index))
+        _select_stored(combo, current)
 
     @staticmethod
     def _config_widget(param, current):

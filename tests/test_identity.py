@@ -199,3 +199,39 @@ def test_registry_entry_bindings_stay_strings(tags):
                        registry_type="minecraft:block")
     assert binding_id(slot, "minecraft:granite") == "minecraft:granite"
     assert binding_name(slot, "minecraft:granite") == "minecraft:granite"
+
+
+def test_the_canonical_key_is_portable_across_platforms():
+    """`os.path.normcase` on Windows also rewrites "/" to "\\", which would undo the
+    separator normalisation and make stored keys platform-specific — a profile is a folder
+    a user can move between machines."""
+    key = FileStore.key("config/foo.json")
+    assert "\\" not in key
+    assert key.count("/") == 1
+
+
+def test_one_file_staged_under_two_spellings_yields_one_snapshot(files, tmp_path):
+    """Two snapshots means the second holds the FIRST write's content, so rolling back
+    restores mid-step state instead of the file as it was."""
+    from packsmith.core.files import FileStaging
+    (tmp_path / "config").mkdir()
+    (tmp_path / "config" / "foo.json").write_text("ORIGINAL", encoding="utf-8")
+
+    staging = FileStaging(files)
+    staging.write("config/foo.json", "first", owner="action", owner_action_ref="p:a")
+    staging.write(r"config\foo.json", "second", owner="action", owner_action_ref="p:a")
+    staging.commit()
+
+    assert len(staging.snapshots) == 1
+    assert list(staging.snapshots.values())[0]["content"] == "ORIGINAL"
+    assert files.read("config/foo.json") == "second"
+
+
+def test_staged_membership_sees_the_alternate_spelling(files, tmp_path):
+    """`file_must_exist` counts files this step already staged — under either spelling."""
+    from packsmith.core.files import FileStaging
+    staging = FileStaging(files)
+    staging.write("config/new.json", "{}", owner="action", owner_action_ref="p:a")
+    staging.write(r"config\new.json", "{}", owner="action", owner_action_ref="p:a",
+                  file_must_exist=True)          # must not raise
+    assert len(staging._pending) == 1

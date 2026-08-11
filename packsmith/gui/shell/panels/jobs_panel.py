@@ -7,6 +7,14 @@ Double-click opens a job editor tab."
 The ▶ column is a one-click run. Pinning doesn't change what a job can do — it just lifts
 it into the top section, which is what makes "the three jobs I actually run" reachable in
 a list that will eventually hold dozens.
+
+**Export is not built, and it isn't a menu-item's worth of work.** §3.2.1 makes job step
+bindings identity-by-**id**, which is correct in-profile and meaningless outside one: a job
+exported as-is would carry integer ids pointing at another profile's tags. A real export
+has to translate id→name on the way out and name→id on the way in, exactly the portability
+split saved View queries already use (they bind by name for this reason). Until that
+translation exists, an "Export" item would produce files that import wrong — worse than
+absent.
 """
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
@@ -123,10 +131,17 @@ class JobsPanel(Panel):
             self.job_activated.emit(job)
 
     def _on_context_menu(self, pos):
-        job = self._job_at(self._tree.itemAt(pos))
-        if job is None:
-            return
+        self._menu_for(self._tree.itemAt(pos)).exec(self._tree.mapToGlobal(pos))
+
+    def _menu_for(self, item):
+        job = self._job_at(item)
         menu = QMenu(self)
+        if job is None:
+            # Empty space still gets a menu: "make a new one" is the action you want most
+            # when the list is empty, and an empty list is the one place with nothing to
+            # right-click.
+            menu.addAction("New Job…", lambda: self.new_job_requested.emit())
+            return menu
         menu.addAction("Run now", lambda: self.run_requested.emit(job))
         menu.addAction("Edit steps…", lambda: self.job_activated.emit(job))
         menu.addSeparator()
@@ -134,4 +149,6 @@ class JobsPanel(Panel):
                        lambda: self.pin_toggled.emit(job))
         menu.addAction("Rename…", lambda: self.rename_requested.emit(job))
         menu.addAction("Delete", lambda: self.delete_requested.emit(job))
-        menu.exec(self._tree.mapToGlobal(pos))
+        menu.addSeparator()
+        menu.addAction("New Job…", lambda: self.new_job_requested.emit())
+        return menu

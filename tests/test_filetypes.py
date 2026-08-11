@@ -76,3 +76,10 @@ def test_unreadable_files_do_not_raise(tmp_path):
 def test_every_unsupported_kind_explains_itself(kind):
     text = ft.describe(kind)
     assert text and not text.endswith("None")
+
+
+def test_a_file_that_sniffs_clean_and_goes_bad_later_still_classifies_text():
+    """Documents the limit of sniffing, and why the open path needs a guard behind it: the
+    probe is the first 8KB, so bad bytes after that are invisible here."""
+    probe = b"{" + b"a" * (ft._PROBE_BYTES - 1)
+    assert ft.classify("config/late.json", probe) == ft.TEXT

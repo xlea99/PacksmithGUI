@@ -211,6 +211,9 @@ class EditorHost(QObject):
         self._js(f"setReadOnly({self._quote(key)}, false)")
         self.unlocked.emit(key)
 
+    def is_locked(self, key: str) -> bool:
+        return key in self._locked
+
     def resync_locks(self):
         """Re-ask every open document whether it is still writable.
 
@@ -286,7 +289,11 @@ class EditorHost(QObject):
 
     def _on_save(self, key, content):
         if key in self._locked:
-            return                                   # §6.3: Ctrl+S is a no-op when locked
+            # §6.3: Ctrl+S is a no-op when locked — but a *silent* no-op reads as a bug,
+            # so say why, the same way a blocked keystroke does.
+            source, path = self._source_of(key)
+            self.edit_blocked.emit(key, source.read_only_reason(path) or "locked")
+            return
         source, path = self._source_of(key)
         try:
             source.write(path, content)

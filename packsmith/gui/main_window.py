@@ -28,7 +28,6 @@ from packsmith.gui.shell.packdump_banner import PackdumpBanner
 from packsmith.core.db import UserDB
 from packsmith.core.tags import TagStore
 from packsmith.core.revalidate import broken_steps, summarise
-from packsmith.core.runner import run_action
 from packsmith.core.packages import (
     PackageIndex, create_package, add_action, remove_action, create_file, delete_file,
     rename_file, create_folder, delete_folder, rename_folder, source_files,
@@ -239,7 +238,9 @@ class MainWindow(QMainWindow):
         self._sidebar.collapsed.connect(self._collapse_panel)
         content.addWidget(self._sidebar)
 
-        # Three panels are live on backend we already have; the rest are honest stubs.
+        # All seven panels are live now. This said "three" for a long time after the other
+        # four grew backends, which is the kind of comment that quietly teaches you the
+        # wrong shape of your own app.
         self._views_panel = ViewsPanel(self._views.all())
         self._views_panel.view_activated.connect(self._open_view)
         self._views_panel.new_view_requested.connect(self._new_view)
@@ -264,7 +265,7 @@ class MainWindow(QMainWindow):
         self._jobs_panel.pin_toggled.connect(self._toggle_pin)
 
         self._files_panel = FilesPanel(self._file_store)
-        self._files_panel.ownership_changed.connect(self._set_status)
+        self._files_panel.ownership_changed.connect(self._file_ownership_changed)
         self._files_panel.file_activated.connect(self._open_file)
 
         self._blueprints_panel = BlueprintsPanel(self._blueprints)
@@ -406,11 +407,17 @@ class MainWindow(QMainWindow):
 
     # --- blueprints --------------------------------------------------------
 
-    def _open_blueprint(self, name):
+    def _open_blueprint(self, name, instance=""):
         """Panel B: an ephemeral view over the whole blueprint — the same gesture as
-        clicking a tag, and savable the same way."""
-        return self._open_blueprint_tab(("blueprint", name), name,
-                                        blueprint_query(name))
+        clicking a tag, and savable the same way.
+
+        Clicking an *instance* opens the same tab, because a one-instance tab would be a
+        worse view of a blueprint than the grid. What it additionally does is land on that
+        instance's row instead of on row 0."""
+        tab = self._open_blueprint_tab(("blueprint", name), name, blueprint_query(name))
+        if instance and not tab.focus_instance(instance):
+            self._set_status(f"'{instance}' isn't in this view of {name}")
+        return tab
 
     def _open_blueprint_tab(self, key, title, query, view=None):
         existing = self._open_tabs.get(key)
@@ -615,12 +622,17 @@ class MainWindow(QMainWindow):
     # _build_shell).
 
     def _switch_profile(self, name: str):
-        if name == self._profile.name:
+        # From the blocked shell there is no current profile to compare against, nothing
+        # open to close and no database to shut — and entering the new one is the entire
+        # point of having just created it.
+        previous = self._profile.name if self._profile else None
+        if name == previous:
             return
         if not self._close_all_tabs():
             return                              # a dirty buffer said no
         try:
-            self._db.close()
+            if getattr(self, "_db", None) is not None:
+                self._db.close()
         except Exception:                       # closing is best-effort; the switch isn't
             log.warning("Could not close the previous profile's database", exc_info=True)
         try:
@@ -633,7 +645,13 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(f"PackSmith — {name}")
 
     def _close_all_tabs(self) -> bool:
-        """Close every open tab, honouring the unsaved-changes guard. False if cancelled."""
+        """Close every open tab, honouring the unsaved-changes guard. False if cancelled.
+
+        The blocked shell never builds a workspace, so "close everything" is vacuously
+        done — this is reached by the profile switch that is the way OUT of that state.
+        """
+        if getattr(self, "_workspace", None) is None:
+            return True
         tabs = self._workspace._tabs
         while tabs.count():
             before = tabs.count()
@@ -643,7 +661,8 @@ class MainWindow(QMainWindow):
         return True
 
     def _open_profile(self):
-        dialog = OpenProfileDialog(current=self._profile.name, parent=self)
+        dialog = OpenProfileDialog(
+            current=self._profile.name if self._profile else None, parent=self)
         dialog.exec()
         if dialog.result_name:
             self._switch_profile(dialog.result_name)
@@ -753,6 +772,12 @@ class MainWindow(QMainWindow):
             log.warning("Packdump check failed", exc_info=True)
             return
         if checked.status in ("unchanged", "missing"):
+            return
+        if getattr(self, "_blocked", None):
+            # The blocked shell's whole instruction is "run the game once, then come back",
+            # and this poll is what "come back" fires. So a dump appearing here should LEAVE
+            # the blocked state rather than try to update a window that was never built.
+            self._enter_profile(self._profile.name)
             return
         if checked.status == "imported":
             self._import_result = import_packdump(self._profile)
@@ -1033,7 +1058,19 @@ class MainWindow(QMainWindow):
             self._set_status(f"{Path(path).name} — {filetypes.describe(kind)}")
             return tab
 
-        tab = EditorTab(self._editor_host, source, path)
+        try:
+            tab = EditorTab(self._editor_host, source, path)
+        except (UnicodeDecodeError, OSError) as e:
+            # Sniffing reads the first few KB; a file can be clean there and hold bad bytes
+            # later, and a config can vanish or lock between the click and the read. The
+            # classifier makes that rare rather than impossible, so the open path still
+            # needs to survive it — this is the last guard, not the first.
+            log.info("Falling back to the placeholder for %s: %s", path, e)
+            tab = UnsupportedFileTab(path, filetypes.BINARY)
+            self._workspace.add_tab(tab, Path(path).name)
+            self._open_tabs[("doc", key)] = tab
+            self._set_status(f"{Path(path).name} — can't be opened as text ({e})")
+            return tab
         tab.unlock_requested.connect(self._request_unlock)
         self._workspace.add_tab(tab, Path(path).name)
         self._open_tabs[("doc", key)] = tab
@@ -1295,9 +1332,54 @@ class MainWindow(QMainWindow):
         self._set_status(f"You now own {rel_path} — actions are blocked from writing it.")
 
     def _on_tab_activated(self, widget):
-        """Hand the shared web view to whichever editor tab is now in front."""
+        """Hand the shared web view to whichever editor tab is now in front, and re-state
+        what the status bar is describing.
+
+        The row count used to be written once when a tab opened and never again, so after
+        switching tabs — or after an edit changed the row count — the bar described a tab
+        that wasn't in front any more. A status bar that is wrong is worse than one that is
+        empty, because you have no way to tell which."""
         if isinstance(widget, EditorTab):
             widget.activate()
+            self._set_status(self._status_for(widget))
+        else:
+            line = self._status_for(widget)
+            if line:
+                self._set_status(line)
+
+    def _status_for(self, tab) -> str:
+        if isinstance(tab, EditorTab):
+            line = self._ownership_line(tab)
+            return f"{line} — unsaved changes" if tab.is_dirty else line
+        model = self._tab_models.get(tab)
+        if model is None:
+            return ""
+        title = self._workspace.tab_title(tab) or ""
+        return f"{title.lstrip('● ')} — {model.rowCount():,} rows"
+
+    def _refresh_status(self):
+        """Re-state the bar for whatever tab is in front (after an edit, run, or save)."""
+        current = self._workspace.current_widget()
+        if current is not None:
+            line = self._status_for(current)
+            if line:
+                self._set_status(line)
+
+    def _ownership_line(self, tab) -> str:
+        """§6.3: for unstructured files ownership is whole-file, "surfaced as a status-bar
+        indicator — the decorations don't apply because there's no key granularity to
+        decorate". Per-key gutter decorations wait for the structured editor; the file's
+        own answer doesn't have to."""
+        source, path = self._editor_host.split_key(tab.key)
+        if source != "instance":
+            return path
+        ownership = self._file_store.ownership(path)
+        if ownership is None:
+            return f"{path} — untouched; editing it makes it yours"
+        if ownership["kind"] == "user":
+            return f"{path} — yours; actions are blocked from writing it"
+        who = ownership.get("action_ref") or "an action"
+        return f"{path} — managed by {who}; take ownership to edit"
 
     def _on_editor_dirty(self, key, is_dirty):
         tab = self._open_tabs.get(("doc", key))
@@ -1306,6 +1388,11 @@ class MainWindow(QMainWindow):
         tab.set_dirty(is_dirty)
         name = Path(tab.path).name
         self._workspace.set_tab_title(tab, f"● {name}" if is_dirty else name)
+        # §4.1 wants unsaved state visible. The tab title's dot carries it, but the title
+        # is easy to miss on a tab that isn't in front — so the bar says it in words for
+        # the one that is.
+        if self._workspace.current_widget() is tab:
+            self._refresh_status()
 
     def _on_document_saved(self, key):
         source, path = self._editor_host.split_key(key)
@@ -1324,6 +1411,17 @@ class MainWindow(QMainWindow):
         if answer == QMessageBox.Cancel:
             return False
         if answer == QMessageBox.Save:
+            # Returning True closes the tab, which disposes the Monaco model — so this
+            # asks for a save and then immediately destroys the thing holding the text.
+            # It is safe for two reasons, both worth stating because neither is obvious:
+            #   1. The buffer is read on the JS side. `request_save` and `closeModel` are
+            #      queued to the renderer in that order, so the text is captured before
+            #      the model dies; only the *notification* comes back asynchronously.
+            #   2. `_on_save` writes through the DocumentSource, which needs the key and
+            #      the content — not the model. It works fine after the tab is gone.
+            # Break either and this silently discards the user's edits, so if the save
+            # path ever stops going through the JS queue, this needs a real veto-then-
+            # close-on-`file_saved` handshake instead.
             self._editor_host.request_save(widget.key)
         return True
 
@@ -1364,8 +1462,11 @@ class MainWindow(QMainWindow):
 
     def _new_view(self):
         """Author a new View: saved to the database, filed in the Views panel, opened."""
-        dlg = QueryConstructorDialog(self._tags, "minecraft:item", new_view=True,
-                                     view_store=self._views, parent=self)
+        registries = sorted(self._packdump.registry)
+        dlg = QueryConstructorDialog(
+            self._tags, "minecraft:item" if "minecraft:item" in registries
+            else (registries[0] if registries else "minecraft:item"),
+            new_view=True, view_store=self._views, parent=self, registries=registries)
         if not dlg.exec():
             return
         try:
@@ -1412,6 +1513,15 @@ class MainWindow(QMainWindow):
 
     def _reload_views(self):
         self._views_panel.set_views(self._views.all())
+        # A view that couldn't be decoded is skipped rather than taking the panel down
+        # (Q-1) — but skipped silently is just a view that vanished. Say so.
+        broken = self._views.unreadable()
+        if broken:
+            names = ", ".join(f"'{name}'" for _id, name, _why in broken[:4])
+            more = f" and {len(broken) - 4} more" if len(broken) > 4 else ""
+            self._set_status(
+                f"{len(broken)} view(s) could not be loaded: {names}{more} — "
+                f"{broken[0][2]}")
 
     # --- tags --------------------------------------------------------------
 
@@ -1493,6 +1603,21 @@ class MainWindow(QMainWindow):
         for key in self._editor_host.resync_locks():
             self._set_status(f"{key.split(':', 1)[-1]} was changed by this run — "
                              f"it's now locked; reload it to see the new contents")
+
+    def _file_ownership_changed(self, message):
+        """Ownership moved from the Files panel — so an open tab's lock may be stale.
+
+        The panel and the editor decide lock state from the same source, but at different
+        moments: the tab decided when it opened. Taking a file from an action in the panel
+        used to leave the tab showing a lock banner over a buffer that was now perfectly
+        saveable, with an unlock button that did nothing. Same staleness the run path fixed
+        (see :meth:`_after_run`), reached from the other direction.
+        """
+        freed = [key for key in self._editor_host.resync_locks()
+                 if not self._editor_host.is_locked(key)]
+        if freed:
+            message += "  The open tab is editable now."
+        self._set_status(message)
 
     def _delete_tag(self, registry_type, tag_name):
         """Undefine a tag. §3.2.1: this cascades to every assignment, so the confirmation
