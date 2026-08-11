@@ -31,6 +31,9 @@ class JobStep:
     on_error: str = None            # None = inherit the job's default
     bindings: dict = field(default_factory=dict)
     config: dict = field(default_factory=dict)
+    # {slot: name | [names]} — what the bound TAGS were called when this step was saved.
+    # Compared against their current names to decide whether a relink is owed (3.2.1).
+    bound_names: dict = field(default_factory=dict)
 
     @property
     def is_action(self) -> bool:
@@ -140,9 +143,10 @@ class JobStore:
         return [self._row_to_step(r) for r in rows]
 
     def add_action_step(self, job_id: int, action_ref: str, *, bindings: dict = None,
-                        config: dict = None, on_error: str = None) -> JobStep:
+                        config: dict = None, on_error: str = None,
+                        bound_names: dict = None) -> JobStep:
         return self._add_step(job_id, "action", action_ref=action_ref, bindings=bindings,
-                              config=config, on_error=on_error)
+                              config=config, on_error=on_error, bound_names=bound_names)
 
     def add_job_step(self, job_id: int, ref_job_id: int, *, on_error: str = None) -> JobStep:
         """Nest another job. Rejected at creation time if it would create a cycle
@@ -155,7 +159,11 @@ class JobStore:
                 f"'{self._name_of(job_id)}' — that would be a cycle")
         return self._add_step(job_id, "job_ref", ref_job_id=ref_job_id, on_error=on_error)
 
-    def update_step(self, step_id: int, *, bindings=None, config=None, on_error=_UNSET):
+    def update_step(self, step_id: int, *, bindings=None, config=None, on_error=_UNSET,
+                    bound_names=None):
+        if bound_names is not None:
+            self._db.execute("UPDATE job_steps SET bound_names = ? WHERE id = ?",
+                             (json.dumps(bound_names) if bound_names else None, step_id))
         if bindings is not None:
             self._db.execute("UPDATE job_steps SET bindings = ? WHERE id = ?",
                              (json.dumps(bindings), step_id))
@@ -167,6 +175,17 @@ class JobStore:
                 raise ValueError(f"Invalid on_error: '{on_error}'")
             self._db.execute("UPDATE job_steps SET on_error = ? WHERE id = ?",
                              (on_error, step_id))
+
+    def relink_step(self, step_id: int, bound_names: dict):
+        """Accept a step's current bindings under their new names (design 3.2.1).
+
+        The gesture the rename ceremony asks for. Nothing about *what* the step targets
+        changes — it was always the same tag id — so this rewrites only the record of what
+        that tag was called, which is what the run-time comparison consults. Confirming is
+        the point: the user is asserting the step still means what they want it to mean.
+        """
+        self._db.execute("UPDATE job_steps SET bound_names = ? WHERE id = ?",
+                         (json.dumps(bound_names) if bound_names else None, step_id))
 
     def remove_step(self, step_id: int):
         self._db.execute("DELETE FROM job_steps WHERE id = ?", (step_id,))
@@ -206,7 +225,7 @@ class JobStore:
     # --- helpers -----------------------------------------------------------
 
     def _add_step(self, job_id, kind, *, action_ref=None, ref_job_id=None,
-                  bindings=None, config=None, on_error=None) -> JobStep:
+                  bindings=None, config=None, on_error=None, bound_names=None) -> JobStep:
         if on_error is not None and on_error not in ON_ERROR:
             raise ValueError(f"Invalid on_error: '{on_error}'")
         if self.get(job_id) is None:
@@ -216,13 +235,15 @@ class JobStore:
         position = (row["p"] + 1) if row and row["p"] is not None else 0
         cur = self._db.execute(
             """INSERT INTO job_steps (job_id, position, kind, action_ref, ref_job_id,
-                                      on_error, bindings, config)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                                      on_error, bindings, config, bound_names)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (job_id, position, kind, action_ref, ref_job_id, on_error,
-             json.dumps(bindings or {}), json.dumps(config or {})))
+             json.dumps(bindings or {}), json.dumps(config or {}),
+             json.dumps(bound_names) if bound_names else None))
         return JobStep(id=cur.lastrowid, job_id=job_id, position=position, kind=kind,
                        action_ref=action_ref, ref_job_id=ref_job_id, on_error=on_error,
-                       bindings=dict(bindings or {}), config=dict(config or {}))
+                       bindings=dict(bindings or {}), config=dict(config or {}),
+                       bound_names=dict(bound_names or {}))
 
     def _reaches(self, from_job_id: int, target_job_id: int) -> bool:
         """Is target reachable by following job-references out of from_job?"""
@@ -265,4 +286,5 @@ class JobStore:
             on_error=row["on_error"],
             bindings=json.loads(row["bindings"]) if row["bindings"] else {},
             config=json.loads(row["config"]) if row["config"] else {},
+            bound_names=json.loads(row["bound_names"]) if row["bound_names"] else {},
         )

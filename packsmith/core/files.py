@@ -321,6 +321,19 @@ class FileStaging:
     def has_pending(self) -> bool:
         return bool(self._pending)
 
+    def pending(self) -> list:
+        """What this buffer WOULD write, as plain data.
+
+        The content is carried, not just the path: for a file the question "what would
+        this action do" is answered by the bytes, and a preview that only listed paths
+        would be a table of contents rather than a preview.
+        """
+        return sorted(
+            ({"engine": "file", "path": path, "action": "write",
+              "value": staged["content"], "owner": staged["owner"]}
+             for path, staged in self._pending.items()),
+            key=lambda d: d["path"])
+
     def commit(self):
         # No existence pre-flight here any more, deliberately. §7.3 puts that guard "at the
         # moment of the call", and `FileStaging.write` now enforces it — so by the time a

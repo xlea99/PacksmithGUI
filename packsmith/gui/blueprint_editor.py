@@ -245,6 +245,33 @@ class _OverridePanel(QWidget):
                 for path, (box, field) in self._rows.items() if box.isChecked()}
 
 
+def _dismiss(picker):
+    """Retire a picker, tolerating one that Qt has already deleted underneath us.
+
+    A picker dismisses itself when its cell editor is destroyed, so by the time the next
+    edit begins the tab's reference can point at a C++ object that no longer exists —
+    and PySide raises on any use of the wrapper, not just on a bad call.
+    """
+    if picker is None:
+        return
+    try:
+        picker.dismiss()
+    except RuntimeError:
+        pass        # already gone, which is what we wanted
+
+
+def _disconnect(signal, slot):
+    """Drop a connection without caring whether it is still there.
+
+    The picker outlives none of these, but Qt tears widgets down in an order Python does
+    not control, so the scrollbar can outlive the popup and keep calling into it.
+    """
+    try:
+        signal.disconnect(slot)
+    except (RuntimeError, TypeError):
+        pass
+
+
 class _InstanceGrid(QTableWidget):
     """The instance table, with the keys a grid is expected to have.
 
@@ -255,8 +282,33 @@ class _InstanceGrid(QTableWidget):
     def __init__(self, tab):
         super().__init__()
         self._tab = tab
+        self._pressed_cell = None
+
+    def mousePressEvent(self, event):
+        """Remember where the user just clicked, for exactly one reader.
+
+        Clicking cell B is what ends an edit in cell A, and the sequence that follows is
+        awkward: A commits, the grid is rebuilt from scratch (losing all selection), and
+        only then does Qt open B's editor — without re-setting the current cell, because
+        it already did that during this press. So whoever restores selection after a commit
+        has to know that the user's intent has moved to B, and the press is the only place
+        that fact exists.
+        """
+        index = self.indexAt(event.position().toPoint())
+        self._pressed_cell = (index.row(), index.column()) if index.isValid() else None
+        super().mousePressEvent(event)
+
+    def take_pressed_cell(self):
+        """Read-and-clear, so a click can only redirect the *next* commit. A stale press
+        from five minutes ago must not move the cursor after an Enter."""
+        cell, self._pressed_cell = self._pressed_cell, None
+        return cell
 
     def keyPressEvent(self, event):
+        # Any keystroke means the user is driving from the keyboard, so the last click
+        # stops speaking for them: click A, arrow to C, press Enter — the commit belongs
+        # to C, and a stale press would drag the cursor back to A.
+        self._pressed_cell = None
         key = event.key()
         index = self.currentIndex()
         editing = self.state() == QAbstractItemView.EditingState
@@ -377,6 +429,7 @@ class BlueprintEditorTab(QWidget):
         self._sticky = {}              # the last slot's type/registry, for the next one
         self._tree_items = {}          # slot path -> its row in the schema tree
         self._picker = None            # the open suggestion popup, kept alive
+        self._picker_cell = None       # (row, column) it is attached to, if any
         # Candidate templates (design 5.3) live in the View's renderer_config — a
         # recommendation is a knob on the renderer, never part of the blueprint (§5.3 Part
         # B: strip every one and the blueprint is byte-for-byte still itself). An unsaved
@@ -546,9 +599,9 @@ class BlueprintEditorTab(QWidget):
             return
         # Held on the tab, not just in a local: the only other owner is the Qt parent, and
         # a popup that gets collected mid-show is a window that vanishes for no reason.
-        if self._picker is not None:
-            self._picker.close()
+        _dismiss(self._picker)
         self._picker = picker
+        self._picker_cell = None       # cursor-anchored, not attached to a cell's editor
         where = QCursor.pos()
         # Opened from a *later* event loop turn. A Qt.Popup grabs the mouse, and showing
         # one inside the click (or the context menu) that spawned it means the release
@@ -567,24 +620,50 @@ class BlueprintEditorTab(QWidget):
         many results a filter happened to return, which is unpredictable from the outside —
         and the widget is bounded and scrollable now, so a long list is no longer a wall.
         """
-        if self._picker is not None:
-            self._picker.close()
-        picker = PickerPopup(candidates, header=note, parent=self, attach=editor)
+        _dismiss(self._picker)
+        # Docked INTO the viewport rather than floating above it. As a top-level window it
+        # was positioned in screen coordinates once, so moving the main window left the
+        # suggestions behind, hovering over the desktop next to a cell that had walked
+        # away. A child of the viewport moves with the window because it is part of it —
+        # there is no position to keep up to date.
+        viewport = self._grid.viewport()
+        picker = PickerPopup(candidates, header=note, attach=editor, dock=viewport)
         self._picker = picker
+        self._picker_cell = (row, column)
+        picker.dismissed.connect(lambda: self._forget_picker(picker))
+        picker.destroyed.connect(lambda *_: self._forget_picker(picker))
 
         def anchor():
-            # Re-resolved at open time rather than captured: the row can scroll between
-            # the editor opening and the popup appearing.
-            index = self._grid.model().index(row, column)
-            rect = self._grid.visualRect(index)
-            picker.popup_under(QRect(self._grid.viewport().mapToGlobal(rect.topLeft()),
-                                     rect.size()))
+            # Re-resolved every time rather than captured: the row moves under the popup
+            # whenever the grid scrolls, and `visualRect` is already in viewport
+            # coordinates — the same ones the docked picker is positioned in.
+            if self._picker is not picker:
+                # Superseded: another cell owns the suggestions now. Its handler stays
+                # connected until Qt gets round to deleting it, and repositioning would
+                # call show() — which is how dragging across a row left a trail of them.
+                return
+            try:
+                rect = self._grid.visualRect(self._grid.model().index(row, column))
+                if rect.isValid() and rect.intersects(viewport.rect()):
+                    picker.dock_under(rect)
+                else:
+                    picker.hide()      # the cell scrolled out of sight; so does its list
+            except RuntimeError:
+                # A scrollbar can outlive the widgets this closure captured when the whole
+                # tab is torn down; Qt deletes in an order Python does not control.
+                pass
 
         # A later turn, so the popup isn't born inside the double-click that opened the
         # editor. Typing re-opens it, so Escape dismisses without ending the session.
         QTimer.singleShot(0, anchor)
         editor.textChanged.connect(
             lambda text: None if picker.isVisible() else anchor())
+        # Scrolling moves the cell within the viewport, and the popup has to travel with
+        # it — being a child only makes it follow the *window*, not the scroll.
+        for bar in (self._grid.verticalScrollBar(), self._grid.horizontalScrollBar()):
+            bar.valueChanged.connect(anchor)
+            picker.destroyed.connect(
+                lambda *_, b=bar: _disconnect(b.valueChanged, anchor))
         return picker
 
     def suggestion_picker(self, row=None, column=None):
@@ -1005,18 +1084,69 @@ class BlueprintEditorTab(QWidget):
         self.changed.emit()
         self._keep_cell(row, column)
 
+    def _forget_picker(self, picker):
+        """Drop the tab's reference when a picker retires, so nothing later asks a dead
+        widget to reposition itself."""
+        if self._picker is picker:
+            self._picker = None
+            self._picker_cell = None
+
+    def _editing_elsewhere(self, row, column) -> bool:
+        """Is the user's attention already on a different cell than (row, column)?
+
+        Two independent signals, because they become true at different moments during a
+        cell-to-cell double-click: the view enters EditingState on the new cell, and the
+        suggestion picker re-attaches to the new cell's editor.
+        """
+        current = self._grid.currentIndex()
+        if (self._grid.state() == QAbstractItemView.EditingState
+                and current.isValid() and (current.row(), current.column()) != (row, column)):
+            return True
+        return (self._picker is not None and self._picker.isVisible()
+                and self._picker_cell not in (None, (row, column)))
+
     def _keep_cell(self, row, column):
-        """Leave the keyboard where the edit was.
+        """Leave the cursor where the user's attention is.
 
         `reload()` rebuilds the grid wholesale, so finishing an edit dropped the current
         cell and with it the ability to arrow onward — every next cell cost a mouse click.
         Deferred a turn because the view is still tearing down its editor at this point and
         would clobber a selection set now.
+
+        Which cell that *is* depends on how the edit ended. Enter or focus-out ends it in
+        place, and the answer is the cell that was being edited. Clicking a different cell
+        also ends it — and then restoring the old cell is actively wrong: it leaves the
+        highlight on the cell you left while the editor opens on the one you clicked. Qt
+        set the current cell during that press and won't set it again, so if this puts it
+        back, nothing corrects it afterwards.
         """
+        # Shared by both passes below: whichever one first sees a press decides the target,
+        # and the other must not undo it. `take_pressed_cell` is read-and-clear, so without
+        # this the second pass reads None and falls back to the cell being left.
+        target = [(row, column)]
+
         def restore():
-            if row < self._grid.rowCount() and column < self._grid.columnCount():
-                self._grid.setCurrentCell(row, column)
-                self._grid.setFocus(Qt.OtherFocusReason)
+            # Read the press HERE rather than in `_keep_cell`, because of the order the
+            # events actually arrive in — verified by instrumenting the real sequence:
+            #
+            #   1. the click takes focus from the editor, which closes and COMMITS it,
+            #      so this whole function runs before the click reaches the view;
+            #   2. `mousePressEvent` then selects the clicked cell and records it;
+            #   3. the deferred pass below runs — and only now is the press visible.
+            #
+            # Read a step earlier and it is always None, which is why following the press
+            # appeared to do nothing.
+            pressed = self._grid.take_pressed_cell()
+            if pressed is not None and pressed != (row, column):
+                target[0] = pressed        # follow the click, don't fight it
+            at_row, at_column = target[0]
+
+            if at_row >= self._grid.rowCount() or at_column >= self._grid.columnCount():
+                return
+            if self._editing_elsewhere(at_row, at_column):
+                return
+            self._grid.setCurrentCell(at_row, at_column)
+            self._grid.setFocus(Qt.OtherFocusReason)
 
         # Twice on purpose: now, so the grid never renders a frame with nothing selected,
         # and again next turn, because closing the editor happens after this returns and

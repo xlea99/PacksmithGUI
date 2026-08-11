@@ -145,3 +145,43 @@ class ViewStore:
             renderer_config=json.loads(raw_config) if raw_config else {},
             position=row["position"],
         )
+
+
+def _rewrite_tag_name(node, old: str, new: str) -> bool:
+    """Rewrite ``Tag("old")`` to ``Tag("new")`` in a SERIALIZED query, in place.
+
+    Works on the JSON form rather than the AST because that is what is stored, and because
+    it needs no knowledge of which node types can contain a Tag — a new node type added
+    later is covered without touching this. Returns whether anything changed.
+    """
+    changed = False
+    if isinstance(node, dict):
+        if node.get("node") == "Tag" and node.get("name") == old:
+            node["name"] = new
+            changed = True
+        for value in node.values():
+            changed |= _rewrite_tag_name(value, old, new)
+    elif isinstance(node, list):
+        for item in node:
+            changed |= _rewrite_tag_name(item, old, new)
+    return changed
+
+
+def rename_tag_in_views(view_store, old: str, new: str) -> list[str]:
+    """Point every saved View's query at a tag's new name. Returns the names rewritten.
+
+    §3.2.1: "Saved View queries (things that only *observe*) are rewritten automatically…
+    No prompt, no breakage." That is the quiet half of the loud-when-it-acts rule — a View
+    can only look, so making the user relink one would be ceremony protecting nothing.
+
+    Views reference tags **by name** (unlike job steps, which use ids) precisely so a View
+    stays portable between profiles, which is what makes this rewrite necessary rather
+    than free.
+    """
+    renamed = []
+    for view in view_store.all():
+        payload = to_dict(view.query)
+        if _rewrite_tag_name(payload, old, new):
+            view_store.update_query(view.id, from_dict(payload))
+            renamed.append(view.name)
+    return renamed

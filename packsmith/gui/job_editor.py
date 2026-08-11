@@ -15,7 +15,8 @@ from PySide6.QtWidgets import (
     QAbstractItemView, QMessageBox, QListWidget, QListWidgetItem,
 )
 
-from packsmith.core.bindings import binding_id, binding_name, mapping_mismatches
+from packsmith.core.bindings import (
+    binding_id, binding_name, mapping_mismatches, record_names, step_problems)
 from packsmith.core.shapes import describe_shape
 from packsmith.gui.shell import style
 from packsmith.gui.shell.picker import PickerPopup, _token_match
@@ -569,6 +570,18 @@ class JobEditorTab(QWidget):
         self._default_policy.blockSignals(False)
 
         self._tree.clear()
+        # One pass, from the same function the pre-flight gate and the Jobs panel use, so
+        # the ⚠ here can never disagree with what happens when you press play.
+        self._problems = {}
+        if self._packages is not None:
+            try:
+                for problem in step_problems(job, package_index=self._packages,
+                                             tag_store=self._tags,
+                                             blueprint_store=self._blueprints,
+                                             packdump=self._dump):
+                    self._problems.setdefault(problem.step_id, []).append(problem)
+            except Exception:        # a cosmetic check must never stop the tab opening
+                pass
         for index, step in enumerate(job.steps, start=1):
             if step.is_action:
                 what = step.action_ref
@@ -587,11 +600,17 @@ class JobEditorTab(QWidget):
             # 3.2.2: a step whose mapping no longer validates "is flagged as needing
             # attention". It already refuses to run — this is what stops that being a
             # surprise at run time, long after the schema edit that caused it.
-            reasons = self._step_problems(step)
-            if reasons:
+            found = self._problems.get(step.id, [])
+            if found:
+                # Amber when a relink would fix it, red when the binding is actually
+                # broken: "confirm this still means what you want" and "this points at
+                # nothing" are different amounts of trouble, and §3.2.1 treats them
+                # differently, so they should not look the same.
+                relink_only = all(p.needs_relink for p in found)
                 item.setText(1, f"⚠ {what}")
-                item.setForeground(1, style.qt_colour(style.ERROR))
-                item.setToolTip(1, "\n".join(reasons))
+                item.setForeground(1, style.qt_colour(
+                    style.WARNING if relink_only else style.ERROR))
+                item.setToolTip(1, chr(10).join(p.detail for p in found))
             self._tree.addTopLevelItem(item)
         for col in range(self._tree.columnCount()):
             self._tree.resizeColumnToContents(col)
@@ -701,8 +720,13 @@ class JobEditorTab(QWidget):
                                packdump=self._dump)
         if not dlg.exec():
             return
+        # Re-record what the bound tags are called. Saving a step is an assertion that it
+        # means what you want, which is exactly what a relink asserts (design 3.2.1) — so
+        # editing a step through this dialog also clears any relink it owed.
         self._jobs.update_step(step.id, bindings=dlg.result_bindings,
-                               config=dlg.result_config, on_error=dlg.result_on_error)
+                               config=dlg.result_config, on_error=dlg.result_on_error,
+                               bound_names=record_names(manifest, dlg.result_bindings,
+                                                        tag_store=self._tags))
         self._touched()
 
     def _remove_step(self):

@@ -287,6 +287,13 @@ class UserDB:
         # Orphan state arrived with blueprint schema evolution (design 3.2.2), after the
         # instances table already existed in some profiles.
         self._add_column_if_missing("blueprint_instances", "orphaned_by", "INTEGER")
+        # What each TAG binding was called when the step was bound (design 3.2.1 rename).
+        # A sibling column rather than a richer `bindings` value on purpose: the binding
+        # payload is read by six call sites in five shapes, and none of them need to know
+        # this exists. Steps written before this shipped have NULL, which reads as "no
+        # recorded name" and therefore "nothing to contradict" — correct, because rename
+        # did not exist to have been used.
+        self._add_column_if_missing("job_steps", "bound_names", "TEXT")
         self._conn.commit()
 
     def _add_column_if_missing(self, table: str, column: str, definition: str):

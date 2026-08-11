@@ -7,10 +7,14 @@ Tags are grouped by registry type because a definition is **scoped to one regist
 (design 3.2.1): `remove` on items is a different tag from `remove` on blocks, and the
 panel should make that structural, not incidental.
 
-Live today: listing, creating (＋ New Tag), deleting (right-click → Delete), and the
-quick-action (double-click → a minimal view for that tag). **Rename and retype are absent
-on purpose** — §3.2.1's Tag Schema Evolution makes rename a loud operation that must relink
-bound job steps, and forbids retype outright; neither ceremony is built yet.
+Live today: listing, creating (＋ New Tag), renaming, deleting (right-click), and the
+quick-action (double-click → a minimal view for that tag).
+
+**Rename carries §3.2.1's full ceremony**, which is the interesting part: it states its
+blast radius first, then rewrites saved Views silently and gates every bound job step until
+the user relinks it. **Retype remains absent on purpose** — §3.2.1 forbids it rather than
+deferring it, because a tag has no structure to preserve and changing its type invalidates
+its values rather than reshaping them.
 """
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
@@ -31,6 +35,7 @@ class TagsPanel(Panel):
     new_tag_requested = Signal()
     delete_tag_requested = Signal(str, str)   # registry type, tag name
     edit_values_requested = Signal(str, str)  # registry type, tag name (enum tags only)
+    rename_tag_requested = Signal(str, str)   # registry type, tag name
 
     def __init__(self, tag_store, parent=None):
         super().__init__("Tags", parent)
@@ -82,8 +87,10 @@ class TagsPanel(Panel):
         if definition and definition["type"] == "enum":
             menu.addAction("Edit values…",
                            lambda: self.edit_values_requested.emit(reg_type, tag_name))
+        menu.addAction("Rename…", lambda: self.rename_tag_requested.emit(reg_type, tag_name))
         menu.addSeparator()
-        # Rename/retype deliberately absent — see module docstring and §3.2.1.
+        # Retype stays absent: §3.2.1 forbids it outright ("a tag has no structure to
+        # preserve"), and undefine-and-redefine is the honest expression of that.
         menu.addAction("Delete tag…",
                        lambda: self.delete_tag_requested.emit(reg_type, tag_name))
         menu.exec(self._tree.mapToGlobal(pos))

@@ -66,6 +66,23 @@ class L2Staging:
     def has_pending(self) -> bool:
         return bool(self._pending)
 
+    def pending(self) -> list:
+        """What this buffer WOULD write, as plain data — design 3.3's dry run, read.
+
+        Sorted and free of internals so two runs of the same action can be compared
+        directly; that comparison is the whole point (see `runner.preview_step`).
+        """
+        described = []
+        for (registry_type, entry_id, tag_name), staged in self._pending.items():
+            described.append({
+                "engine": "tag", "registry_type": registry_type, "entry_id": entry_id,
+                "tag": tag_name,
+                "action": "delete" if staged is _DELETE else "write",
+                "value": None if staged is _DELETE else staged["value"],
+                "owner": None if staged is _DELETE else staged["owner"],
+            })
+        return sorted(described, key=lambda d: (d["registry_type"], d["entry_id"], d["tag"]))
+
     def commit(self):
         """Flush every staged write to the store, capturing each cell's PRIOR
         (existence, value, owner) into ``self.inverse`` first — the record the
@@ -169,6 +186,25 @@ class BlueprintStaging:
     @property
     def has_pending(self) -> bool:
         return bool(self._pending or self._new_instances)
+
+    def pending(self) -> list:
+        """What this buffer WOULD write, as plain data. Instance creations are included:
+        they are staged too, so a dry run that omitted them would under-report."""
+        described = [
+            {"engine": "blueprint", "blueprint": blueprint, "instance": instance,
+             "slot": None, "action": "create", "value": None, "owner": created_by}
+            for (blueprint, instance), created_by in self._new_instances.items()
+        ]
+        for (blueprint, instance, slot_path), staged in self._pending.items():
+            described.append({
+                "engine": "blueprint", "blueprint": blueprint, "instance": instance,
+                "slot": slot_path,
+                "action": "unbind" if staged is _DELETE else "bind",
+                "value": None if staged is _DELETE else staged["value"],
+                "owner": None if staged is _DELETE else staged["owner"],
+            })
+        return sorted(described,
+                      key=lambda d: (d["blueprint"], d["instance"], d["slot"] or ""))
 
     def commit(self):
         self.inverse = []

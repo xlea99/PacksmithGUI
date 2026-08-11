@@ -32,7 +32,8 @@ from packsmith.core.packages import (
     PackageIndex, create_package, add_action, remove_action, create_file, delete_file,
     rename_file, create_folder, delete_folder, rename_folder, source_files,
 )
-from packsmith.core.bindings import best_guess_bindings, resolve_step
+from packsmith.core.bindings import (
+    best_guess_bindings, record_names, resolve_step, step_problems)
 from packsmith.core import filetypes
 from packsmith.core.files import FileStore
 from packsmith.core.history import StepRunStore, JobRunStore
@@ -68,6 +69,7 @@ from packsmith.gui.blueprint_editor import BlueprintEditorTab, NewBlueprintDialo
 from packsmith.gui.action_editor import (
     NewActionDialog, NewFileDialog, NewFolderDialog, RenameFileDialog,
 )
+from packsmith.gui.jar_viewer import JarViewerTab
 from packsmith.gui.job_editor import JobEditorTab
 from packsmith.gui.table.registry_table_model import RegistryTableModel
 from packsmith.gui.table.registry_sort_proxy import RegistrySortProxy
@@ -255,8 +257,9 @@ class MainWindow(QMainWindow):
         self._tags_panel.new_tag_requested.connect(self._new_tag)
         self._tags_panel.delete_tag_requested.connect(self._delete_tag)
         self._tags_panel.edit_values_requested.connect(self._edit_enum_values)
+        self._tags_panel.rename_tag_requested.connect(self._rename_tag)
 
-        self._jobs_panel = JobsPanel(self._jobs.all())
+        self._jobs_panel = JobsPanel(self._jobs.all(), readiness=self._job_problems)
         self._jobs_panel.job_activated.connect(self._open_job_editor)
         self._jobs_panel.run_requested.connect(self._run_job)
         self._jobs_panel.new_job_requested.connect(self._new_job)
@@ -350,6 +353,7 @@ class MainWindow(QMainWindow):
         results.rolled_back.connect(self._on_rolled_back)
         self._bottom.set_panel("job_results", results)
         errors = ErrorsView(self._tags, self._packdump,
+                            job_store=self._jobs, package_index=self._packages,
                             blueprint_store=self._blueprints)
         errors.resolved.connect(self._on_orphans_resolved)
         self._bottom.set_panel("errors", errors)
@@ -598,6 +602,23 @@ class MainWindow(QMainWindow):
         self._reload_blueprint_tabs()
         self._after_blueprint_change()
         return True
+
+    def _reload_job_tabs(self):
+        """Re-read every open job editor from the store.
+
+        Same blind spot `_reload_blueprint_tabs` exists for: a job tab renders itself
+        rather than going through `_tab_models`, so refreshing the models leaves it
+        showing whatever was true when it opened. That matters more now that the tab flags
+        unrunnable steps — deleting a tag would grey a job in the sidebar while its open
+        tab still showed the step as perfectly fine, which is a worse state than not
+        flagging at all: two surfaces disagreeing about the same fact.
+        """
+        for (kind, _key), tab in list(self._open_tabs.items()):
+            if kind == "job" and isinstance(tab, JobEditorTab):
+                try:
+                    tab.refresh()
+                except RuntimeError:
+                    pass        # the tab was closed while we walked
 
     def _reload_blueprint_tabs(self):
         """Re-read every open blueprint view from the store.
@@ -1051,6 +1072,16 @@ class MainWindow(QMainWindow):
         # double-clicking one is ordinary rather than perverse. The NBT and JAR editors are
         # a sanctioned deferral; reaching them through a decode crash is not.
         kind = self._file_kind(source, path)
+        if kind == filetypes.ARCHIVE and source == "instance":
+            # §6.5, step one. Only for instance files: a package's own source tree isn't
+            # an archive, and a jar in `userdata/` would be PackSmith's business rather
+            # than the pack's.
+            tab = JarViewerTab(self._file_store.root / path)
+            tab.status.connect(self._set_status)
+            self._workspace.add_tab(tab, Path(path).name)
+            self._open_tabs[("doc", key)] = tab
+            self._set_status(f"{Path(path).name} — {tab._summary.text()}")
+            return tab
         if kind != filetypes.TEXT:
             tab = UnsupportedFileTab(path, kind)
             self._workspace.add_tab(tab, Path(path).name)
@@ -1583,6 +1614,12 @@ class MainWindow(QMainWindow):
     def _refresh_after_tag_change(self):
         for model in self._tab_models.values():
             model.reevaluate()
+        # A tag is part of a job's contract, not just of a view's columns: deleting or
+        # renaming one can make a step unrunnable (design 3.2.1). Both surfaces that say
+        # so have to hear about it, or the sidebar greys a job while its open tab still
+        # shows the step as fine — two places disagreeing about one fact.
+        self._jobs_panel.refresh()
+        self._reload_job_tabs()
         self._bottom.refresh_panels()
 
     def _refresh_after_run(self):
@@ -1619,6 +1656,73 @@ class MainWindow(QMainWindow):
             message += "  The open tab is editable now."
         self._set_status(message)
 
+    def _job_problems(self, job):
+        """Why ``job`` would refuse to run, without running it (design 3.2.1).
+
+        The same function the pre-flight gate uses, so the colour in the panel and the
+        behaviour on pressing play can never disagree — a job painted runnable that then
+        refuses would be worse than not colouring at all.
+        """
+        try:
+            return step_problems(self._jobs.get(job.id), package_index=self._packages,
+                                 tag_store=self._tags, blueprint_store=self._blueprints,
+                                 packdump=self._packdump)
+        except Exception:            # never let a cosmetic check break the panel
+            return []
+
+    def _rename_tag(self, registry_type, tag_name):
+        """Rename a tag, stating both blast radii first (design 3.2.1).
+
+        The two consequences are reported separately because they are genuinely different
+        in kind, and the difference *is* the rule: Views only observe, so they follow
+        silently; job steps act, so they stop until relinked. Saying "3 views and 2 steps
+        are affected" as one number would hide that half of it needs nothing from you and
+        half of it will not run until it does.
+        """
+        new_name, ok = QInputDialog.getText(self, "Rename Tag", "New name:", text=tag_name)
+        new_name = (new_name or "").strip()
+        if not ok or not new_name or new_name == tag_name:
+            return
+
+        preview = self._tags.preview_rename(
+            registry_type, tag_name, new_name, view_store=self._views,
+            job_store=self._jobs, package_index=self._packages)
+        detail = ""
+        if preview["views"]:
+            detail += (f"\n\n{len(preview['views'])} saved view(s) will follow "
+                       f"automatically:\n  " + "\n  ".join(preview["views"]))
+        if preview["steps"]:
+            detail += ("\n\nThese job steps are bound to it and will REFUSE TO RUN until "
+                       "you relink them (Errors panel):\n  "
+                       + "\n  ".join(preview["steps"]))
+        if not detail:
+            detail = "\n\nNothing else references it."
+
+        if QMessageBox.question(
+                self, "Rename Tag",
+                f"Rename '{tag_name}' to '{new_name}' on {registry_type}?"
+                f"\n\nAssignments are untouched — they reference the tag itself, not its "
+                f"name.{detail}",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
+            return
+
+        try:
+            rewritten = self._tags.rename(registry_type, tag_name, new_name,
+                                          view_store=self._views)
+        except (ValueError, KeyError) as e:
+            QMessageBox.warning(self, "Rename Tag", str(e))
+            return
+
+        self._tags_panel.refresh()
+        self._views_panel.set_views(self._views.all())
+        self._refresh_after_tag_change()
+        said = f"Renamed '{tag_name}' to '{new_name}'"
+        if rewritten:
+            said += f" — {len(rewritten)} view(s) followed"
+        if preview["steps"]:
+            said += f"; {len(preview['steps'])} job step(s) need relinking"
+        self._set_status(said)
+
     def _delete_tag(self, registry_type, tag_name):
         """Undefine a tag. §3.2.1: this cascades to every assignment, so the confirmation
         names the count being destroyed."""
@@ -1634,10 +1738,10 @@ class MainWindow(QMainWindow):
             return
         self._tags.undefine(registry_type, tag_name)
         self._tags_panel.refresh()
-        # Any open view selecting that tag now has a stale column set — re-evaluate all.
-        for model in self._tab_models.values():
-            model.reevaluate()
-        self._bottom.refresh_panels()
+        # Any open view selecting that tag now has a stale column set, and any job step
+        # bound to it just became unrunnable — one helper knows the whole blast radius, so
+        # a new consequence gets picked up here without anyone remembering to add it.
+        self._refresh_after_tag_change()
         self._bottom.set_status(f"Deleted tag '{tag_name}' and {len(assigned)} assignment(s)")
 
     def _active_model(self):
@@ -1800,7 +1904,9 @@ class MainWindow(QMainWindow):
                 job = self._jobs.create(manifest.name or ref)
             except ValueError:
                 continue
-            self._jobs.add_action_step(job.id, ref, bindings=bindings)
+            self._jobs.add_action_step(
+                job.id, ref, bindings=bindings,
+                bound_names=record_names(manifest, bindings, tag_store=self._tags))
             self._jobs.set_pinned(job.id, True)
 
     def _seed_views(self):

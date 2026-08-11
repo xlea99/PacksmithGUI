@@ -11,7 +11,9 @@ import json
 import sqlite3
 from dataclasses import dataclass
 
+from packsmith.common.logging import log
 from packsmith.core.db import UserDB
+from packsmith.core.views import rename_tag_in_views
 
 
 @dataclass(frozen=True)
@@ -96,6 +98,84 @@ class TagStore:
             raise ValueError(f"Tag '{name}' already exists on registry '{registry_type}'")
         self._build_definitions()
         return cur.lastrowid
+
+    def rename(self, registry_type: str, old_name: str, new_name: str,
+               *, view_store=None) -> list[str]:
+        """Rename a tag definition. Returns the saved Views whose queries were rewritten.
+
+        §3.2.1: renaming "never touches data — assignments and bindings reference the id.
+        What it touches is *meaning*." So this is one row plus the references that are held
+        by NAME rather than by id, which is exactly the saved Views.
+
+        Job steps are deliberately NOT touched here. They bind by id, so they keep working
+        mechanically, and that is the danger: a step would silently start acting on a tag
+        whose meaning the user just changed. They are gated instead, by comparing the name
+        recorded at bind time against the new one (see `bindings.stale_bindings`) — which
+        is why this method needs to do nothing to them at all.
+        """
+        new_name = (new_name or "").strip()
+        if not new_name:
+            raise ValueError("A tag needs a name")
+        definition = self.definition(registry_type, old_name)
+        if definition is None:
+            raise KeyError(f"No tag '{old_name}' on {registry_type}")
+        if new_name == old_name:
+            return []
+        if self.definition(registry_type, new_name) is not None:
+            raise ValueError(
+                f"'{registry_type}' already has a tag called '{new_name}'. Tag names are "
+                f"unique per registry — pick another name, or undefine that one first.")
+
+        # One transaction: a rename that renamed the tag but not the Views pointing at it
+        # would leave those Views silently querying a name that no longer exists.
+        with self._db.transaction():
+            self._db.execute("UPDATE tag_definitions SET name = ? WHERE id = ?",
+                             (new_name, definition["id"]))
+            rewritten = (rename_tag_in_views(view_store, old_name, new_name)
+                         if view_store is not None else [])
+        self._build_definitions()
+        log.info(f"Renamed tag {registry_type}:{old_name} -> {new_name}")
+        return rewritten
+
+    def preview_rename(self, registry_type: str, old_name: str, new_name: str,
+                       *, view_store=None, job_store=None, package_index=None) -> dict:
+        """What a rename would touch, answered before anything commits.
+
+        Mirrors `preview_enum_change`: the user makes an informed choice *first*, and the
+        two consequences are reported separately because they are genuinely different —
+        Views follow silently, job steps stop until relinked.
+        """
+        definition = self.definition(registry_type, old_name)
+        if definition is None:
+            raise KeyError(f"No tag '{old_name}' on {registry_type}")
+
+        views = []
+        if view_store is not None:
+            from packsmith.core.query import to_dict
+            from packsmith.core.views import _rewrite_tag_name
+            for view in view_store.all():
+                if _rewrite_tag_name(to_dict(view.query), old_name, new_name):
+                    views.append(view.name)
+
+        steps = []
+        if job_store is not None and package_index is not None:
+            for job in job_store.all():
+                for step in job_store.get(job.id).steps:
+                    if not step.is_action:
+                        continue
+                    try:
+                        manifest = package_index.get(step.action_ref)
+                    except (KeyError, AttributeError):
+                        continue
+                    for slot_name, slot in manifest.mappings.items():
+                        if slot.kind != "tag" or slot.registry_type != registry_type:
+                            continue
+                        bound = step.bindings.get(slot_name)
+                        ids = bound if isinstance(bound, list) else [bound]
+                        if definition["id"] in [i for i in ids if isinstance(i, int)]:
+                            steps.append(f"{job.name} step {step.position + 1} "
+                                         f"({step.action_ref})")
+        return {"views": views, "steps": sorted(set(steps))}
 
     def undefine(self, registry_type: str, name: str):
         self._db.execute("DELETE FROM tag_definitions WHERE registry_type = ? AND name = ?",

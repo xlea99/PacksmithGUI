@@ -47,9 +47,13 @@ class PickerPopup(QFrame):
     """Choose one string from a bounded, scrollable, filterable list."""
 
     chosen = Signal(str)
+    # Emitted synchronously by `dismiss()`. `destroyed` would do as well, except it
+    # waits for deferred deletion — so an owner clearing its reference on that alone
+    # keeps pointing at a retired picker for an unpredictable number of event turns.
+    dismissed = Signal()
 
     def __init__(self, items, *, header="", placeholder="type to narrow", parent=None,
-                 match=None, attach=None):
+                 match=None, attach=None, dock=None):
         # Two different windows, decided here rather than flipped later: changing the flags
         # afterwards recreates the native window, and this frame should never spend even one
         # moment being an ordinary decorated window.
@@ -64,8 +68,24 @@ class PickerPopup(QFrame):
         # (WS_EX_NOACTIVATE on Windows). Without it, clicking the scrollbar activates the
         # popup, the cell editor gets a FocusOut, and the view helpfully ends the edit —
         # so scrolling the suggestions would close them.
-        super().__init__(parent, (Qt.ToolTip | Qt.WindowDoesNotAcceptFocus)
-                         if attach is not None else Qt.Popup)
+        #
+        # `dock` is the third case and the least window-like: an ordinary child widget
+        # inside the view's viewport. A top-level popup is positioned in *screen*
+        # coordinates, so it stays put when the main window moves — the suggestions
+        # detach from the cell they belong to and hang in space over the desktop. A child
+        # moves with its parent by construction, which is the only way to be genuinely
+        # stuck to a cell rather than repeatedly chasing it. The cost is that it clips to
+        # the viewport, so it must be sized to fit inside one (see `dock_under`).
+        if dock is not None:
+            super().__init__(dock)
+            # A frameless child of a scroll area inherits nothing to paint on, so without
+            # this the list renders over whatever cells are behind it.
+            self.setAutoFillBackground(True)
+        else:
+            super().__init__(parent, (Qt.ToolTip | Qt.WindowDoesNotAcceptFocus)
+                             if attach is not None else Qt.Popup)
+        self._docked = dock is not None
+        self._dismissed = False    # set by dismiss(); nothing may re-show it after
         # Token matching by default, because that is what typing into a box means
         # everywhere else in this app — a plain substring filter would fail on
         # "polished granite stair" (ids use underscores), and failing on a space is the
@@ -160,12 +180,26 @@ class PickerPopup(QFrame):
         # QStyledItemDelegate would cancel the whole edit on Escape before we ever saw it.
         QTimer.singleShot(0, self._filter_keys)
         editor.textChanged.connect(self._repopulate)
-        editor.destroyed.connect(lambda *_: self.close())
+        editor.destroyed.connect(lambda *_: self.dismiss())
         self._repopulate(editor.text())
 
     def _has_the_pointer(self) -> bool:
-        """Is this popup what the user is currently interacting with?"""
-        return self.isActiveWindow() or self.geometry().contains(QCursor.pos())
+        """Is this popup what the user is currently interacting with?
+
+        Both halves change meaning when docked, and getting either wrong swallows every
+        FocusOut — which means the cell editor never closes and the grid becomes unusable:
+
+        - `isActiveWindow()` asks about the *top-level* window. For a floating popup that
+          is the popup itself, so it answers the intended question. For a docked child it
+          is the main window, so it is true whenever the app has focus at all, and this
+          would always return True.
+        - `geometry()` is in screen coordinates only for a top-level window; for a child
+          it is relative to the viewport. Mapping the cursor into local coordinates is
+          right either way.
+        """
+        if not self._docked and self.isActiveWindow():
+            return True
+        return self.rect().contains(self.mapFromGlobal(QCursor.pos()))
 
     def _refocus(self):
         try:
@@ -307,12 +341,75 @@ class PickerPopup(QFrame):
             x = min(max(x, area.left()), area.right() - self.width())
         self._show_at(QPoint(x, y))
 
+    # How much clear space to leave between the popup and the viewport edge. Small enough
+    # to waste nothing, big enough that the popup never looks welded to the bottom.
+    _EDGE_MARGIN = 10
+
+    def dismiss(self):
+        """Close this picker **for good**, rather than merely hiding it.
+
+        `close()` is enough for a top-level window: it is hidden, nothing else references
+        it, and Python collects it. A docked picker is a child widget, so closing leaves it
+        parked in the viewport's child list, alive and still wired to whatever was driving
+        it — and anything that later asks it to reposition will call `show()` and bring a
+        picker for an edit that finished minutes ago back onto the screen. Dragging across
+        a row and letting the grid autoscroll resurrected one per cell visited.
+
+        The flag matters as much as the delete: `deleteLater` runs at the next event loop
+        pass, and the scroll handlers fire before that.
+        """
+        self._dismissed = True
+        self.dismissed.emit()
+        self.hide()
+        self.close()
+        self.deleteLater()
+
+    def dock_under(self, rect: QRect):
+        """Position under a cell **inside the viewport**, sized to fit within it.
+
+        The docked counterpart of `popup_under`, and the differences are all consequences
+        of being a child widget rather than a window:
+
+        - Coordinates are the viewport's, which is exactly what `QAbstractItemView.
+          visualRect` already returns — no mapping to global and back.
+        - It cannot overhang, so instead of flipping to whichever side has *any* room, it
+          takes whichever side has *more* and then caps its height to what actually fits.
+          Below is preferred on a tie, because a list that grows downward from what you
+          are typing is the shape everyone expects.
+        - The height cap keeps the internal scrollbar doing the work. Nothing is dropped
+          from the list — only the number of rows visible at once changes.
+        """
+        viewport = self.parentWidget()
+        if viewport is None or self._dismissed:
+            return
+        self.adjustSize()
+        available = viewport.height()
+        below = available - rect.bottom() - 1 - self._EDGE_MARGIN
+        above = rect.top() - self._EDGE_MARGIN
+
+        if below >= above:
+            height, top = min(self.height(), below), rect.bottom() + 1
+        else:
+            height = min(self.height(), above)
+            top = rect.top() - height
+
+        width = max(min(_MAX_WIDTH, max(rect.width(), self.width())),
+                    0)
+        width = min(width, max(viewport.width() - 2 * self._EDGE_MARGIN, 1))
+        left = min(max(rect.left(), 0), max(viewport.width() - width, 0))
+
+        self.setGeometry(left, max(top, 0), width, max(height, 1))
+        self.show()
+        self.raise_()          # above the cell editor, which is a sibling in the viewport
+
     @staticmethod
     def _screen_area(point):
         screen = QApplication.screenAt(point) or QApplication.primaryScreen()
         return screen.availableGeometry() if screen is not None else None
 
     def _show_at(self, target: QPoint):
+        if self._dismissed:
+            return
         self.move(target)
         self.show()
         self.raise_()

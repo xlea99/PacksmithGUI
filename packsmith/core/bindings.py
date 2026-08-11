@@ -19,6 +19,8 @@ Every kind honours ``cardinality``: ``one`` resolves to a scalar, ``many`` to a 
 
 ``access`` enforcement (write-on-a-read-slot) is Phase 4.
 """
+from dataclasses import dataclass
+
 from packsmith.core.shapes import describe_shape, mismatches
 
 SUPPORTED_KINDS = ("tag", "blueprint", "blueprint_instance", "registry_entry")
@@ -93,14 +95,24 @@ def binding_name(slot, bound, *, tag_store=None, blueprint_store=None):
     return instance.ref if instance else None
 
 
-def validate_binding(slot, tag_definition):
+def validate_binding(slot, tag_definition, bound=None):
     """Raise ValueError if ``tag_definition`` doesn't satisfy ``slot``'s contract.
-    ``tag_definition`` is what ``TagStore.definition(name)`` returns (or None)."""
+
+    ``tag_definition`` is what ``TagStore.definition(name)`` returns (or None); ``bound``
+    is the name that was looked up, carried through only so a failure can say which tag
+    it was talking about.
+    """
     if slot.kind != "tag":
         raise ValueError(
             f"mapping '{slot.name}' is kind '{slot.kind}'; only 'tag' mappings are supported in the MVP")
     if tag_definition is None:
-        raise ValueError(f"mapping '{slot.name}': the bound tag does not exist")
+        # Name the tag. "The bound tag does not exist" is true and useless — the whole
+        # question the user has is *which* tag, and the answer is almost always "the one
+        # you just renamed", which the message can say for itself.
+        named = f" '{bound}'" if bound else ""
+        raise ValueError(
+            f"mapping '{slot.name}': the bound tag{named} no longer exists on "
+            f"{slot.registry_type} — it was renamed or deleted; re-bind this step")
     if slot.tag_type and tag_definition["type"] != slot.tag_type:
         raise ValueError(
             f"mapping '{slot.name}' needs a '{slot.tag_type}' tag, "
@@ -251,7 +263,8 @@ def resolve_step(manifest, *, bindings: dict, config: dict, tag_store,
                         f"mapping '{name}': '{item}' is not in {slot.registry_type}")
                 values.append(item)
             else:
-                validate_binding(slot, tag_store.definition(slot.registry_type, item))
+                validate_binding(slot, tag_store.definition(slot.registry_type, item),
+                                 bound=item)
                 values.append(item)
         resolved_mappings[name] = values if slot.cardinality == "many" else values[0]
 
@@ -391,3 +404,143 @@ def best_guess_bindings(manifest, tag_store, blueprint_store=None, packdump=None
 
 def _type_ok(slot, definition) -> bool:
     return slot.kind == "tag" and (not slot.tag_type or definition["type"] == slot.tag_type)
+
+
+def record_names(manifest, bindings: dict, *, tag_store=None) -> dict:
+    """Snapshot what each bound TAG is called, at the moment the step is saved.
+
+    This is the whole mechanism behind §3.2.1's "bound job steps must be explicitly
+    relinked" after a rename. A binding stores an id, and a rename doesn't change the id —
+    so nothing is mechanically broken and there is no natural signal that the step's
+    *meaning* moved. Comparing the name recorded here against the tag's current name is
+    that signal, and it's derived rather than flagged: the rename is one UPDATE, and every
+    step's answer changes with it, atomically. Nothing to propagate, nothing to miss.
+
+    **Tags only.** §3.2.2 makes a blueprint rename explicitly non-destructive — bindings
+    are keyed by id and a rename is "a metadata-only operation" — so recording blueprint
+    names here would gate jobs on a mutation the design says is silent.
+    """
+    recorded = {}
+    for name, slot in manifest.mappings.items():
+        if slot.kind != "tag":
+            continue
+        bound = bindings.get(name)
+        if bound is None:
+            continue
+        chosen = _as_list(bound)
+        names = [binding_name(slot, one, tag_store=tag_store) for one in chosen]
+        names = [n for n in names if n is not None]
+        if not names:
+            continue
+        recorded[name] = names if isinstance(bound, list) else names[0]
+    return recorded
+
+
+@dataclass(frozen=True)
+class StaleBinding:
+    """A step bound to a tag that has since been renamed."""
+    step_id: int
+    job_name: str
+    position: int
+    action_ref: str
+    slot: str
+    was: str            # what it was called when it was bound
+    now: str            # what that same tag is called today
+
+    def describe(self) -> str:
+        return (f"{self.job_name} step {self.position + 1} ({self.action_ref}): "
+                f"'{self.slot}' was bound to '{self.was}', now called '{self.now}'")
+
+
+def stale_bindings(job, *, package_index, tag_store) -> list:
+    """Every binding in ``job`` whose tag has been renamed since it was bound.
+
+    Empty for a job with nothing to relink, so callers can treat it as a boolean.
+    """
+    found = []
+    for step in job.steps:
+        if not step.is_action or not step.bound_names:
+            continue
+        try:
+            manifest = package_index.get(step.action_ref)
+        except (KeyError, AttributeError):
+            continue        # uninstalled package: not our problem to report here
+        for slot_name, slot in manifest.mappings.items():
+            if slot.kind != "tag":
+                continue
+            was = step.bound_names.get(slot_name)
+            if was is None:
+                continue    # never recorded: written before rename existed
+            bound = step.bindings.get(slot_name)
+            current = [binding_name(slot, one, tag_store=tag_store)
+                       for one in _as_list(bound)]
+            for old, now in zip(_as_list(was), current):
+                if now is not None and old != now:
+                    found.append(StaleBinding(
+                        step_id=step.id, job_name=job.name, position=step.position,
+                        action_ref=step.action_ref, slot=slot_name, was=old, now=now))
+    return found
+
+
+@dataclass(frozen=True)
+class StepProblem:
+    """Why one step cannot run, known without running it."""
+    step_id: int
+    position: int
+    action_ref: str
+    detail: str
+    kind: str           # "relink" | "broken"
+
+    @property
+    def needs_relink(self) -> bool:
+        """Relink problems are answerable in one click; broken ones need a real re-bind."""
+        return self.kind == "relink"
+
+
+def step_problems(job, *, package_index, tag_store, blueprint_store=None,
+                  packdump=None) -> list:
+    """Everything that would stop ``job`` running, determined WITHOUT running it.
+
+    One function so that three consumers cannot disagree: the pre-flight gate, the Errors
+    panel, and the Jobs panel's "this won't run" colouring. A job painted as runnable that
+    then refuses is worse than no colouring at all.
+
+    Two kinds, because they need different things from the user:
+
+    - **relink** — the tag was renamed and the binding still resolves (it holds an id).
+      Nothing is broken; the user confirms the step still means what they want.
+    - **broken** — the binding does not resolve at all: a legacy name-based binding whose
+      tag was renamed out from under it, a deleted artifact, a shape that no longer fits.
+      This needs a real re-bind, and it is why the two are not merged.
+    """
+    problems = []
+    for stale in stale_bindings(job, package_index=package_index, tag_store=tag_store):
+        problems.append(StepProblem(
+            step_id=stale.step_id, position=stale.position, action_ref=stale.action_ref,
+            detail=(f"'{stale.slot}' was bound to '{stale.was}', now called "
+                    f"'{stale.now}'"),
+            kind="relink"))
+
+    # Deliberately NOT de-duplicated by step. A step can be both — renamed *and* missing a
+    # value its action declares — and suppressing the second would offer a one-click relink
+    # that leaves the step just as unrunnable, which is a worse failure than saying two
+    # things. In the ordinary case the stale step still resolves fine, so nothing doubles.
+    for step in job.steps:
+        if not step.is_action:
+            continue
+        try:
+            manifest = package_index.get(step.action_ref)
+        except (KeyError, AttributeError):
+            problems.append(StepProblem(
+                step_id=step.id, position=step.position, action_ref=step.action_ref,
+                detail=f"'{step.action_ref}' is not installed", kind="broken"))
+            continue
+        try:
+            resolve_step(manifest, bindings=step.bindings, config=step.config,
+                         tag_store=tag_store, blueprint_store=blueprint_store,
+                         packdump=packdump)
+        except ValueError as e:
+            problems.append(StepProblem(
+                step_id=step.id, position=step.position, action_ref=step.action_ref,
+                detail=str(e), kind="broken"))
+    return problems

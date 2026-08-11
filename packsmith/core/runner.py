@@ -166,3 +166,88 @@ def run_action(action_fn, *, tag_store, packdump, action_ref,
             **(history_context or {}),
         )
     return StepResult(action_ref, status, reason=reason, log_lines=pack.log_lines, run_id=run_id)
+
+
+@dataclass
+class StepPreview:
+    """What a step WOULD do, without having done it (design 3.3).
+
+    The action really ran to produce this — its body executed against the same staging
+    buffers a committed run uses; the buffers were simply dropped instead of promoted.
+    That is the point rather than an implementation note: §3.3 requires that "the bytes
+    that commit are exactly the bytes of the final, zero-conflict dry-run", which is only
+    true if the preview IS the run rather than a simulation of it.
+    """
+    action_ref: str
+    status: str                      # "success" | "failed" — could this step even get here
+    writes: list = field(default_factory=list)     # engine-tagged, sorted, plain data
+    log_lines: list = field(default_factory=list)
+    reason: str = None
+
+    @property
+    def ok(self) -> bool:
+        return self.status == "success"
+
+    def summary(self) -> dict:
+        """How many changes per engine — the headline a preview UI would show."""
+        counts = {}
+        for write in self.writes:
+            counts[write["engine"]] = counts.get(write["engine"], 0) + 1
+        return counts
+
+
+def preview_step(action_fn, *, tag_store, packdump, action_ref,
+                 mappings=None, config=None, file_store=None,
+                 conflict_policies=None, blueprint_store=None) -> StepPreview:
+    """Run a step and report what it would write, committing nothing.
+
+    Deliberately NOT a separate execution path: this is `run_action`'s own lifecycle with
+    the promotion withheld, because a preview produced by different code is a preview that
+    can disagree with the run. Nothing is recorded to history either — the step didn't
+    happen, and a run history that lists things that never ran is worse than no history.
+
+    Two properties are worth testing against this and are (see `tests/test_preview.py`):
+    running it twice from the same state must produce identical writes, and what a real
+    run commits must match what the preview said. §7.4 forbids a clock and randomness in
+    the capability catalog precisely to keep both true.
+    """
+    l2 = L2Staging(tag_store)
+    files = FileStaging(file_store) if file_store is not None else None
+    blueprints = BlueprintStaging(blueprint_store) if blueprint_store is not None else None
+    pack = Pack(staging=l2, file_staging=files, tag_store=tag_store, packdump=packdump,
+                action_ref=action_ref, mappings=mappings, config=config,
+                conflict_policies=conflict_policies,
+                blueprint_staging=blueprints, blueprint_store=blueprint_store)
+    if files is not None:
+        files.logs_to(pack.log)
+
+    status, reason = "success", None
+    try:
+        action_fn(pack)
+    except ActionFailure as e:
+        status, reason = "failed", e.reason
+    except Exception as e:
+        status, reason = "failed", f"{type(e).__name__}: {e}"
+
+    # A failed step commits nothing, so its preview must promise nothing. Reporting the
+    # writes it managed to stage before dying would be more informative and would break the
+    # one guarantee this exists for — `writes` is what a run would COMMIT, and a failed run
+    # commits none of them. The log lines carry the diagnostic story instead.
+    writes = []
+    if status == "success":
+        writes = list(l2.pending())
+        if blueprints is not None:
+            writes += blueprints.pending()
+        if files is not None:
+            writes += files.pending()
+
+    # Discard AFTER reading: the buffers are the answer, and dropping them first would
+    # leave nothing to report.
+    l2.discard()
+    if files is not None:
+        files.discard()
+    if blueprints is not None:
+        blueprints.discard()
+
+    return StepPreview(action_ref=action_ref, status=status, reason=reason,
+                       writes=writes, log_lines=pack.log_lines)

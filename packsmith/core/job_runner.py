@@ -23,7 +23,8 @@ first time rather than moving an existing one.
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
-from packsmith.core.bindings import resolve_step, conflict_policies_for
+from packsmith.core.bindings import (
+    resolve_step, conflict_policies_for, stale_bindings)
 from packsmith.core.runner import run_action, StepResult
 
 
@@ -35,6 +36,7 @@ class JobResult:
     step_results: list = field(default_factory=list)   # list[StepResult], in run order
     run_id: int | None = None         # job_runs id, if recorded
     not_run: int = 0                  # steps never reached because something halted
+    blocked: list = field(default_factory=list)   # StaleBinding: relinks owed (3.2.1)
 
     @property
     def ok(self) -> bool:
@@ -54,6 +56,20 @@ def run_job(job, *, job_store, package_index, tag_store, packdump,
     like ``run_action``. ``history`` records each action step; ``job_history`` records the
     run itself and links the steps to it.
     """
+    # PRE-FLIGHT, before a run is even recorded. §3.2.1 requires a step bound to a renamed
+    # tag to refuse until relinked; checking that per-step as we reach it would mean steps
+    # 1 and 2 have already applied their changes when step 3 refuses — a half-applied job,
+    # which is the exact state the staging and rollback design exists to prevent. Learning
+    # "won't start, here's why" is strictly better than stopping two-thirds of the way in.
+    #
+    # This is deliberately wider than 3.2.1's letter, which gates the step: one stale
+    # binding blocks the whole job, including its unrelated steps. That trade is recorded
+    # in 3.2.1 — a job is the unit you press play on.
+    blocked = stale_bindings(job, package_index=package_index, tag_store=tag_store)
+    if blocked:
+        return JobResult(job_id=job.id, job_name=job.name, status="failed",
+                         not_run=len(job.steps), blocked=blocked)
+
     run_id = job_history.start(job.id, job.name) if job_history is not None else None
     ctx = _Context(job_store=job_store, package_index=package_index, tag_store=tag_store,
                    packdump=packdump, file_store=file_store, history=history,

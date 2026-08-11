@@ -17,6 +17,7 @@ translation exists, an "Export" item would produce files that import wrong — w
 absent.
 """
 from PySide6.QtCore import Qt, Signal
+from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QTreeWidget, QTreeWidgetItem, QPushButton, QHBoxLayout, QWidget, QLineEdit, QMenu,
     QAbstractItemView,
@@ -38,9 +39,13 @@ class JobsPanel(Panel):
     delete_requested = Signal(object)
     pin_toggled = Signal(object)
 
-    def __init__(self, jobs=None, parent=None):
+    def __init__(self, jobs=None, parent=None, readiness=None):
         super().__init__("Jobs", parent)
         self._jobs = list(jobs or [])
+        # Injected rather than reached for: whether a job can run is a question about
+        # installed packages, tags and blueprints, and a sidebar panel has no business
+        # holding any of them. Takes a Job, returns [StepProblem]. Absent = don't colour.
+        self._readiness = readiness or (lambda job: [])
 
         bar = QWidget()
         bar_lay = QHBoxLayout(bar)
@@ -113,8 +118,28 @@ class JobsPanel(Panel):
             item.setData(0, _ROLE_JOB, job)
             item.setToolTip(0, f"Run '{job.name}' now")
             steps = len(job.steps)
-            item.setToolTip(1, f"{job.name} — {steps} step{'s' if steps != 1 else ''}; "
-                               f"double-click to edit")
+            tip = (f"{job.name} — {steps} step{'s' if steps != 1 else ''}; "
+                   f"double-click to edit")
+
+            # §3.2.1's gate is pre-flight, so whether a job will refuse is knowable now.
+            # Saying so before the user presses play is the whole point: discovering it by
+            # pressing play and reading a failure is a worse way to learn the same fact.
+            problems = self._readiness(job)
+            if problems:
+                item.setForeground(1, QColor(style.WARNING))
+                # Two different promises, so two different sentences. A relink owed is
+                # gated pre-flight — the job genuinely will not START. A broken binding
+                # fails at its own step, where the step's on_error decides whether the
+                # rest continues; saying "will not run" there would be a lie, and one the
+                # user would catch the first time a `skip` step carried on regardless.
+                relinks = [p for p in problems if p.needs_relink]
+                headline = (f"will not run — {len(relinks)} step(s) need relinking"
+                            if relinks else
+                            f"{len(problems)} step(s) will fail as bound")
+                detail = chr(10).join(f"step {p.position + 1}: {p.detail}"
+                                      for p in problems[:4])
+                tip = f"{job.name} — {headline}{chr(10)}{chr(10)}{detail}"
+            item.setToolTip(1, tip)
             header.addChild(item)
 
     def _job_at(self, item):

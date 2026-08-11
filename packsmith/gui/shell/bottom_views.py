@@ -223,12 +223,15 @@ class ErrorsView(_SummaryView):
 
     resolved = Signal()   # something changed; the app should re-evaluate views
 
-    def __init__(self, tag_store, packdump, blueprint_store=None, parent=None):
+    def __init__(self, tag_store, packdump, blueprint_store=None, parent=None,
+                 job_store=None, package_index=None):
         super().__init__(["Problem", "Registry", "Detail"],
                          "No problems detected.", parent)
         self._tags = tag_store
         self._packdump = packdump
         self._blueprints = blueprint_store
+        self._jobs = job_store
+        self._packages = package_index
         self._tree.setContextMenuPolicy(Qt.CustomContextMenu)
         self._tree.customContextMenuRequested.connect(self._on_context_menu)
         self.refresh()
@@ -274,9 +277,34 @@ class ErrorsView(_SummaryView):
             self._tree.addTopLevelItem(item)
 
         self._add_blueprint_orphans()
+        self._add_relinks_owed()
         for col in range(self._tree.columnCount()):
             self._tree.resizeColumnToContents(col)
         self._show_empty(not self.has_problems())
+
+    def _add_relinks_owed(self):
+        """Steps bound to a tag that has since been renamed (design 3.2.1).
+
+        These belong here rather than in the Jobs panel because this panel answers one
+        question — "what is broken, and how do I fix it" — and a job that refuses to start
+        is exactly that. The row is red because the consequence is hard: the whole job is
+        gated until this is answered, not just the step.
+        """
+        if self._jobs is None or self._packages is None:
+            return
+        from packsmith.core.bindings import stale_bindings
+        for job in self._jobs.all():
+            for stale in stale_bindings(self._jobs.get(job.id),
+                                        package_index=self._packages,
+                                        tag_store=self._tags):
+                item = QTreeWidgetItem(
+                    ["Relink owed", f"{stale.job_name} step {stale.position + 1}",
+                     f"'{stale.slot}' was bound to '{stale.was}', now called "
+                     f"'{stale.now}' — this job will not run until you confirm"])
+                item.setForeground(0, style.qt_colour(style.ERROR))
+                item.setData(0, Qt.UserRole + 2, stale)
+                item.setToolTip(2, "Right-click to relink")
+                self._tree.addTopLevelItem(item)
 
     def _add_blueprint_orphans(self):
         """Design 3.2.2: an orphaned instance "surfaces in the Errors panel under an
@@ -319,6 +347,12 @@ class ErrorsView(_SummaryView):
         item = self._tree.itemAt(pos)
         if item is None:
             return
+        stale = item.data(0, Qt.UserRole + 2)
+        if stale is not None:
+            menu = QMenu(self)
+            menu.addAction(f"Relink to '{stale.now}'", lambda: self._relink(stale))
+            menu.exec(self._tree.mapToGlobal(pos))
+            return
         orphan = item.data(0, Qt.UserRole + 1)
         if orphan is not None:
             self._blueprint_menu(pos, orphan)
@@ -340,6 +374,25 @@ class ErrorsView(_SummaryView):
             menu.addAction(f"Clear  ({len(members)} assignments)",
                            lambda: self._clear_entries(registry_type, tag_name, members))
         menu.exec(self._tree.mapToGlobal(pos))
+
+    def _relink(self, stale):
+        """Accept the step's bindings under their new names.
+
+        Nothing about the target changes — it was always this tag id. What the user is
+        asserting is that the step still *means* what they want, which is the entire point
+        of §3.2.1 gating rather than silently carrying on.
+        """
+        from packsmith.core.bindings import record_names
+        step = next((s for job in self._jobs.all()
+                     for s in self._jobs.get(job.id).steps if s.id == stale.step_id), None)
+        if step is None:
+            self.refresh()
+            return
+        manifest = self._packages.get(step.action_ref)
+        self._jobs.relink_step(step.id,
+                               record_names(manifest, step.bindings, tag_store=self._tags))
+        self.refresh()
+        self.resolved.emit()
 
     def _blueprint_menu(self, pos, orphan):
         """3.2.2's four resolutions. "The user must choose one; there is no 'ignore' or
