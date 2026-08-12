@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "packsmith"
+version = "0.1.0"
+description = "An IDE for Minecraft modpack development"
+requires-python = ">=3.13"
+license = { text = "Proprietary" }
+
+# Pinned to the versions actually developed against, not floated. A modpack tool is a
+# desktop app that gets frozen and shipped: the build has to be reproducible, and PySide6
+# in particular ships its own Qt runtime, so a surprise minor bump is a different Qt.
+dependencies = [
+    "PySide6==6.10.2",      # Qt bindings; QtWebEngine hosts the vendored Monaco editor
+    "starlark-pyo3==2025.2.5",  # the Starlark interpreter actions run in (design 3.3)
+    "json5==0.15.0",        # tolerant reads of Minecraft's comment-laden JSON (design 6.3)
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==9.1.1",
+]
+
+[project.gui-scripts]
+packsmith = "packsmith.gui.app:run"
+
+[tool.setuptools.packages.find]
+include = ["packsmith*"]
+
+[tool.setuptools.package-data]
+# Monaco is VENDORED, not CDN-loaded (design 6.3) — the editor has to work offline, so the
+# whole of it ships inside the package and must survive both an install and a freeze.
+"packsmith.gui.editor" = ["*.html", "monaco/**/*", "vendor/**/*"]
