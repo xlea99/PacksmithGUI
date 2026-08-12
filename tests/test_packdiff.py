@@ -253,7 +253,7 @@ def test_the_timeline_marks_which_one_is_active(history):
 
 
 def test_ordering_follows_the_dump_timestamp_not_the_folder(history):
-    """A revert rewrites folders, so file times record when PackSmith shuffled things
+    """A revert rewrites folders, so file times record when Packsmith shuffled things
     around. Only the dump's own timestamp says when the pack looked like that."""
     base = history.packdumps_dir / "history"
     (base / "2026-01-01_00-00-00" / "meta.json").touch()      # newest on disk, oldest in fact

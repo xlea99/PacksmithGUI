@@ -15,7 +15,7 @@ into `datapacks.write`: an action that genuinely depends on load order can decla
 be refused on a pack where it is unavailable, instead of silently producing the wrong
 result. Modelling the loaders as interchangeable would make that distinction unsayable.
 
-A pack may be a folder or a zip. PackSmith writes folders — a zip would have to be
+A pack may be a folder or a zip. Packsmith writes folders — a zip would have to be
 rebuilt on every edit, and the whole point of an override is that you can go and look at
 it — but both are listed, because the user's packs contain both.
 """
@@ -103,7 +103,7 @@ class PaxiProvider(PackLoaderProvider):
                       kind="datapacks") -> Path:
         """Where a file must land to override a mod's built-in copy (§8.1).
 
-        "PackSmith doesn't do anything clever here — it just writes the file to the right
+        "Packsmith doesn't do anything clever here — it just writes the file to the right
         place and lets Minecraft's pack layering do the rest." The member path is the one
         the mod uses inside its own jar (`data/<namespace>/…`), reproduced verbatim.
         """
@@ -117,7 +117,7 @@ class PaxiProvider(PackLoaderProvider):
         return target
 
     def create_pack(self, instance_root, pack_name: str, kind="datapacks",
-                    description="Created by PackSmith", pack_format=15) -> Path:
+                    description="Created by Packsmith", pack_format=15) -> Path:
         """Make an empty pack with the `pack.mcmeta` Minecraft requires (§8.1).
 
         A pack without one is silently ignored by the game, which is the most confusing

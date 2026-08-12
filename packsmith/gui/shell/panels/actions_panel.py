@@ -18,7 +18,7 @@ turns an entry point back into a plain function, which is how a file becomes a l
 
 This is also where a package's source files surface — deliberately *not* the Files panel.
 That panel is a tree rooted at the game instance, and package sources are not in it; they
-are PackSmith's own userdata. Each keeps the rules that suit it: instance files answer to
+are Packsmith's own userdata. Each keeps the rules that suit it: instance files answer to
 ownership, package sources to provenance (§3.3.1 — you may edit what you authored, not
 what you downloaded).
 """

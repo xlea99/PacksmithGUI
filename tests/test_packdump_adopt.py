@@ -5,7 +5,7 @@ in the profile database, and a new registry does not touch a byte of it, so ther
 that requires closing the database or destroying every open tab. The import fires on window
 focus, which is exactly when the user comes back from playtesting; a mod the launcher
 updated on its own is enough to trigger it. Charging them their whole workspace for that is
-a punishment for the loop PackSmith exists to support.
+a punishment for the loop Packsmith exists to support.
 
 What replaces the teardown is a **rebind**, and rebinding is only safe if it is exhaustive.
 A holder that keeps the old dump does not crash — it answers, confidently, from a registry
@@ -117,7 +117,7 @@ def find_packdump_holders(root):
 
     Found by walking, not by asking. `MainWindow._packdump_holders` is the production
     enumeration; if this test used it, the two would agree by construction and a holder
-    missing from both would pass. So this crawls PackSmith objects, their containers and the
+    missing from both would pass. So this crawls Packsmith objects, their containers and the
     Qt child tree, and reports anything holding something that looks like a dump.
     """
     from PySide6.QtCore import QObject

@@ -12,7 +12,7 @@ and gets a mapping slot.
 
 A pack is the first slottable artifact from the FILE world rather than Layer 2, and the two
 consequences of that are what most of this file pins down: the binding stores a *name*
-(there is no id to store — PackSmith does not own the directory), and `conflict_policy` does
+(there is no id to store — Packsmith does not own the directory), and `conflict_policy` does
 not apply (files hard-block, §6.1, rather than negotiating).
 """
 import json
@@ -129,8 +129,8 @@ def test_declaring_a_policy_on_a_pack_is_an_error():
 
 def test_the_binding_is_the_pack_name(world):
     """Layer 2 artifacts carry database ids so a rename can't break a binding. A pack's
-    identity IS its directory name, and PackSmith does not own that directory — so there
-    is no id to store, and this is the one mapping kind where a rename outside PackSmith
+    identity IS its directory name, and Packsmith does not own that directory — so there
+    is no id to store, and this is the one mapping kind where a rename outside Packsmith
     genuinely breaks the binding."""
     assert binding_id(slot(), "tweaks") == "tweaks"
     assert binding_name(slot(), "tweaks") == "tweaks"

@@ -2,7 +2,7 @@
 
 §5.3 Part B: *"the **user authors the recommendation query**, parameterized over the
 instance and anchored on a reliable slot… The author encodes 'base is my anchor' by
-referencing it — PackSmith never discovers it."* This is that parameterisation.
+referencing it — Packsmith never discovers it."* This is that parameterisation.
 
 A template is an ordinary filter with **parameter tokens** in it::
 

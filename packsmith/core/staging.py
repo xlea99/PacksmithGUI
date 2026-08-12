@@ -8,7 +8,7 @@ action step atomic all-or-nothing semantics without any special ceremony from
 the action author.
 
 This module is the LAYER 2 (tag) side of staging — the closed-world engine where
-PackSmith is the sole writer. File staging (open-world, store-by-path snapshots)
+Packsmith is the sole writer. File staging (open-world, store-by-path snapshots)
 is a separate concern handled elsewhere.
 """
 

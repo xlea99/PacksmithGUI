@@ -1,4 +1,4 @@
-"""Shared fixtures for the PackSmith unit suite.
+"""Shared fixtures for the Packsmith unit suite.
 
 Every unit test runs against its own isolated database, created fresh from
 pytest's ``tmp_path`` and discarded when the test ends. This hermetic setup is

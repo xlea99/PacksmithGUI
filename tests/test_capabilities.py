@@ -75,7 +75,7 @@ def test_requiring_a_missing_capability_says_what_is_missing():
 # --- two loaders at once (§8.1's multi-loader case) ----------------------------------------
 
 def test_the_second_loader_becomes_an_alternative_not_a_conflict():
-    """§7.1: PackSmith picks one as the default and offers the choice. Neither is an
+    """§7.1: Packsmith picks one as the default and offers the choice. Neither is an
     error — having both installed is unusual but legal."""
     table = resolve(Dump("paxi", "openloader"),
                     loaders=[PaxiProvider(), FakeLoader()])

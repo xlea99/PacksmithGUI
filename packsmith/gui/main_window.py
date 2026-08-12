@@ -87,6 +87,7 @@ from packsmith.gui.override_dialog import OverrideTargetDialog
 from packsmith.gui.packdump_diff import PackdumpDiffTab
 from packsmith.gui.jar_viewer import JarViewerTab
 from packsmith.gui.nbt_viewer import NbtViewerTab
+from packsmith.gui.settings_dialog import SettingsDialog
 from packsmith.gui.job_editor import JobEditorTab
 from packsmith.gui.table.registry_table_model import RegistryTableModel
 from packsmith.gui.table.registry_sort_proxy import RegistrySortProxy
@@ -108,7 +109,7 @@ class MainWindow(QMainWindow):
 
     def __init__(self, profile_name: str = None):
         super().__init__()
-        self.setWindowTitle("PackSmith")
+        self.setWindowTitle("Packsmith")
         self.setMinimumSize(1200, 700)
 
         self._tab_models = {}     # tab widget -> RegistryTableModel
@@ -141,7 +142,7 @@ class MainWindow(QMainWindow):
         under one developer's home directory: a guaranteed launch crash on any other
         machine, and on that one machine it quietly invented a profile nobody asked for.
         First run now opens the gated window instead, which is what §3.1 describes —
-        PackSmith "won't let you do anything until it loads its first packdump"."""
+        Packsmith "won't let you do anything until it loads its first packdump"."""
         existing = list_profiles()
         if "packsmith_test" in existing:
             return "packsmith_test"
@@ -167,7 +168,7 @@ class MainWindow(QMainWindow):
             self._packdump = None
             self._import_result = None
             self._blocked = (
-                "PackSmith needs a profile before it can do anything.\n\n"
+                "Packsmith needs a profile before it can do anything.\n\n"
                 "A profile points at one Minecraft instance. Create one from the Profiles "
                 "menu, then launch the game once so the Packsmith mod writes its packdump.")
             return
@@ -208,7 +209,7 @@ class MainWindow(QMainWindow):
     def _build_blocked_shell(self, reason: str):
         """A window that explains what's missing instead of a console traceback.
 
-        §3.1: PackSmith "won't let you do anything until it loads its first packdump" —
+        §3.1: Packsmith "won't let you do anything until it loads its first packdump" —
         gated, not absent. The menu bar stays live so the one thing that can fix this
         (Profiles) is reachable; everything that needs a registry simply isn't built.
         """
@@ -300,7 +301,7 @@ class MainWindow(QMainWindow):
         active_loader = self._loaders.provider_for(DATAPACKS_WRITE)
         self._files_panel = FilesPanel(self._file_store, loader=active_loader)
         self._files_panel._mc_version = self._profile.mc_version
-        # The real client jar, when this launcher's layout is one PackSmith knows or the
+        # The real client jar, when this launcher's layout is one Packsmith knows or the
         # user has pointed at it. Used for `pack_format` today (Mojang's own number rather
         # than a memorised one) and for browsing vanilla data later (§3.1).
         self._client_jar = locate_for(self._profile)
@@ -723,7 +724,7 @@ class MainWindow(QMainWindow):
                                  f"{name}\n\n{e}\n\nStaying where we were.")
             self._enter_profile(self._profile.name)
             return
-        self.setWindowTitle(f"PackSmith — {name}")
+        self.setWindowTitle(f"Packsmith — {name}")
 
     def _close_all_tabs(self) -> bool:
         """Close every open tab, honouring the unsaved-changes guard. False if cancelled.
@@ -975,7 +976,7 @@ class MainWindow(QMainWindow):
     # This matters because the import fires on window focus, which is exactly when the user
     # comes back from playtesting — and a mod the launcher updated on its own is enough to
     # trigger it. Charging them their whole workspace for that is a punishment for the loop
-    # PackSmith exists to support.
+    # Packsmith exists to support.
     #
     # **THE RULE: anything that stores a packdump implements `set_packdump`, and is reached
     # by `_packdump_holders`.** A holder that forgets goes silently stale — it keeps
@@ -1018,6 +1019,35 @@ class MainWindow(QMainWindow):
             self._switch_profile_in_place()
             return
         self._report_import(self._import_result)
+
+    def _open_settings(self):
+        """File → Packsmith Settings. Profile-scoped, because both settings are.
+
+        Applying is deliberately narrow: the client jar is re-located and the panels that
+        hold it are re-pointed, but nothing is torn down. Neither setting changes the
+        registry, so the packdump-adopt path (which does rebuild things) has no business
+        running here.
+        """
+        if self._profile is None:
+            return
+        dialog = SettingsDialog(self._profile, parent=self)
+        if not dialog.exec() or dialog.result_settings is None:
+            return
+        self._profile.settings = dialog.result_settings
+        try:
+            self._profile.save()
+        except Exception as e:
+            QMessageBox.warning(self, "Couldn't save settings", str(e))
+            return
+        self._apply_jar_setting()
+        self._set_status("Settings saved")
+
+    def _apply_jar_setting(self):
+        """Re-locate the client jar and hand it to everything that reads it."""
+        self._client_jar = locate_for(self._profile)
+        if getattr(self, "_files_panel", None) is not None:
+            self._files_panel._client_jar = self._client_jar.path if self._client_jar else None
+            self._files_panel.refresh()
 
     def _pack_targets(self):
         """Which datapacks and resource packs this profile has (design 3.3 / 8.1).
@@ -1117,7 +1147,7 @@ class MainWindow(QMainWindow):
 
     def _check_for_new_packdump(self):
         """Poll on window focus. The mental model is that the packdump is a LIVE snapshot,
-        and you generate a new one by leaving PackSmith to run the game — so coming back is
+        and you generate a new one by leaving Packsmith to run the game — so coming back is
         exactly the moment to look. Cheap: a load and a comparison, no watcher."""
         if self._rebuild_pending:
             # A dump already landed on disk that the window never took on. Nothing on the
@@ -1163,7 +1193,7 @@ class MainWindow(QMainWindow):
     def _show_panel(self, key):
         # Reload from source on the way in. A panel that only refreshes when it *itself*
         # changes something goes stale behind your back — an action run claims a file, or
-        # something outside PackSmith edits the instance, and the panel keeps showing the
+        # something outside Packsmith edits the instance, and the panel keeps showing the
         # world as it was when you last looked at it.
         reload_panel = self._panel_reloaders.get(key)
         if reload_panel is not None:
@@ -1188,6 +1218,8 @@ class MainWindow(QMainWindow):
         file_menu.addSeparator()
         file_menu.addAction("Check for New Packdump", self._check_for_new_packdump)
         file_menu.addSeparator()
+        file_menu.addAction("Packsmith Settings…", self._open_settings)
+        file_menu.addSeparator()
         file_menu.addAction("Exit", self.close)
 
         edit_menu = bar.addMenu("Edit")
@@ -1208,7 +1240,7 @@ class MainWindow(QMainWindow):
         profiles_menu.addAction("New Profile…", self._new_profile)
 
         help_menu = bar.addMenu("Help")
-        help_menu.addAction("About PackSmith").setEnabled(False)
+        help_menu.addAction("About Packsmith").setEnabled(False)
 
     # --- view tabs ---------------------------------------------------------
 
@@ -1398,7 +1430,7 @@ class MainWindow(QMainWindow):
 
     def _open_package_document(self, path):
         """A package source or manifest from the Actions panel — governed by provenance.
-        These deliberately never appear in the Files panel: they're PackSmith's own
+        These deliberately never appear in the Files panel: they're Packsmith's own
         userdata, not game files."""
         return self._open_document("package", path)
 
@@ -1415,7 +1447,7 @@ class MainWindow(QMainWindow):
         kind = self._file_kind(source, path)
         if kind == filetypes.ARCHIVE and source == "instance":
             # §6.5, step one. Only for instance files: a package's own source tree isn't
-            # an archive, and a jar in `userdata/` would be PackSmith's business rather
+            # an archive, and a jar in `userdata/` would be Packsmith's business rather
             # than the pack's.
             tab = JarViewerTab(self._file_store.root / path)
             tab.status.connect(self._set_status)
@@ -1533,7 +1565,7 @@ class MainWindow(QMainWindow):
     def _save_as_override(self, archive_rel, member):
         """Copy a file out of a mod jar into a datapack or resource pack (design 6.5).
 
-        "PackSmith doesn't do anything clever here — it just writes the file to the right
+        "Packsmith doesn't do anything clever here — it just writes the file to the right
         place and lets Minecraft's pack layering do the rest" (§8.1). The path inside the
         pack is the path inside the jar, unchanged: that is the entire mechanism, and
         altering it would produce a file the game never looks at.

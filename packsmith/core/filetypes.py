@@ -1,6 +1,6 @@
 """Which editor a file belongs to (design 6.0, Editor Dispatch).
 
-§6.0: *"PackSmith picks the editor by file extension **and content sniffing**"* — known text
+§6.0: *"Packsmith picks the editor by file extension **and content sniffing**"* — known text
 extensions to the Text Editor, NBT to the NBT Editor, archives to the JAR Viewer, and
 *"unknown/binary → a 'cannot display' placeholder for formats the system doesn't
 recognize."*
@@ -126,4 +126,4 @@ def describe(kind: str) -> str:
         IMAGE: "This is an image, but it could not be decoded — it may be truncated.",
         BINARY: "This file isn't text, so there's nothing to show yet — a hex view is "
                 "part of the JAR viewer (design 6.5).",
-    }.get(kind, "PackSmith can't display this file yet.")
+    }.get(kind, "Packsmith can't display this file yet.")

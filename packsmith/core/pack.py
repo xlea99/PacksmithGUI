@@ -159,7 +159,7 @@ class _Tags:
         if policy == "ask":
             raise ActionFailure(
                 f"{cell} is owned by {who} and this mapping's conflict policy is 'ask', "
-                f"which PackSmith does not support yet — choose overwrite, skip, or fail.")
+                f"which Packsmith does not support yet — choose overwrite, skip, or fail.")
         if policy == "fail":
             raise ActionFailure(
                 f"{cell} is owned by {who} and this mapping's conflict policy is 'fail'.")
@@ -316,7 +316,7 @@ class _Blueprints:
         if policy == "ask":
             raise ActionFailure(
                 f"{cell} is owned by {who} and this mapping's conflict policy is 'ask', "
-                f"which PackSmith does not support yet — choose overwrite, skip, or fail.")
+                f"which Packsmith does not support yet — choose overwrite, skip, or fail.")
         if policy == "fail":
             raise ActionFailure(
                 f"{cell} is owned by {who} and this mapping's conflict policy is 'fail'.")

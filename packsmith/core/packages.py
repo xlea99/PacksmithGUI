@@ -45,7 +45,7 @@ class MappingSlot:
     conflict_policy: str = None   # overwrite | skip | fail | ask
     # Which kind of pack a `pack` mapping binds (design 3.3): datapacks | resourcepacks.
     # A pack is the one slottable artifact that lives in the FILE world rather than Layer 2,
-    # so its binding stores the pack's name — a directory PackSmith does not own — instead
+    # so its binding stores the pack's name — a directory Packsmith does not own — instead
     # of a database id.
     pack_kind: str = None
 

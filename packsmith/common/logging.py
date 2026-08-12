@@ -10,7 +10,7 @@ class TolerantRotatingFileHandler(RotatingFileHandler):
     """A rotating handler that survives not being able to rotate.
 
     On Windows a file cannot be renamed while another process holds it, so rotation fails
-    whenever a second thing is touching the log — another PackSmith window, a test run, an
+    whenever a second thing is touching the log — another Packsmith window, a test run, an
     antivirus scanner mid-read. The stock handler's response is to print the whole
     traceback to stderr, and because it re-attempts on *every* record once the file is at
     the size limit, the app's console fills with identical tracebacks faster than it can

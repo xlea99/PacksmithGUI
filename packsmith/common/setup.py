@@ -35,7 +35,7 @@ class ProjectPaths:
 
         `_MEIPASS` is PyInstaller's extraction directory: a temp folder, recreated on every
         launch and deleted on exit (and read-only in onefile builds). Rooting `userdata/`
-        there meant a frozen PackSmith would lose every profile, every tag and every
+        there meant a frozen Packsmith would lose every profile, every tag and every
         blueprint each time it closed — the whole L2 database, silently, with the app
         looking like it started fresh. Nothing in dev catches it, because dev is never
         frozen.
@@ -59,12 +59,13 @@ class ProjectPaths:
                 base = Path.home() / "Library" / "Application Support"
             else:
                 base = os.environ.get("XDG_DATA_HOME") or (Path.home() / ".local" / "share")
-            return Path(base) / "PackSmith"
+            return Path(base) / "Packsmith"
         return Path(__file__).resolve().parents[2]
 
     @staticmethod
     def build():
         root = ProjectPaths.data_root()
+
 
         userdata = ensure_directory(root / "userdata")
         # NOT must_exist: a fresh clone has no userdata/ at all, and crashing at *import

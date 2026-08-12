@@ -1,13 +1,13 @@
 """Finding the real Minecraft client jar — design 3.1.
 
-The packdump tells PackSmith what the *modded* registry looks like. It says nothing about
+The packdump tells Packsmith what the *modded* registry looks like. It says nothing about
 vanilla's own content: the loot table for `minecraft:oak_leaves`, the recipe for stone
 bricks, the `minecraft:leaves` block tag. Those live in the client jar, which every player
 of a modpack necessarily already has — 5,888 files under `data/` in 1.20.1 — and which
-PackSmith can read without extracting anything (§6.5).
+Packsmith can read without extracting anything (§6.5).
 
 It is also where the authoritative `pack_format` lives (`version.json`), so a datapack
-PackSmith creates declares the number Minecraft itself uses rather than one from a table
+Packsmith creates declares the number Minecraft itself uses rather than one from a table
 that rots every release.
 
 **The hard part is not reading it, it is finding it.** Launchers do not agree, and there
@@ -124,7 +124,7 @@ def candidate_roots(instance_path) -> list:
     """Directories that might be a launcher root, nearest first.
 
     Walking up from the instance rather than scanning the disk: the instance is the one
-    location PackSmith is certain about, every launcher keeps its jars near it, and a
+    location Packsmith is certain about, every launcher keeps its jars near it, and a
     filesystem-wide search would be both slow and prone to finding somebody else's
     Minecraft.
     """
@@ -142,7 +142,7 @@ def locate(instance_path, version: str, *, override=None) -> LocatedJar | None:
     """Find the client jar for ``version``, or None.
 
     ``override`` is the user's explicit setting and is tried first and alone: if someone
-    has told PackSmith where the jar is, quietly preferring a detected one would make the
+    has told Packsmith where the jar is, quietly preferring a detected one would make the
     setting a suggestion.
     """
     if override:

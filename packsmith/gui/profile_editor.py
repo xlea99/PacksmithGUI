@@ -239,7 +239,7 @@ class NewProfileDialog(QDialog):
         found = read_instance_contract(path)
         if not found:
             self._detected.setText(
-                "No packdump in this folder yet — run the PackSmith mod in the instance, "
+                "No packdump in this folder yet — run the Packsmith mod in the instance, "
                 "or fill the contract in by hand.")
             self._detected.setStyleSheet(
                 f"color: {style.OWNER_ACTION}; font-size: 11px;")

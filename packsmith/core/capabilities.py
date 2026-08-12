@@ -176,7 +176,7 @@ def resolve(packdump, *, loaders=(), preferred=None) -> ResolutionTable:
     """Build a profile's resolution table from the loaders that detect as present.
 
     ``preferred`` is the user's sticky per-profile choice (§8.1): when two loaders both
-    provide `datapacks.write`, PackSmith picks a default and lets the user change it,
+    provide `datapacks.write`, Packsmith picks a default and lets the user change it,
     rather than guessing differently on each launch.
     """
     table = ResolutionTable()

@@ -2,7 +2,7 @@
 
 §6.5's mundane purpose, quoted: "peeking into a mod's internals currently requires an
 external tool that extracts files to a scratch directory just to view them. The JAR Viewer
-lets the user do this in PackSmith without leaving the workspace."
+lets the user do this in Packsmith without leaving the workspace."
 
 **This is the browsing half only.** Viewing a member's *content* (routing text to the Text
 Editor, binary to something honest) and the save-as-override workflow are later steps. What

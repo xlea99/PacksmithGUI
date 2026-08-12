@@ -3,7 +3,7 @@
 Two scopes: **registry** (rows are entries) and **blueprint** (rows are the instances of a
 schema, fields are its slots). Order of operations mirrors SQL: WHERE -> project ->
 DISTINCT -> ORDER BY -> LIMIT. The executor is swappable behind the AST; this one is
-deliberately simple and correct at PackSmith's scale.
+deliberately simple and correct at Packsmith's scale.
 
 Null semantics (deliberate, conservative): when a field has no value for an entry (an
 unset tag with no default, a missing attribute), every ``Cmp`` is False. Presence is

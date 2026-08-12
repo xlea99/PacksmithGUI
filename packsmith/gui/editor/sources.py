@@ -8,8 +8,8 @@ which is the whole reason the abstraction is worth having:
   external writers (the game, mod updates, other editors). They are governed by
   **ownership** (§6.1): an action-owned file is locked until the user takes it.
 
-* **Package files** are PackSmith's own userdata — Starlark actions and manifests the user
-  authored. Nothing outside PackSmith writes them, so the ownership engine does not apply;
+* **Package files** are Packsmith's own userdata — Starlark actions and manifests the user
+  authored. Nothing outside Packsmith writes them, so the ownership engine does not apply;
   running them through claim/release would be a category error (you would be "taking" a
   file you wrote, from nobody). They are governed by **provenance** instead: authored is
   editable, downloaded is read-only (§3.3.1, §6.3).
@@ -112,7 +112,7 @@ class InstanceFileSource(DocumentSource):
 class PackageFileSource(DocumentSource):
     """Action sources and manifests under the profile's packages directory.
 
-    Closed world: PackSmith is the only writer, so no ownership. Editability is decided by
+    Closed world: Packsmith is the only writer, so no ownership. Editability is decided by
     the package's **provenance** — you may edit what you authored, not what you downloaded.
     """
 

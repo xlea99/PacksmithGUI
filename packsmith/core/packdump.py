@@ -361,7 +361,7 @@ class Packdump:
     # Read only views of the dicts cause we aint about dirty editing.
     #
     # These were commented out "temp… for ease of debug" and stayed that way, which made
-    # L1's central promise — "read-only, PackSmith never writes it" (§3.1) — a convention
+    # L1's central promise — "read-only, Packsmith never writes it" (§3.1) — a convention
     # rather than a property. Starlark was insulated because the bridge hands actions
     # copies; every Python caller in the GUI was on the honour system, and an accidental
     # `dump.registry[...]["values"].append(...)` would have corrupted the in-memory L1 for
@@ -634,7 +634,7 @@ def snapshot_timeline(profile: Profile) -> list[dict]:
     """Every snapshot this profile holds, **newest first**, including the active one.
 
     Ordered by the timestamp the *game* generated the dump rather than by folder mtime: a
-    revert rewrites folders, so file times record when PackSmith shuffled things around
+    revert rewrites folders, so file times record when Packsmith shuffled things around
     while the dump's own timestamp records when the pack actually looked like that. Only
     the second one makes "the previous snapshot" mean anything.
     """

@@ -123,7 +123,7 @@ def test_a_mod_version_bump_counts_as_a_change_even_with_identical_registries(tm
 # --- L1 immutability (design 3.1) ---------------------------------------------------------
 
 def test_the_registry_cannot_be_rebound_through_the_getter(tmp_path):
-    """§3.1's "read-only, PackSmith never writes it" was convention only — the guards were
+    """§3.1's "read-only, Packsmith never writes it" was convention only — the guards were
     commented out "temp… for ease of debug"."""
     dump = Packdump.load(write_dump(tmp_path / "src"))
     with pytest.raises(TypeError):

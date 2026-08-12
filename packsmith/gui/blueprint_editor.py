@@ -6,7 +6,7 @@ look at is how it ends up wrong. This is the plain renderer that gets you to rea
 * **the schema** as a tree, because inline groups are a tree;
 * **the instances as a grid** — one row per instance, one column per value slot — because
   "every stone type × cut × form, and which are filled" is literally a table, and it is the
-  shape the user was maintaining in a spreadsheet before PackSmith existed.
+  shape the user was maintaining in a spreadsheet before Packsmith existed.
 
 Gaps are painted rather than left blank. An empty slot is the *output* of the primitive —
 missing content that needs generating or sourcing — so it reads as a marked absence, not as

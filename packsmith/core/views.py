@@ -45,7 +45,7 @@ class ViewStore:
         """Every saved view that can be loaded, in display order.
 
         One unreadable row must not take the panel with it. A view is a saved query, and a
-        query is data that outlives the code that wrote it — a row from a newer PackSmith,
+        query is data that outlives the code that wrote it — a row from a newer Packsmith,
         a hand-edited profile, or a node the decoder doesn't know yet is a real possibility,
         and losing access to nine healthy views because the tenth is broken is a far worse
         failure than the broken one. Casualties are reported via :meth:`unreadable`.

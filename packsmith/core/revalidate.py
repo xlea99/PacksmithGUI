@@ -1,6 +1,6 @@
 """Which job steps a blueprint schema change would break (design 3.2.2).
 
-3.2.2: "When a user confirms a rename, retype, or removal on a blueprint slot, PackSmith
+3.2.2: "When a user confirms a rename, retype, or removal on a blueprint slot, Packsmith
 finds all action mappings whose `required_shape` references the mutated blueprint schema.
 Each affected mapping is re-validated against the new schema shape... The user makes an
 informed choice **before the mutation commits.**"

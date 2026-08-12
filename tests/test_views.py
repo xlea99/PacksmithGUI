@@ -148,7 +148,7 @@ def test_blank_name_raises(views):
 
 def test_one_unreadable_view_does_not_take_the_others_with_it(views):
     """A saved query is data that outlives the code that wrote it — a row from a newer
-    PackSmith or a hand-edited profile is a real possibility. Losing every healthy view to
+    Packsmith or a hand-edited profile is a real possibility. Losing every healthy view to
     one broken row is a far worse failure than the broken row."""
     import json
     views.create("first", Query(scope=Registry("minecraft:item"), select=[Id]))

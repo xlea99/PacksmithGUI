@@ -1,6 +1,6 @@
 """The gated first-launch shell and every way out of it (design 3.1).
 
-§3.1 gates PackSmith on its first packdump. A gate you cannot pass is just a wall, so this
+§3.1 gates Packsmith on its first packdump. A gate you cannot pass is just a wall, so this
 covers the escape hatches — which is the coverage whose absence let all four of them ship
 broken: the shell has `_profile = None` and never builds a workspace, and four recovery
 paths dereferenced one or the other.

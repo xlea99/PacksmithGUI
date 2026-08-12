@@ -1,6 +1,6 @@
 """Save-as-override — design 6.5 / 8.1.
 
-The mechanism is deliberately dumb, and §8.1 says so: *"PackSmith doesn't do anything
+The mechanism is deliberately dumb, and §8.1 says so: *"Packsmith doesn't do anything
 clever here — it just writes the file to the right place and lets Minecraft's pack layering
 do the rest."* An override works by sitting at **the same namespace path the mod uses**,
 inside a pack that loads afterwards. So the one thing that must never drift is the path.
@@ -225,7 +225,7 @@ def test_reopening_restores_what_a_packdump_rebuild_closed(qapp):
     """Adopting a dump happens on window focus — which fires exactly when you come back
     from playtesting. A mod updating itself in the launcher is enough to trigger it, so the
     user may not have done anything at all; losing every open tab for that is a punishment
-    for the loop PackSmith exists to support.
+    for the loop Packsmith exists to support.
     """
     from packsmith.gui.main_window import MainWindow
 

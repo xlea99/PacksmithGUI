@@ -477,7 +477,7 @@ class BlueprintStore:
                             enum_values=None) -> Impact:
         """Can every existing binding survive the new type?
 
-        3.2.2 offers auto-coerce "only when PackSmith can *prove* the coercion is
+        3.2.2 offers auto-coerce "only when Packsmith can *prove* the coercion is
         lossless". The proof needs no table of which type converts to which: run every
         existing binding through the *new* slot's own validator. If they all pass, the
         coercion is lossless by construction, and it stays correct as types are added.

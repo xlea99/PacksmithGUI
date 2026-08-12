@@ -36,6 +36,11 @@ ERROR = "#e06c6c"
 # shout at the same volume.
 WARNING = "#d0a050"
 
+# Confirmation that something the app went looking for is genuinely there and checked out —
+# a located client jar, a verified path. Muted rather than a signal green: it is the state
+# you expect, so it should read as settled, not as a congratulation.
+SUCCESS = "#7ea87e"
+
 # A gap in a blueprint instance: an empty slot is missing content, not an error, so it
 # reads as absence rather than alarm (design 3.2.2).
 GAP = "#3a3a48"

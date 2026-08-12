@@ -114,7 +114,7 @@ class RegistryFieldCatalog:
 
     Note: tag values are read per (entry, tag) via the tag store. Bulk-loading L2 for
     a scope up front is a straightforward future optimization behind this same seam;
-    at PackSmith's ~2000-entry scale the per-cell reads are fine for v1.
+    at Packsmith's ~2000-entry scale the per-cell reads are fine for v1.
     """
 
     def __init__(self, packdump, tag_store, registry_type: str):

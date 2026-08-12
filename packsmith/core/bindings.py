@@ -63,8 +63,8 @@ def parse_instance_ref(ref, blueprint_store):
 def binding_id(slot, artifact_name, *, tag_store=None, blueprint_store=None):
     """The value to STORE for a chosen artifact — its id, or the string for L1 entries."""
     if slot.kind in ("registry_entry", "pack"):
-        # A pack has no id to store: its identity IS its directory name, and PackSmith does
-        # not own that directory (design 3.3). Renaming it outside PackSmith therefore
+        # A pack has no id to store: its identity IS its directory name, and Packsmith does
+        # not own that directory (design 3.3). Renaming it outside Packsmith therefore
         # breaks the binding — surfaced loudly at resolve time rather than papered over.
         return artifact_name
     if slot.kind == "tag":
@@ -267,7 +267,7 @@ def resolve_step(manifest, *, bindings: dict, config: dict, tag_store,
                 values.append(item)
             elif slot.kind == "pack":
                 # Checked here rather than only when bound, for the same reason blueprint
-                # shapes are: the pack is a directory PackSmith does not own, so it can be
+                # shapes are: the pack is a directory Packsmith does not own, so it can be
                 # renamed or deleted between binding this step and running it — and a write
                 # into a pack that isn't there is a silent no-op, not an error Minecraft
                 # reports.

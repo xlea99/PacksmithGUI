@@ -1,4 +1,4 @@
-# hehe.py — PackSmith's first Monaco test file
+# hehe.py — Packsmith's first Monaco test file
 
 import random
 

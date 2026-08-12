@@ -1,7 +1,7 @@
 """Conflict policy and the file hard-block — the two ownership engines under pressure
 (design 3.2.1 / 3.3 / 6.0 / 6.1).
 
-They look alike and behave differently on purpose. **L2 is closed-world** — PackSmith is
+They look alike and behave differently on purpose. **L2 is closed-world** — Packsmith is
 the only writer, so a conflict is negotiable by declared policy (overwrite / skip / fail).
 **Files are open-world** — the game, mod updates, and other editors also write them, so a
 user-owned file is hard-blocked, not negotiated.

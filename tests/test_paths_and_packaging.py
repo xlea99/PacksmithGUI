@@ -36,7 +36,7 @@ def test_a_frozen_build_does_not_put_user_data_in_the_extraction_dir(monkeypatch
 
     assert meipass not in root.parents and root != meipass, \
         f"user data would live in the extraction dir: {root}"
-    assert root == tmp_path / "roaming" / "PackSmith"
+    assert root == tmp_path / "roaming" / "Packsmith"
 
 
 def test_a_userdata_folder_beside_the_exe_wins(monkeypatch, tmp_path):
@@ -50,8 +50,8 @@ def test_a_userdata_folder_beside_the_exe_wins(monkeypatch, tmp_path):
 
 
 @pytest.mark.parametrize("platform, env, expected", [
-    ("win32", {"APPDATA": "APPDATA_DIR"}, ("APPDATA_DIR", "PackSmith")),
-    ("linux", {"XDG_DATA_HOME": "XDG_DIR"}, ("XDG_DIR", "PackSmith")),
+    ("win32", {"APPDATA": "APPDATA_DIR"}, ("APPDATA_DIR", "Packsmith")),
+    ("linux", {"XDG_DATA_HOME": "XDG_DIR"}, ("XDG_DIR", "Packsmith")),
 ])
 def test_each_platform_uses_its_own_per_user_location(monkeypatch, tmp_path,
                                                       platform, env, expected):

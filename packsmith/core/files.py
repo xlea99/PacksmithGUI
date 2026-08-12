@@ -1,7 +1,7 @@
 """File access and whole-file ownership — the OPEN-WORLD engine (design 6.0/6.1).
 
-Distinct from the Layer 2 tag engine on purpose. L2 data lives in PackSmith's own
-database where PackSmith is the sole writer; files live on disk where an
+Distinct from the Layer 2 tag engine on purpose. L2 data lives in Packsmith's own
+database where Packsmith is the sole writer; files live on disk where an
 uncontrolled external world (the game, mod updates, the user in another editor)
 also writes them. Same ownership vocabulary (user / action / untouched), different
 machinery.

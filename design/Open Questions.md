@@ -21,7 +21,7 @@ design pass. No clear home in existing sections — would likely be its own §4.
 
 ### Testing Strategy
 
-How does PackSmith get tested? The ownership model, action API, round-trip parsers, and
+How does Packsmith get tested? The ownership model, action API, round-trip parsers, and
 blueprint system all have complex invariants. Needs at minimum a strategy sketch — unit
 tests, integration tests, what gets mocked vs. real. Process-level concern, not a
 feature of any one section.
