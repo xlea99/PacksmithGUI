@@ -565,3 +565,121 @@ def list_snapshots(profile: Profile) -> list[dict]:
     return summaries
 
 
+
+
+def revert_to_snapshot(profile: Profile, snapshot_name: str) -> ImportResult:
+    """Make an archived snapshot the active one again (design 3.1's review workflow).
+
+    Adopting a dump is loud but not destructive — Layer 1 is read-only and the import never
+    touches Layer 2 — so "undo that update" has to be a real operation rather than an
+    apology. This is that operation.
+
+    **The current latest is archived first**, so reverting is itself revertible. Losing the
+    dump you just came from would make this a one-way door and turn a review into a
+    commitment, which is the opposite of the point.
+    """
+    history_dir = profile.packdumps_dir / "history"
+    source = history_dir / snapshot_name
+    if not (source / "meta.json").is_file():
+        return ImportResult("missing", current_packdump(profile),
+                            reason=f"No archived snapshot named '{snapshot_name}'")
+    try:
+        restoring = Packdump.load(source)
+    except ValueError as e:
+        return ImportResult("unreadable", current_packdump(profile), reason=str(e))
+
+    latest_dir = profile.packdumps_dir / "latest"
+    previous = None
+    if (latest_dir / "meta.json").is_file():
+        previous = Packdump.load(latest_dir)
+        archive_path = history_dir / previous.timestamp.strftime("%Y-%m-%d_%H-%M-%S")
+        if archive_path.exists():
+            shutil.rmtree(archive_path)
+        shutil.move(str(latest_dir), str(archive_path))
+        log.info(f"Archived the current packdump to {archive_path} before reverting")
+
+    latest_dir.mkdir(parents=True, exist_ok=True)
+    restoring.save(latest_dir)
+    shutil.rmtree(source, ignore_errors=True)      # it now lives in latest/, not history/
+    log.info(f"Reverted packdump to snapshot {snapshot_name}")
+
+    return ImportResult("imported", restoring,
+                        diff=previous.compare(restoring) if previous else {})
+
+
+# Whether a changed dump is adopted the moment it is noticed, or held for review.
+#
+# **Auto-adopt is the default**, and the reasoning is worth keeping next to the switch:
+# stale is the worse failure mode. An unwanted import announces itself the moment you look
+# at anything, while staleness produces confidently wrong output that looks fine. §3.1's
+# argument for holding — "prevents transient mod installs from polluting the tag/blueprint
+# data" — turned out not to apply, because importing never touches Layer 2 at all.
+#
+# It is a setting rather than a constant because the preference is genuinely arguable, and
+# a user who wants to inspect every dump before it lands should be able to say so. One
+# function, so a settings menu has exactly one thing to flip.
+AUTO_ADOPT_SETTING = "auto_adopt_packdump"
+
+
+def auto_adopt_enabled(profile: Profile) -> bool:
+    return bool(profile.settings.get(AUTO_ADOPT_SETTING, True))
+
+
+# The active dump lives in `latest/`, not in `history/`, so it has no folder name to refer
+# to. This is the name the timeline uses for it.
+ACTIVE_SNAPSHOT = "latest"
+
+
+def snapshot_timeline(profile: Profile) -> list[dict]:
+    """Every snapshot this profile holds, **newest first**, including the active one.
+
+    Ordered by the timestamp the *game* generated the dump rather than by folder mtime: a
+    revert rewrites folders, so file times record when PackSmith shuffled things around
+    while the dump's own timestamp records when the pack actually looked like that. Only
+    the second one makes "the previous snapshot" mean anything.
+    """
+    entries = [{**entry, "name": entry["path"].name, "active": False}
+               for entry in list_snapshots(profile)]
+    latest_dir = profile.packdumps_dir / "latest"
+    if (latest_dir / "meta.json").is_file():
+        try:
+            with open(latest_dir / "meta.json", "r") as handle:
+                meta = json.load(handle)
+            entries.append({
+                "path": latest_dir, "name": ACTIVE_SNAPSHOT, "active": True,
+                "timestamp": meta.get("generated_at_utc", ""),
+                "mc_version": meta.get("minecraft_version", ""),
+                "loader": meta.get("loader", ""),
+                "loader_version": meta.get("loader_version", ""),
+                "mod_count": meta.get("mod_count", 0),
+            })
+        except (json.JSONDecodeError, OSError):
+            log.warning("Skipping the active snapshot: its meta.json is unreadable")
+    entries.sort(key=lambda entry: entry["timestamp"], reverse=True)
+    return entries
+
+
+def previous_snapshot(profile: Profile, name: str):
+    """The snapshot immediately older than ``name``, or None if it is the oldest held.
+
+    "Older" is by the dump's own timestamp, so this answers "what did the pack look like
+    before this one" rather than "which folder was written first".
+    """
+    timeline = snapshot_timeline(profile)
+    for index, entry in enumerate(timeline):
+        if entry["name"] == name:
+            return timeline[index + 1] if index + 1 < len(timeline) else None
+    return None
+
+
+def compare_snapshots(profile: Profile, older_name: str, newer_name: str) -> dict:
+    """The raw diff between two stored snapshots, in ``old.compare(new)`` order.
+
+    Direction is fixed here so callers cannot get it backwards — which is the one mistake
+    that produces a confident, plausible, entirely wrong report (see `core/packdiff`).
+    """
+    by_name = {entry["name"]: entry["path"] for entry in snapshot_timeline(profile)}
+    if older_name not in by_name or newer_name not in by_name:
+        missing = older_name if older_name not in by_name else newer_name
+        raise ValueError(f"No snapshot named '{missing}'")
+    return Packdump.load(by_name[older_name]).compare(Packdump.load(by_name[newer_name]))

@@ -19,7 +19,18 @@ from PySide6.QtCore import Qt, QEvent
 from PySide6.QtGui import QShortcut, QKeySequence
 
 from packsmith.core.profile import Profile, list_profiles
-from packsmith.core.packdump import check_packdump, current_packdump, import_packdump
+from packsmith.core.archives import ArchiveError, read_member
+from packsmith.core.capabilities import (
+    CapabilityError, DATAPACKS_WRITE, RESOURCEPACKS_WRITE, PackTargets, override_kind,
+    pack_format_for, resolve)
+from packsmith.core.launchers import locate_for
+from packsmith.core.packdiff import summarise_diff, tags_at_risk
+from packsmith.integrations import PACK_LOADERS
+from packsmith.core.packdump import (
+    ACTIVE_SNAPSHOT, auto_adopt_enabled, check_packdump, compare_snapshots,
+    current_packdump,
+    import_packdump, list_snapshots, previous_snapshot, revert_to_snapshot,
+    snapshot_timeline)
 from packsmith.common.logging import log
 from packsmith.gui.profile_editor import (
     NewProfileDialog, OpenProfileDialog, confirm_force_import,
@@ -50,7 +61,7 @@ from packsmith.gui.shell import style
 from packsmith.gui.shell.sidebar import Sidebar, PanelStack
 from packsmith.gui.shell.workspace import Workspace
 from packsmith.gui.shell.bottom_panel import BottomPanel
-from packsmith.gui.shell.bottom_views import JobResultsView, ErrorsView
+from packsmith.gui.shell.bottom_views import PackdumpView, JobResultsView, ErrorsView
 from packsmith.gui.shell.panels import PANEL_SPECS
 from packsmith.gui.shell.panels.base import StubPanel
 from packsmith.gui.shell.panels.registry_panel import RegistryPanel
@@ -59,7 +70,9 @@ from packsmith.gui.shell.panels.tags_panel import TagsPanel
 from packsmith.gui.shell.panels.jobs_panel import JobsPanel
 from packsmith.gui.shell.panels.files_panel import FilesPanel
 from packsmith.gui.editor.host import EditorHost, EditorTab, UnsupportedFileTab
-from packsmith.gui.editor.sources import InstanceFileSource, PackageFileSource
+from packsmith.gui.editor.sources import (
+    InstanceFileSource, JarMemberSource, PackageFileSource, is_overridable, member_path,
+    split_member)
 from packsmith.gui.shell.panels.actions_panel import ActionsPanel
 from packsmith.gui.shell.panels.blueprints_panel import BlueprintsPanel
 from packsmith.gui.query_bar import QueryBar, combine
@@ -69,7 +82,11 @@ from packsmith.gui.blueprint_editor import BlueprintEditorTab, NewBlueprintDialo
 from packsmith.gui.action_editor import (
     NewActionDialog, NewFileDialog, NewFolderDialog, RenameFileDialog,
 )
+from packsmith.gui.image_viewer import ImageViewerTab
+from packsmith.gui.override_dialog import OverrideTargetDialog
+from packsmith.gui.packdump_diff import PackdumpDiffTab
 from packsmith.gui.jar_viewer import JarViewerTab
+from packsmith.gui.nbt_viewer import NbtViewerTab
 from packsmith.gui.job_editor import JobEditorTab
 from packsmith.gui.table.registry_table_model import RegistryTableModel
 from packsmith.gui.table.registry_sort_proxy import RegistrySortProxy
@@ -105,6 +122,11 @@ class MainWindow(QMainWindow):
         self._shortcuts = []      # ditto — parented to the window, not the central widget
         self._import_result = None
         self._last_focus_check = None
+        # Set when a dump was written to disk but the window could not take it on (the
+        # unsaved-changes guard refused the fallback rebuild). Without it the import would
+        # be lost for good: `check_packdump` compares the instance against what is already
+        # on disk, so it would answer "unchanged" from then on.
+        self._rebuild_pending = False
 
         self._build_menu_bar()
         self._enter_profile(profile_name or self._default_profile())
@@ -154,7 +176,12 @@ class MainWindow(QMainWindow):
         # confidently wrong output that looks fine, while an unwanted import announces
         # itself the moment you look at anything. What is *not* automatic is adopting a
         # dump that fails the profile's contract; see _report_import.
-        self._import_result = import_packdump(self._profile)
+        # Auto-adopt is the DEFAULT, not a hardcoded truth: `auto_adopt_enabled` is the
+        # one place a settings menu will flip. With it off, the dump is only inspected —
+        # nothing changes until the user blesses it from the Packdump tab.
+        self._import_result = (import_packdump(self._profile)
+                               if auto_adopt_enabled(self._profile)
+                               else check_packdump(self._profile))
         self._packdump = self._import_result.packdump or current_packdump(self._profile)
         if self._packdump is None:
             # §3.1 gates the app on the first packdump; it does not crash it. Raising here
@@ -267,7 +294,17 @@ class MainWindow(QMainWindow):
         self._jobs_panel.delete_requested.connect(self._delete_job)
         self._jobs_panel.pin_toggled.connect(self._toggle_pin)
 
-        self._files_panel = FilesPanel(self._file_store)
+        # §8.1: the loader detected in this pack, or None. It is what gives Smart Mode
+        # its categories — with no loader mod there are no global datapacks to categorise.
+        self._loaders = resolve(self._packdump, loaders=PACK_LOADERS)
+        active_loader = self._loaders.provider_for(DATAPACKS_WRITE)
+        self._files_panel = FilesPanel(self._file_store, loader=active_loader)
+        self._files_panel._mc_version = self._profile.mc_version
+        # The real client jar, when this launcher's layout is one PackSmith knows or the
+        # user has pointed at it. Used for `pack_format` today (Mojang's own number rather
+        # than a memorised one) and for browsing vanilla data later (§3.1).
+        self._client_jar = locate_for(self._profile)
+        self._files_panel._client_jar = self._client_jar.path if self._client_jar else None
         self._files_panel.ownership_changed.connect(self._file_ownership_changed)
         self._files_panel.file_activated.connect(self._open_file)
 
@@ -333,6 +370,9 @@ class MainWindow(QMainWindow):
             # provenance. Different worlds, deliberately different rules.
             "instance": InstanceFileSource(self._file_store, on_claim=self._on_file_claimed),
             "package": PackageFileSource(self._packages, self._profile.packages_dir),
+            # Members of jars in the instance. Read-only by provenance (§6.5) — the source
+            # itself refuses writes, so the editor needs no special case.
+            "jar": JarMemberSource(self._file_store.root),
         }
         if self._editor_host is None:
             self._editor_host = EditorHost(sources, container=self)
@@ -357,6 +397,17 @@ class MainWindow(QMainWindow):
                             blueprint_store=self._blueprints)
         errors.resolved.connect(self._on_orphans_resolved)
         self._bottom.set_panel("errors", errors)
+
+        packdump_view = PackdumpView()
+        packdump_view.open_diff_requested.connect(self._open_packdump_diff)
+        packdump_view.snapshot_diff_requested.connect(self._open_snapshot_diff)
+        packdump_view.snapshot_vs_active_requested.connect(
+            self._open_snapshot_vs_active)
+        packdump_view.bless_requested.connect(self._bless_packdump)
+        packdump_view.revert_requested.connect(self._revert_packdump)
+        packdump_view.status.connect(self._set_status)
+        self._bottom.set_panel("packdump", packdump_view)
+        self._refresh_packdump_panel()
 
         vertical = QSplitter(Qt.Vertical)
         vertical.addWidget(self._workspace)
@@ -399,15 +450,24 @@ class MainWindow(QMainWindow):
         name = QLabel(f"{self._profile.name}")
         name.setStyleSheet(f"font-size: 14px; font-weight: bold; color: {style.TEXT};")
 
-        info = QLabel(
-            f"{self._packdump.mc_version}  {self._profile.loader} "
-            f"{self._profile.loader_version}  |  {len(self._packdump.mods)} mods")
-        info.setStyleSheet(f"font-size: 12px; color: {style.TEXT_MUTED};")
+        # Kept, because adopting a dump rewrites it in place: the mod count in the header is
+        # the first thing that would silently disagree with the pack after an import.
+        self._header_info = QLabel()
+        self._header_info.setStyleSheet(f"font-size: 12px; color: {style.TEXT_MUTED};")
+        self._refresh_header()
 
         lay.addWidget(name)
         lay.addStretch()
-        lay.addWidget(info)
+        lay.addWidget(self._header_info)
         return header
+
+    def _refresh_header(self):
+        label = getattr(self, "_header_info", None)
+        if label is None or self._packdump is None:
+            return
+        label.setText(
+            f"{self._packdump.mc_version}  {self._profile.loader} "
+            f"{self._profile.loader_version}  |  {len(self._packdump.mods)} mods")
 
     # --- blueprints --------------------------------------------------------
 
@@ -709,6 +769,139 @@ class MainWindow(QMainWindow):
 
     # --- packdump ----------------------------------------------------------
 
+    # --- packdump review (design 3.1 / 4.1) --------------------------------
+
+    def _packdump_summary(self):
+        """The last comparison, normalised into added/removed terms."""
+        result = getattr(self, "_import_result", None)
+        return summarise_diff(result.diff) if result is not None else None
+
+    def _packdump_at_risk(self):
+        """Assignments the ACTIVE dump orphans. Computed against what is in effect, so it
+        is a report when auto-adopt is on and a warning when it isn't."""
+        try:
+            return tags_at_risk(self._tags, self._packdump) if self._packdump else []
+        except Exception:
+            return []
+
+    def _refresh_packdump_panel(self):
+        view = self._bottom.panel("packdump")
+        if view is None or not isinstance(view, PackdumpView):
+            return
+        result = getattr(self, "_import_result", None)
+        snapshots = []
+        for entry in list_snapshots(self._profile):
+            snapshots.append({**entry, "name": entry["path"].name})
+        view.show_state(
+            summary=self._packdump_summary(),
+            at_risk=self._packdump_at_risk(),
+            # Pending only ever happens with auto-adopt turned off: the dump differs and
+            # nothing has been written.
+            pending=bool(result is not None and result.status == "changed"),
+            snapshots=snapshots)
+
+    def _open_packdump_diff(self):
+        """Open the comparison as its own tab.
+
+        The strip says *that* something changed; this is where you read *what*. A real
+        update to a 300-mod pack moves thousands of entries, which is not a thing a few
+        rows of bottom panel can show.
+        """
+        summary = self._packdump_summary()
+        if summary is None:
+            self._set_status("No packdump comparison to show")
+            return
+        key = ("packdump-diff", "latest")
+        existing = self._open_tabs.get(key)
+        if existing is not None and self._workspace.focus_widget(existing):
+            return existing
+        tab = PackdumpDiffTab(summary, at_risk=self._packdump_at_risk())
+        tab.status.connect(self._set_status)
+        self._workspace.add_tab(tab, "Packdump changes")
+        self._open_tabs[key] = tab
+        return tab
+
+    def _open_snapshot_diff(self, snapshot_name):
+        """What this snapshot changed, against the snapshot before it."""
+        previous = previous_snapshot(self._profile, snapshot_name)
+        if previous is None:
+            self._set_status(
+                f"{snapshot_name} is the oldest snapshot kept — there is nothing before "
+                f"it to compare against")
+            return
+        return self._open_diff_between(previous["name"], snapshot_name)
+
+    def _open_snapshot_vs_active(self, snapshot_name):
+        """What has changed between this snapshot and the dump in effect now.
+
+        Usually the reason you were looking at history in the first place: not "what did
+        that one update do" but "what have I gained and lost since then".
+        """
+        if snapshot_name == ACTIVE_SNAPSHOT:
+            self._set_status("That snapshot is the active dump")
+            return
+        return self._open_diff_between(snapshot_name, ACTIVE_SNAPSHOT)
+
+    def _open_diff_between(self, older_name, newer_name):
+        """Open the diff between two stored snapshots.
+
+        One implementation for every pair, because the direction is the only thing that can
+        be wrong here and it should be decided in exactly one place. The tab is the same one
+        an import opens — "what did this change" is the same question whenever it is asked.
+        """
+        try:
+            diff = compare_snapshots(self._profile, older_name, newer_name)
+        except (ValueError, OSError) as e:
+            QMessageBox.warning(self, "Compare snapshots", str(e))
+            return
+
+        key = ("packdump-diff", f"{older_name}->{newer_name}")
+        existing = self._open_tabs.get(key)
+        if existing is not None and self._workspace.focus_widget(existing):
+            return existing
+        summary = summarise_diff(diff)
+        tab = PackdumpDiffTab(summary, title=f"{older_name} → {newer_name}")
+        tab.status.connect(self._set_status)
+        # Named for the pair: several of these can be open at once, and three tabs all
+        # called "Packdump changes" tell you nothing about which is which.
+        label = "now" if newer_name == ACTIVE_SNAPSHOT else newer_name[:10]
+        self._workspace.add_tab(tab, f"{older_name[:10]} → {label}")
+        self._open_tabs[key] = tab
+        self._set_status(f"{older_name} → {label}: {summary.headline()}")
+        return tab
+
+    def _bless_packdump(self):
+        """Adopt a dump that was held for review (auto-adopt off)."""
+        self._import_result = import_packdump(self._profile)
+        if self._import_result.status == "imported":
+            self._adopt_packdump(self._import_result.packdump)
+            return
+        self._report_import(self._import_result)
+        self._refresh_packdump_panel()
+
+    def _revert_packdump(self, snapshot_name):
+        """Go back to an archived snapshot (design 3.1's review workflow).
+
+        Loud, because it changes what every view reads — but not destructive: the dump it
+        replaces is archived first, so this is revertible in its own right.
+        """
+        if QMessageBox.question(
+                self, "Revert packdump",
+                f"Make snapshot '{snapshot_name}' the active packdump?\n\n"
+                f"Your tags, blueprints and jobs are untouched — but anything referring to "
+                f"entries that only exist in the newer dump will read as orphaned until "
+                f"you come back.\n\n"
+                f"The dump you are replacing is archived, so this is undoable.",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
+            return
+        result = revert_to_snapshot(self._profile, snapshot_name)
+        if result.status != "imported":
+            QMessageBox.warning(self, "Revert packdump", result.reason or "Could not revert")
+            return
+        self._import_result = result
+        self._adopt_packdump(result.packdump)
+        self._set_status(f"Reverted to packdump snapshot {snapshot_name}")
+
     def _report_import(self, result, *, initial=False):
         """Be loud in proportion to what the import did to the user's DATA.
 
@@ -769,24 +962,172 @@ class MainWindow(QMainWindow):
         if self._import_result.status != "imported":
             self._report_import(self._import_result)
             return
-        # The registry underneath everything just changed; nothing that reads it can stay.
-        self._switch_profile_in_place()
+        # The registry underneath everything just changed; every holder has to be re-pointed.
+        self._adopt_packdump(self._import_result.packdump)
+
+    # --- adopting a new packdump (design 3.1) ------------------------------
+    #
+    # A packdump change is NOT a profile change. Layer 2 — tags, blueprints, views, jobs —
+    # lives in the profile database, and a new registry does not touch a byte of it. So the
+    # database never needs closing and the workspace never needs tearing down: what changes
+    # is one Layer 1 object, read by a countable set of holders.
+    #
+    # This matters because the import fires on window focus, which is exactly when the user
+    # comes back from playtesting — and a mod the launcher updated on its own is enough to
+    # trigger it. Charging them their whole workspace for that is a punishment for the loop
+    # PackSmith exists to support.
+    #
+    # **THE RULE: anything that stores a packdump implements `set_packdump`, and is reached
+    # by `_packdump_holders`.** A holder that forgets goes silently stale — it keeps
+    # answering from a registry the game no longer has, which is precisely the failure §3.1
+    # calls worse than an unwanted import, *because it looks fine*. Holders read their dump
+    # lazily inside a refresh method; none of them derive-and-cache at construction, and
+    # that property is what makes the swap safe rather than hopeful. It has to be kept.
+    # `tests/test_packdump_adopt.py` walks the live window and fails on any holder left
+    # pointing at the old dump.
+
+    def _packdump_holders(self):
+        """Every object that stores the packdump. Anything without `set_packdump` (an
+        editor, an image viewer) simply isn't one and is skipped by the caller."""
+        yield getattr(self, "_blueprints", None)
+        yield getattr(self, "_registry_panel", None)
+        bottom = getattr(self, "_bottom", None)
+        if bottom is not None:
+            yield bottom.panel("errors")
+        yield from self._tab_models.values()          # open view tabs
+        yield from self._open_tabs.values()           # blueprint and job tabs
+
+    def _adopt_packdump(self, dump):
+        """Point the window at a newly imported dump, leaving the workspace alone.
+
+        Falls back to the full rebuild if rebinding raises: a half-rebound window is worse
+        than a rebuilt one, because some of it would still be answering from the old
+        registry — the exact thing this is here to prevent.
+        """
+        if dump is None:
+            return
+        if getattr(self, "_blocked", None) or getattr(self, "_workspace", None) is None:
+            # Nothing was ever built to rebind; entering the profile is what builds it.
+            self._enter_profile(self._profile.name)
+            return
+        try:
+            self._rebind_packdump(dump)
+        except Exception:
+            log.warning("Could not rebind onto the new packdump; rebuilding the window",
+                        exc_info=True)
+            self._switch_profile_in_place()
+            return
+        self._report_import(self._import_result)
+
+    def _pack_targets(self):
+        """Which datapacks and resource packs this profile has (design 3.3 / 8.1).
+
+        Built fresh each time rather than cached: packs are folders on disk that the user
+        (or anything else) can create and delete between one call and the next, and a picker
+        offering a pack that is no longer there is worse than a moment's directory read.
+        """
+        loaders = getattr(self, "_loaders", None)
+        store = getattr(self, "_file_store", None)
+        if loaders is None or store is None:
+            return None
+        return PackTargets(loaders, store.root)
+
+    def _rebind_packdump(self, dump):
+        self._packdump = dump
+        self._rebuild_pending = False
+        for holder in self._packdump_holders():
+            rebind = getattr(holder, "set_packdump", None)
+            if rebind is not None:
+                rebind(dump)
+        # §8.1: a mod update can install or remove the pack loader itself, so the resolution
+        # table is derived from the dump and has to be recomputed rather than kept.
+        self._loaders = resolve(dump, loaders=PACK_LOADERS)
+        if getattr(self, "_files_panel", None) is not None:
+            self._files_panel.set_loader(self._loaders.provider_for(DATAPACKS_WRITE))
+        self._refresh_header()
+        self._refresh_packdump_panel()
 
     def _switch_profile_in_place(self):
-        """Rebuild against the same profile — used after a forced import, where the
-        packdump changed but the profile didn't."""
+        """Rebuild against the same profile — the fallback when rebinding fails.
+
+        Reopens whatever was open, best-effort. Not the normal path any more: see
+        `_adopt_packdump`, which is what runs when a dump is imported.
+        """
+        reopen = list(self._open_tabs)
         if not self._close_all_tabs():
+            # The unsaved-changes guard refused. The new dump is already written to disk,
+            # so bailing outright would leave the window reading an old registry that
+            # nothing would ever re-offer — `check_packdump` compares against what is on
+            # disk and would report "unchanged" forever after. So: put back what we closed,
+            # and remember to try again on the next focus.
+            self._reopen_tabs(reopen)
+            self._rebuild_pending = True
+            self._set_status("Packdump import postponed — save or close your edited tabs")
             return
         try:
             self._db.close()
         except Exception:
             log.warning("Could not close the database before rebuilding", exc_info=True)
+        self._rebuild_pending = False
         self._enter_profile(self._profile.name)
+        self._reopen_tabs(reopen)
+
+    def _reopen_tabs(self, keys):
+        """Put back the tabs a rebuild closed, in the order they were in.
+
+        Best-effort by design: a view, blueprint or job the new packdump invalidated simply
+        doesn't come back, and that is the honest outcome — better than an empty tab
+        claiming to show something that is gone.
+
+        Every kind `_open_tabs` can hold is handled here. A kind that is missing doesn't
+        fail loudly, it just silently stops coming back — which is how the packdump-diff
+        tab quietly went missing across a rebuild for as long as it did.
+        """
+        for key in keys:
+            kind = key[0] if isinstance(key, tuple) else None
+            try:
+                if kind == "doc":
+                    source, path = self._editor_host.split_key(key[1])
+                    self._open_document(source, path)
+                elif kind == "browse":
+                    self._open_browse(key[1])
+                elif kind == "tag":
+                    self._open_tag_view(key[1], key[2])
+                elif kind == "packdump-diff":
+                    # The tab that says what changed is the one an adopt would otherwise
+                    # close — which is the worst possible thing to drop on an import.
+                    if key[1] == "latest":
+                        self._open_packdump_diff()
+                    else:
+                        older, _, newer = key[1].partition("->")
+                        self._open_diff_between(older, newer)
+                elif kind == "view":
+                    view = next((v for v in self._views.all() if v.id == key[1]), None)
+                    if view is not None:
+                        self._open_view(view)
+                elif kind == "blueprint":
+                    if key[1] in set(self._blueprints.names()):
+                        self._open_blueprint(key[1])
+                elif kind == "job":
+                    job = self._jobs.get(key[1])
+                    if job is not None:
+                        self._open_job_editor(job)
+            except Exception:
+                log.info("Could not reopen %s after the packdump changed", key, exc_info=True)
 
     def _check_for_new_packdump(self):
         """Poll on window focus. The mental model is that the packdump is a LIVE snapshot,
         and you generate a new one by leaving PackSmith to run the game — so coming back is
         exactly the moment to look. Cheap: a load and a comparison, no watcher."""
+        if self._rebuild_pending:
+            # A dump already landed on disk that the window never took on. Nothing on the
+            # instance side has to change for that to still be owed, so it is checked
+            # against what we are HOLDING rather than against the instance.
+            latest = current_packdump(self._profile)
+            if latest is not None and latest != self._packdump:
+                self._adopt_packdump(latest)
+                return
+            self._rebuild_pending = False
         try:
             checked = check_packdump(self._profile)
         except Exception:
@@ -803,7 +1144,7 @@ class MainWindow(QMainWindow):
         if checked.status == "imported":
             self._import_result = import_packdump(self._profile)
             if self._import_result.status == "imported":
-                self._switch_profile_in_place()
+                self._adopt_packdump(self._import_result.packdump)
                 return
         self._import_result = checked
         self._report_import(checked)
@@ -1078,9 +1419,37 @@ class MainWindow(QMainWindow):
             # than the pack's.
             tab = JarViewerTab(self._file_store.root / path)
             tab.status.connect(self._set_status)
+            tab.member_activated.connect(
+                lambda _archive, member, rel=path: self._open_jar_member(rel, member))
+            tab.override_requested.connect(
+                lambda _archive, member, rel=path: self._save_as_override(rel, member))
             self._workspace.add_tab(tab, Path(path).name)
             self._open_tabs[("doc", key)] = tab
             self._set_status(f"{Path(path).name} — {tab._summary.text()}")
+            return tab
+        if kind == filetypes.NBT:
+            # Bytes, like the image viewer — so a structure file inside a mod's jar opens
+            # exactly like one on disk, and neither is extracted (design 6.5).
+            tab = NbtViewerTab(self._bytes_for(source, path) or b"", Path(path).name,
+                               read_only_reason=self._nbt_read_only_reason(source, path))
+            tab.status.connect(self._set_status)
+            tab.save_requested.connect(
+                lambda data, s=source, p=path, t=tab: self._save_nbt(s, p, t, data))
+            tab.dirty_changed.connect(
+                lambda dirty, p=path, t=tab: self._on_tab_dirty(t, Path(p).name, dirty))
+            self._workspace.add_tab(tab, Path(path).name)
+            self._open_tabs[("doc", key)] = tab
+            self._set_status(f"{Path(path).name} — {tab._summary.text()}")
+            return tab
+        if kind == filetypes.IMAGE:
+            # One branch for both worlds: the viewer takes BYTES, so a texture on disk and
+            # a texture inside a jar are the same case and neither is extracted.
+            data = self._bytes_for(source, path)
+            tab = ImageViewerTab(data or b"", Path(path).name)
+            tab.status.connect(self._set_status)
+            self._workspace.add_tab(tab, Path(path).name)
+            self._open_tabs[("doc", key)] = tab
+            self._set_status(f"{Path(path).name} — {tab._info.text()}")
             return tab
         if kind != filetypes.TEXT:
             tab = UnsupportedFileTab(path, kind)
@@ -1108,8 +1477,159 @@ class MainWindow(QMainWindow):
         tab.activate()
         return tab
 
+    def _nbt_read_only_reason(self, source, path):
+        """Why this NBT file can't be saved in place, or None.
+
+        A jar member is the case that matters and it is the same answer §6.5 gives for
+        text: the mod's own copy must stay exactly as it shipped, because the whole
+        override mechanism depends on it. So the reason names the way forward rather than
+        just refusing.
+        """
+        if source == "jar":
+            archive, member = split_member(path)
+            if is_overridable(member):
+                return (f"Read-only — this is inside {Path(archive).name}. Right-click it "
+                        f"in the jar and choose \"Save as override\" for an editable copy.")
+            return f"Read-only — {Path(archive).name} members have no override target."
+        if source == "package":
+            return None
+        try:
+            locked = self._file_store.ownership(path)
+        except Exception:
+            return None
+        if locked and locked.get("kind") == "action":
+            # Whole-file ownership (§6.1). §6.4 wants this per-path, which would let two
+            # actions own different branches; §1.1 defers per-key claims, so the file is
+            # the unit here exactly as it is for a config.
+            return (f"Read-only — an action owns this file "
+                    f"({locked.get('action_ref') or 'unknown'}). Take it in the Files panel "
+                    f"to edit it.")
+        return None
+
+    def _save_nbt(self, source, path, tab, data: bytes):
+        """Write an edited NBT tree back (design 6.4).
+
+        Binary all the way: `write_bytes` exists precisely so a gzipped tag tree isn't
+        routed through the text path, which would mangle it — or raise while capturing the
+        prior content for rollback, which is a confusing place to fail.
+        """
+        if source != "instance":
+            self._set_status(f"{Path(path).name} can't be saved here")
+            return
+        try:
+            self._file_store.write_bytes(path, data, owner="user")
+        except Exception as e:
+            QMessageBox.warning(self, "Couldn't save", f"{path}\n\n{e}")
+            self._set_status(f"Save failed: {e}")
+            return
+        tab.mark_saved()
+        self._set_status(f"Saved {path} — {len(data):,} bytes")
+        self._files_panel.refresh()          # the save may have claimed ownership
+
+    def _on_tab_dirty(self, tab, name, dirty):
+        """The unsaved dot, for tabs that aren't Monaco (design 4.1 wants it visible)."""
+        self._workspace.set_tab_title(tab, f"● {name}" if dirty else name)
+
+    def _save_as_override(self, archive_rel, member):
+        """Copy a file out of a mod jar into a datapack or resource pack (design 6.5).
+
+        "PackSmith doesn't do anything clever here — it just writes the file to the right
+        place and lets Minecraft's pack layering do the rest" (§8.1). The path inside the
+        pack is the path inside the jar, unchanged: that is the entire mechanism, and
+        altering it would produce a file the game never looks at.
+        """
+        kind = override_kind(member)
+        if kind is None:
+            self._set_status(f"{member} has no override target")
+            return
+        capability = (DATAPACKS_WRITE if kind == "datapacks" else RESOURCEPACKS_WRITE)
+        try:
+            loader = self._loaders.require(capability)
+        except CapabilityError as e:
+            QMessageBox.information(
+                self, "No pack loader",
+                f"{e}\n\nMinecraft has no built-in way to load a global datapack, so "
+                f"overrides need a loader mod such as Paxi, OpenLoader or Moonlight.")
+            return
+
+        setting = f"override_target_{kind}"
+        dialog = OverrideTargetDialog(
+            member, kind, loader.packs(self._file_store.root, kind),
+            default=self._profile.settings.get(setting), parent=self)
+        if not dialog.exec():
+            return
+
+        pack = dialog.result_pack
+        try:
+            if dialog.result_is_new:
+                loader.create_pack(
+                    self._file_store.root, pack, kind=kind,
+                    pack_format=pack_format_for(
+                        self._profile.mc_version, kind,
+                        client_jar=self._client_jar.path if self._client_jar else None))
+            target = loader.override_path(self._file_store.root, pack, member, kind=kind)
+            rel = target.relative_to(self._file_store.root).as_posix()
+        except (OSError, ValueError) as e:
+            QMessageBox.warning(self, "Save as override", str(e))
+            return
+
+        if target.exists() and QMessageBox.question(
+                self, "Overwrite existing override",
+                f"'{pack}' already overrides {member}.\n\nReplace it with the copy from "
+                f"{Path(archive_rel).name}? Anything you changed in it will be lost.",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
+            return
+
+        try:
+            data = read_member(self._file_store.root / archive_rel, member)
+            # Bytes, not text: an override is as often a PNG as a JSON, and the ownership
+            # record matters either way — this file is now the user's.
+            self._file_store.write_bytes(rel, data, owner="user")
+        except (ArchiveError, OSError) as e:
+            QMessageBox.warning(self, "Save as override", f"Could not write it: {e}")
+            return
+
+        # Sticky per profile (§8.1), so the next override goes where the last one did.
+        self._profile.settings[setting] = pack
+        self._profile.save()
+        self._files_panel.refresh()
+        self._set_status(f"Overriding {member} in '{pack}' — {loader.name} will load it")
+        return self._open_file(rel)
+
+    def _open_jar_member(self, archive_rel, member):
+        """Open one file from inside a jar (design 6.5, step two).
+
+        Nothing is extracted — the member is read out of the archive into memory and handed
+        to the editor as a string. A scratch copy on disk would be the very thing §6.5
+        exists to remove, only hidden somewhere the user can't see it.
+        """
+        return self._open_document("jar", member_path(archive_rel, member))
+
+    def _bytes_for(self, source, path) -> bytes:
+        """The raw bytes of a document, whichever world it lives in.
+
+        The two are genuinely different reads — one from disk, one out of a zip — and
+        everything downstream is happier not knowing which it got.
+        """
+        try:
+            if source == "jar":
+                return self._editor_host.source_named("jar").raw(path)
+            root = (self._file_store.root if source == "instance"
+                    else self._packages.directory)
+            return (Path(root) / path).read_bytes()
+        except Exception:
+            return b""
+
     def _file_kind(self, source, path) -> str:
         """Classify by extension plus a peek at the bytes, per 6.0's "content sniffing"."""
+        if source == "jar":
+            # Classified from the member's OWN bytes: `data/.../x.json` is text and
+            # `Mod.class` is not, and neither fact is knowable from the jar's extension.
+            try:
+                probe = self._editor_host.source_named("jar").raw(path)[:4096]
+            except Exception:
+                return filetypes.BINARY
+            return filetypes.classify(split_member(path)[1], probe)
         root = (self._file_store.root if source == "instance"
                 else self._packages.directory)
         try:
@@ -1432,7 +1952,26 @@ class MainWindow(QMainWindow):
             self._files_panel.refresh()      # the save may have claimed ownership
 
     def _may_close_tab(self, widget) -> bool:
-        """Veto closing an editor tab with unsaved changes unless the user insists."""
+        """Veto closing a tab with unsaved changes unless the user insists."""
+        if isinstance(widget, NbtViewerTab):
+            # An NBT tab edits an in-memory tree with no autosave anywhere, so closing it
+            # is the only way to lose the work — which makes the guard MORE necessary here
+            # than for Monaco, not less.
+            if not widget.is_dirty:
+                return True
+            answer = QMessageBox.question(
+                self, "Unsaved changes",
+                f"{widget.label} has unsaved changes.\n\nSave before closing?",
+                QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel,
+                QMessageBox.Save)
+            if answer == QMessageBox.Cancel:
+                return False
+            if answer == QMessageBox.Save:
+                # Synchronous, unlike Monaco's: the bytes come straight off the tree, so
+                # they are written before this returns and the tab is destroyed.
+                widget.request_save()
+                return not widget.is_dirty      # a failed write must not close the tab
+            return True
         if not isinstance(widget, EditorTab) or not widget.is_dirty:
             return True
         answer = QMessageBox.question(
@@ -1666,7 +2205,8 @@ class MainWindow(QMainWindow):
         try:
             return step_problems(self._jobs.get(job.id), package_index=self._packages,
                                  tag_store=self._tags, blueprint_store=self._blueprints,
-                                 packdump=self._packdump)
+                                 packdump=self._packdump,
+                                 pack_targets=self._pack_targets())
         except Exception:            # never let a cosmetic check break the panel
             return []
 
@@ -1788,7 +2328,8 @@ class MainWindow(QMainWindow):
                          job_store=self._jobs, package_index=self._packages,
                          tag_store=self._tags, packdump=self._packdump,
                          file_store=self._file_store, history=self._history,
-                         job_history=self._job_history)
+                         job_history=self._job_history,
+                         pack_targets=self._pack_targets())
 
         for step in result.step_results:
             for level, message in step.log_lines:
@@ -1900,7 +2441,8 @@ class MainWindow(QMainWindow):
         for ref, manifest in sorted(self._packages.actions.items()):
             try:
                 bindings = best_guess_bindings(manifest, self._tags,
-                                               blueprint_store=self._blueprints)
+                                               blueprint_store=self._blueprints,
+                                               pack_targets=self._pack_targets())
                 job = self._jobs.create(manifest.name or ref)
             except ValueError:
                 continue

@@ -11,8 +11,8 @@ import json
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
-    QTreeWidget, QTreeWidgetItem, QWidget, QVBoxLayout, QLabel, QMenu, QMessageBox,
-    QInputDialog,
+    QTreeWidget, QTreeWidgetItem, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QMenu,
+    QMessageBox, QInputDialog, QPushButton,
 )
 
 from packsmith.core.history import rollback_step
@@ -240,6 +240,16 @@ class ErrorsView(_SummaryView):
         """Whether anything is currently listed. Lets callers decide to interrupt without
         recomputing orphans a second time."""
         return self._tree.topLevelItemCount() > 0
+
+    def set_packdump(self, packdump):
+        """Adopt a newly imported dump (design 3.1).
+
+        This panel *is* the fallout report — orphans are assignments pointing at entries
+        the current dump no longer has — so it has to recompute against the new one. A
+        stale reference here would keep saying the pack was fine while it wasn't.
+        """
+        self._packdump = packdump
+        self.refresh()
 
     def refresh(self):
         self._tree.clear()
@@ -601,3 +611,134 @@ def _describe_changes(rollback_json) -> str:
     if files:
         parts.append(f"{files} file{'s' if files != 1 else ''}")
     return ", ".join(parts) if parts else "no changes"
+
+
+class PackdumpView(_SummaryView):
+    """Packdump management, in the strip — design 4.1.
+
+    §4.1 asks for "diff summary, orphaned tags at risk, and a Bless action". All of that
+    lives here EXCEPT the diff itself, which opens as its own tab: a real update to a
+    300-mod pack moves thousands of entries, and a few rows of bottom panel is a place to
+    learn *that* something changed, not to read *what*.
+
+    So this is the summary and the launcher. It also carries the two things you can
+    actually do to a snapshot — adopt the pending one, or go back to an older one — because
+    they are decisions about what you just read.
+    """
+
+    open_diff_requested = Signal()
+    snapshot_diff_requested = Signal(str)     # vs the snapshot before it
+    snapshot_vs_active_requested = Signal(str)   # vs the dump in effect now
+    bless_requested = Signal()
+    revert_requested = Signal(str)      # snapshot folder name
+    status = Signal(str)
+
+    def __init__(self, parent=None):
+        super().__init__(["Snapshot", "When", "Mods"],
+                         "No packdump loaded.", parent)
+        self._summary = None
+        self._pending = False
+
+        self._headline = QLabel()
+        self._headline.setWordWrap(True)
+        self._headline.setContentsMargins(10, 6, 10, 4)
+        self._headline.setStyleSheet(f"color: {style.TEXT}; font-size: 11px;")
+        self.layout().insertWidget(0, self._headline)
+
+        bar = QWidget()
+        bar_lay = QHBoxLayout(bar)
+        bar_lay.setContentsMargins(8, 0, 8, 6)
+        bar_lay.setSpacing(6)
+        self._open_button = self._small_button("View changes…", self.open_diff_requested)
+        self._bless_button = self._small_button("Bless this dump", self.bless_requested)
+        self._bless_button.hide()
+        bar_lay.addWidget(self._open_button)
+        bar_lay.addWidget(self._bless_button)
+        bar_lay.addStretch()
+        self.layout().insertWidget(1, bar)
+
+        self._tree.setContextMenuPolicy(Qt.CustomContextMenu)
+        self._tree.customContextMenuRequested.connect(self._on_context_menu)
+
+    @staticmethod
+    def _small_button(text, signal):
+        button = QPushButton(text)
+        button.setStyleSheet(f"""
+            QPushButton {{
+                background: {style.BG_CHROME}; color: {style.TEXT_MUTED};
+                border: 1px solid {style.BORDER}; font-size: 11px; padding: 2px 8px;
+            }}
+            QPushButton:hover {{ color: {style.TEXT}; border-color: {style.ACCENT_EDGE}; }}
+        """)
+        button.clicked.connect(lambda: signal.emit())
+        return button
+
+    def show_state(self, *, summary=None, at_risk=(), pending=False, snapshots=(),
+                   active=None):
+        """Everything the strip knows, set in one call.
+
+        One setter rather than several because these are facets of a single answer — what
+        happened to Layer 1 — and letting them be set independently is how a panel ends up
+        showing a diff from one import beside a snapshot list from another.
+        """
+        self._summary = summary
+        self._pending = pending
+        # Blessing is only offered when there is something to bless. With auto-adopt on
+        # (the default) that is never, and a permanently disabled button would be a
+        # standing invitation to wonder what it does.
+        self._bless_button.setVisible(pending)
+        self._open_button.setEnabled(summary is not None and not summary.empty)
+
+        if summary is None:
+            self._headline.setText("No packdump comparison available.")
+        elif pending:
+            self._headline.setText(
+                f"A new dump is waiting: {summary.headline()}. "
+                f"Nothing has changed until you bless it.")
+        elif summary.empty:
+            self._headline.setText("The instance's dump matches the active snapshot.")
+        else:
+            text = f"Last import: {summary.headline()}."
+            if at_risk:
+                text += (f"   ⚠ {len(at_risk):,} tag assignment"
+                         f"{'s' if len(at_risk) != 1 else ''} orphaned by it.")
+            self._headline.setText(text)
+
+        self._tree.clear()
+        for snapshot in snapshots:
+            item = QTreeWidgetItem([
+                snapshot.get("name", ""),
+                (snapshot.get("timestamp") or "").replace("T", " ")[:19],
+                str(snapshot.get("mod_count", "")),
+            ])
+            item.setData(0, Qt.UserRole, snapshot.get("name"))
+            if snapshot.get("name") == active:
+                item.setForeground(0, style.qt_colour(style.ACCENT_EDGE))
+                item.setToolTip(0, "the active snapshot")
+            self._tree.addTopLevelItem(item)
+        self._show_empty(self._tree.topLevelItemCount() == 0)
+
+    def _on_context_menu(self, pos):
+        menu = self._menu_for(self._tree.itemAt(pos))
+        if menu is not None:
+            menu.exec(self._tree.mapToGlobal(pos))
+
+    def _menu_for(self, item):
+        """Built separately from being shown, so it can be inspected: `exec` blocks on a
+        real menu loop, which in a test is a hang rather than a failure."""
+        name = item.data(0, Qt.UserRole) if item is not None else None
+        if not name:
+            return None
+        menu = QMenu(self)
+        # First, because looking is what you do before deciding — and reverting to a
+        # snapshot you haven't inspected is exactly the guess this tab exists to replace.
+        # Two different questions, and both get asked: "what did this update do" (against
+        # the snapshot before it) and "what have I gained or lost since" (against the dump
+        # in effect now). The second is usually why you are looking at history at all.
+        menu.addAction("See what changed in this snapshot",
+                       lambda: self.snapshot_diff_requested.emit(name))
+        menu.addAction("Compare with the active dump",
+                       lambda: self.snapshot_vs_active_requested.emit(name))
+        menu.addSeparator()
+        menu.addAction(f"Revert to {name}", lambda: self.revert_requested.emit(name))
+        return menu

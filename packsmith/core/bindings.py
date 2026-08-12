@@ -62,7 +62,10 @@ def parse_instance_ref(ref, blueprint_store):
 
 def binding_id(slot, artifact_name, *, tag_store=None, blueprint_store=None):
     """The value to STORE for a chosen artifact — its id, or the string for L1 entries."""
-    if slot.kind == "registry_entry":
+    if slot.kind in ("registry_entry", "pack"):
+        # A pack has no id to store: its identity IS its directory name, and PackSmith does
+        # not own that directory (design 3.3). Renaming it outside PackSmith therefore
+        # breaks the binding — surfaced loudly at resolve time rather than papered over.
         return artifact_name
     if slot.kind == "tag":
         definition = tag_store.definition(slot.registry_type, artifact_name)
@@ -82,7 +85,7 @@ def binding_name(slot, bound, *, tag_store=None, blueprint_store=None):
     Returns None when the id points at something that no longer exists, which is a real
     state the UI has to show rather than crash on.
     """
-    if bound is None or slot.kind == "registry_entry":
+    if bound is None or slot.kind in ("registry_entry", "pack"):
         return bound
     if isinstance(bound, str):
         return bound                       # legacy name, written before ids
@@ -211,7 +214,7 @@ def entry_exists(registry_type, entry_id, packdump) -> bool:
 
 
 def resolve_step(manifest, *, bindings: dict, config: dict, tag_store,
-                 blueprint_store=None, packdump=None):
+                 blueprint_store=None, packdump=None, pack_targets=None):
     """Validate a step's bindings + config against the manifest and return the
     ``(mappings, config)`` pair the runner consumes. Raises on an unbound required
     mapping, a type mismatch, or a missing required config value.
@@ -261,6 +264,23 @@ def resolve_step(manifest, *, bindings: dict, config: dict, tag_store,
                 if not entry_exists(slot.registry_type, item, packdump):
                     raise ValueError(
                         f"mapping '{name}': '{item}' is not in {slot.registry_type}")
+                values.append(item)
+            elif slot.kind == "pack":
+                # Checked here rather than only when bound, for the same reason blueprint
+                # shapes are: the pack is a directory PackSmith does not own, so it can be
+                # renamed or deleted between binding this step and running it — and a write
+                # into a pack that isn't there is a silent no-op, not an error Minecraft
+                # reports.
+                available = pack_targets.available(slot.pack_kind) \
+                    if pack_targets is not None else None
+                if available is None:
+                    raise ValueError(
+                        f"mapping '{name}' needs a {slot.pack_kind[:-1]}, but no pack "
+                        f"loader is installed in this profile — see design 8.1")
+                if item not in available:
+                    raise ValueError(
+                        f"mapping '{name}': there is no {slot.pack_kind[:-1]} called "
+                        f"'{item}' any more — re-bind this step")
                 values.append(item)
             else:
                 validate_binding(slot, tag_store.definition(slot.registry_type, item),
@@ -349,7 +369,8 @@ def conflict_policies_for(manifest, mappings: dict) -> dict:
     return policies
 
 
-def best_guess_bindings(manifest, tag_store, blueprint_store=None, packdump=None) -> dict:
+def best_guess_bindings(manifest, tag_store, blueprint_store=None, packdump=None,
+                        pack_targets=None) -> dict:
     """Suggest a binding per mapping slot from the user's existing tags: prefer an
     exact ``likely_name`` match that's type-compatible, else the first type-compatible
     tag, else None. Candidates are drawn from the slot's own ``registry_type`` (definitions
@@ -377,6 +398,18 @@ def best_guess_bindings(manifest, tag_store, blueprint_store=None, packdump=None
                 pick = (slot.likely_name if slot.likely_name in fitting
                         else (fitting[0] if fitting else None))
                 suggestions[name] = _id(pick) if pick is not None else None
+            continue
+        if slot.kind == "pack":
+            # 3.3's best-guess fill: prefer the author's hint when the user actually has a
+            # pack by that name, else pre-select when there is exactly one — with several,
+            # which one an override lands in is a real decision and guessing is worse than
+            # asking.
+            packs = pack_targets.available(slot.pack_kind) if pack_targets else None
+            packs = packs or []
+            pick = (slot.likely_name if slot.likely_name in packs
+                    else (packs[0] if len(packs) == 1 else None))
+            suggestions[name] = ([pick] if pick else []) \
+                if slot.cardinality == "many" else pick
             continue
         if slot.kind == "registry_entry":
             # `likely_name` is the author's hint at an id. Offered only if the pack
@@ -498,7 +531,7 @@ class StepProblem:
 
 
 def step_problems(job, *, package_index, tag_store, blueprint_store=None,
-                  packdump=None) -> list:
+                  packdump=None, pack_targets=None) -> list:
     """Everything that would stop ``job`` running, determined WITHOUT running it.
 
     One function so that three consumers cannot disagree: the pre-flight gate, the Errors
@@ -538,7 +571,7 @@ def step_problems(job, *, package_index, tag_store, blueprint_store=None,
         try:
             resolve_step(manifest, bindings=step.bindings, config=step.config,
                          tag_store=tag_store, blueprint_store=blueprint_store,
-                         packdump=packdump)
+                         packdump=packdump, pack_targets=pack_targets)
         except ValueError as e:
             problems.append(StepProblem(
                 step_id=step.id, position=step.position, action_ref=step.action_ref,

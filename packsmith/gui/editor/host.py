@@ -153,6 +153,11 @@ class EditorHost(QObject):
         source, _, path = key.partition(":")
         return source, path
 
+    def source_named(self, name: str):
+        """One registered DocumentSource by name, for callers that need to ask a source
+        something before a document exists — classifying bytes, most obviously."""
+        return self._sources[name]
+
     def _source_of(self, key: str):
         source, path = self.split_key(key)
         return self._sources[source], path

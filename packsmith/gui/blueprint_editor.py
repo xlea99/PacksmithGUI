@@ -836,6 +836,16 @@ class BlueprintEditorTab(QWidget):
 
     # --- rendering ---------------------------------------------------------
 
+    def set_packdump(self, packdump):
+        """Adopt a newly imported dump (design 3.1).
+
+        ``reload()`` re-evaluates the query and rebuilds the grid, and it already keeps the
+        arrangement the user made — folded groups and column widths — so a packdump import
+        costs a repaint rather than the layout.
+        """
+        self._dump = packdump
+        self.reload()
+
     def reload(self):
         self._loading = True
         try:

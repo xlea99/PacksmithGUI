@@ -167,6 +167,35 @@ class FileStore:
         )
         return prior
 
+    def write_bytes(self, rel_path: str, content: bytes, *, owner,
+                    owner_action_ref=None) -> bytes | None:
+        """The binary sibling of :meth:`write`, with the same ownership semantics.
+
+        Text is the common case in a modpack but not the only one — a resource-pack
+        override is a PNG, an NBT structure is a gzipped tag tree — and routing those
+        through the text path either mangles them or raises `UnicodeDecodeError` while
+        *capturing the prior content for rollback*, which is a confusing place to fail.
+
+        Returns the prior bytes so a caller can snapshot them, exactly as ``write`` does.
+        """
+        p = self._abs(rel_path)
+        prior = p.read_bytes() if p.is_file() else None
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(content)
+        self._db.execute(
+            """INSERT INTO file_ownership (path, owner_kind, owner_action_ref)
+               VALUES (?, ?, ?)
+                   ON CONFLICT(path) DO UPDATE SET
+                       owner_kind = excluded.owner_kind,
+                       owner_action_ref = excluded.owner_action_ref""",
+            (self.key(rel_path), owner, owner_action_ref),
+        )
+        return prior
+
+    def read_bytes(self, rel_path: str) -> bytes | None:
+        p = self._abs(rel_path)
+        return p.read_bytes() if p.is_file() else None
+
     def delete(self, rel_path: str):
         """Remove the file from disk (if present) and drop its ownership record."""
         p = self._abs(rel_path)

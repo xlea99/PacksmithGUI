@@ -50,6 +50,7 @@ def _owner_dot(colour: str) -> QIcon:
 _ROLE_PATH = Qt.UserRole        # relative path (posix-style)
 _ROLE_IS_DIR = Qt.UserRole + 1
 _ROLE_LOADED = Qt.UserRole + 2
+_ROLE_CATEGORY = Qt.UserRole + 3   # 'datapacks' / 'resourcepacks' in Smart Mode
 
 
 def _parent_of(rel: str) -> str:
@@ -67,22 +68,38 @@ class FilesPanel(Panel):
     file_activated = Signal(str)        # relative path (double-clicked)
     ownership_changed = Signal(str)     # relative path
 
-    def __init__(self, file_store, parent=None):
+    def __init__(self, file_store, parent=None, loader=None):
         super().__init__("Files", parent)
         self._files = file_store
         self._owners = {}
+        # The active global pack loader (§8.1), or None. Smart Mode's categories come from
+        # it: without a loader there is no such thing as a global datapack, so there is
+        # nothing to categorise and the mode stays disabled.
+        self._loader = loader
+        self._smart = False
+        self._mc_version = None      # set by the window; decides pack_format
+        self._client_jar = None      # the real jar, when it can be found
 
         mode_row = QWidget()
         mode_lay = QHBoxLayout(mode_row)
         mode_lay.setContentsMargins(6, 4, 6, 2)
-        mode = QComboBox()
-        mode.addItem("Honest — raw filesystem")
-        mode.addItem("Smart — by purpose (needs integrations)")
-        mode.model().item(1).setEnabled(False)      # §6.2: no integrations installed yet
-        mode.setToolTip("Smart Mode's categories come from integrations (§7); none are "
-                        "installed in this profile yet.")
-        mode.setStyleSheet(f"font-size: 11px; color: {style.TEXT_MUTED};")
-        mode_lay.addWidget(mode)
+        self._mode = QComboBox()
+        self._mode.addItem("Honest — raw filesystem")
+        self._mode.addItem("Smart — by purpose"
+                           + ("" if loader else " (needs a pack loader)"))
+        if loader is None:
+            # §6.2 says categories without an integration simply don't appear. Minecraft
+            # has no vanilla global datapacks (§8.1), so with no loader mod installed
+            # there is genuinely nothing for this mode to show.
+            self._mode.model().item(1).setEnabled(False)
+            self._mode.setToolTip(
+                "Smart Mode groups files by purpose, and its categories come from an "
+                "installed global pack loader (Paxi, OpenLoader, …). This pack has none.")
+        else:
+            self._mode.setToolTip(f"Smart Mode categories come from {loader.name} (§8.1)")
+        self._mode.currentIndexChanged.connect(self._on_mode_changed)
+        self._mode.setStyleSheet(f"font-size: 11px; color: {style.TEXT_MUTED};")
+        mode_lay.addWidget(self._mode)
         self.body().addWidget(mode_row)
 
         legend = QLabel(
@@ -107,13 +124,86 @@ class FilesPanel(Panel):
 
     # --- population ---------------------------------------------------------
 
+    def set_loader(self, loader):
+        """Adopt the loader resolved from a newly imported packdump (§8.1).
+
+        Installing or removing Paxi is an ordinary packdump change, and Smart Mode is built
+        entirely out of the loader's directories — so losing the loader has to drop the
+        panel back to Honest Mode rather than leave a mode with nothing behind it.
+        """
+        self._loader = loader
+        if loader is None:
+            self._smart = False
+        self.refresh()
+
     def refresh(self):
         """Reload ownership and rebuild the visible tree, preserving what was expanded."""
         self._owners = {_norm(p): o for p, o in self._files.all_ownership().items()}
         expanded = self._expanded_paths()
         self._tree.clear()
-        self._populate(None, self._files.root, "")
+        if self._smart and self._loader is not None:
+            self._populate_smart()
+        else:
+            self._populate(None, self._files.root, "")
         self._restore_expanded(expanded)
+
+    def _on_mode_changed(self, index):
+        self._smart = index == 1 and self._loader is not None
+        self.refresh()
+
+    def _populate_smart(self):
+        """§6.2 Smart Mode: files grouped by purpose rather than by where they sit.
+
+        The categories are the loader's own directories (§8.1), so this is not a
+        reinterpretation of the filesystem — it is the same files, reached by what they are
+        FOR. A pack under `config/paxi/datapacks/` is a datapack; the honest tree can only
+        tell you it is a folder inside a mod's config.
+
+        Order matters here in a way it doesn't in Honest Mode: packs are listed as the
+        loader loads them, because with Paxi that is a thing the user controls and needs
+        to see.
+        """
+        for label, kind in (("📦  Datapacks", "datapacks"),
+                            ("🎨  Resource Packs", "resourcepacks")):
+            root = (self._loader.datapack_root(self._files.root) if kind == "datapacks"
+                    else self._loader.resourcepack_root(self._files.root))
+            category = QTreeWidgetItem([label])
+            category.setData(0, _ROLE_CATEGORY, kind)
+            category.setData(0, _ROLE_IS_DIR, True)
+            # Marked loaded, because its children are built right here. Without this the
+            # expand handler treats it as an unvisited folder and populates it a SECOND
+            # time from the filesystem — every pack listed twice, which reads as a
+            # plausible number rather than as a bug.
+            category.setData(0, _ROLE_LOADED, True)
+            category.setForeground(0, QColor(style.TEXT))
+            try:
+                rel_root = Path(root).relative_to(self._files.root).as_posix()
+            except ValueError:
+                rel_root = None
+            category.setData(0, _ROLE_PATH, rel_root)
+            self._tree.addTopLevelItem(category)
+            category.setExpanded(True)
+
+            packs = self._loader.packs(self._files.root, kind) if rel_root else []
+            for name in packs:
+                rel = f"{rel_root}/{name}"
+                item = QTreeWidgetItem([name])
+                item.setData(0, _ROLE_PATH, rel)
+                is_dir = (self._files.root / rel).is_dir()
+                item.setData(0, _ROLE_IS_DIR, is_dir)
+                if is_dir:
+                    item.setData(0, _ROLE_LOADED, False)
+                    item.addChild(QTreeWidgetItem(["…"]))
+                else:
+                    # A zipped pack: real, listed, and not something to browse into here.
+                    self._style_file(item, rel)
+                    item.setToolTip(0, f"{rel} — a zipped pack")
+                category.addChild(item)
+            if not packs:
+                empty = QTreeWidgetItem(["(none yet — right-click to create one)"])
+                empty.setForeground(0, QColor(style.TEXT_FAINT))
+                empty.setFlags(Qt.ItemIsEnabled)
+                category.addChild(empty)
 
     def _expanded_paths(self) -> set:
         found = set()
@@ -198,6 +288,19 @@ class FilesPanel(Panel):
         rel = item.data(0, _ROLE_PATH) if item is not None else ""
         is_dir = bool(item.data(0, _ROLE_IS_DIR)) if item is not None else True
 
+        # A Smart Mode category is not a folder you manage — it is the loader's own
+        # directory. Renaming or deleting it would break the loader, so it gets exactly the
+        # one action that belongs there (§8.1's "New Datapack…" registration).
+        category = item.data(0, _ROLE_CATEGORY) if item is not None else None
+        if category is not None:
+            menu = QMenu(self)
+            noun = "Datapack" if category == "datapacks" else "Resource Pack"
+            menu.addAction(f"New {noun}…", lambda: self._new_pack(category))
+            if rel:
+                menu.addSeparator()
+                menu.addAction("Reveal in Explorer", lambda: self._reveal(rel))
+            return menu
+
         menu = QMenu(self)
         if not is_dir:
             ownership = self._owners.get(_norm(rel))
@@ -223,6 +326,44 @@ class FilesPanel(Panel):
         return menu
 
     # --- filesystem actions (design 6.2) ------------------------------------
+
+    def _new_pack(self, kind):
+        """Create a global datapack or resource pack through the loader (§8.1).
+
+        The loader owns the layout, not this panel: it decides where the pack goes and
+        writes the `pack.mcmeta` Minecraft requires. A pack without one is silently ignored
+        by the game — the folder is there, the files are there, and nothing happens — which
+        is the most confusing failure available, so it is never left to the user.
+        """
+        noun = "datapack" if kind == "datapacks" else "resource pack"
+        name, ok = QInputDialog.getText(self, f"New {noun}", f"{noun.title()} name:")
+        name = (name or "").strip()
+        if not ok or not name:
+            return
+        if "/" in name or chr(92) in name:
+            QMessageBox.warning(self, f"New {noun}",
+                                "A pack name can't contain a path separator.")
+            return
+        root = (self._loader.datapack_root(self._files.root) if kind == "datapacks"
+                else self._loader.resourcepack_root(self._files.root))
+        if (Path(root) / name).exists():
+            QMessageBox.warning(self, f"New {noun}", f"'{name}' already exists.")
+            return
+        try:
+            folder = self._loader.create_pack(self._files.root, name, kind=kind,
+                                              pack_format=self._pack_format(kind))
+        except (OSError, ValueError) as e:
+            QMessageBox.warning(self, f"New {noun}", f"Could not create '{name}': {e}")
+            return
+        rel = Path(folder).relative_to(self._files.root).as_posix()
+        self._after_change(rel, f"Created {noun} '{name}' — {self._loader.name} loads it.")
+
+    def _pack_format(self, kind) -> int:
+        """Which `pack_format` the new pack declares. Minecraft refuses a pack whose
+        format doesn't match its version, and "incompatible" is a confusing thing to read
+        on a pack you just made."""
+        from packsmith.core.capabilities import pack_format_for
+        return pack_format_for(self._mc_version, kind, client_jar=self._client_jar)
 
     def _new_file(self, parent_rel):
         name, ok = QInputDialog.getText(self, "New File", "File name:")

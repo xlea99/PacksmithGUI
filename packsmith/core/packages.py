@@ -43,6 +43,11 @@ class MappingSlot:
     # writes a cell someone else already owns. There is deliberately NO default — "the
     # author must explicitly choose… there is no universally-correct answer."
     conflict_policy: str = None   # overwrite | skip | fail | ask
+    # Which kind of pack a `pack` mapping binds (design 3.3): datapacks | resourcepacks.
+    # A pack is the one slottable artifact that lives in the FILE world rather than Layer 2,
+    # so its binding stores the pack's name — a directory PackSmith does not own — instead
+    # of a database id.
+    pack_kind: str = None
 
 
 @dataclass
@@ -223,8 +228,14 @@ WRITE_ACCESS = ("write", "read_write")
 # `required_shape` (3.3), never by the name the user gave their schema.
 # `registry_entry` binds one specific Layer 1 entry, typed by `registry_type` — for the
 # action that needs "the block you want everything cut from", not a whole tag or schema.
-MAPPING_KINDS = ("tag", "blueprint", "blueprint_instance", "registry_entry")
+# `pack` binds one of the user's datapacks or resource packs (3.3). It is the only slottable
+# artifact from the FILE world: a datapack is a named thing the user created, several exist,
+# and which one an action writes into decides load order and therefore which override wins.
+# That is identity, not a path — which is why `config/quark-common.toml` stays a literal and
+# this does not.
+MAPPING_KINDS = ("tag", "blueprint", "blueprint_instance", "registry_entry", "pack")
 BLUEPRINT_KINDS = ("blueprint", "blueprint_instance")
+PACK_KINDS = ("datapacks", "resourcepacks")
 # 3.3: `one` is a single-select picker, `many` is "zero or more" and a multi-select list.
 CARDINALITIES = ("one", "many")
 
@@ -625,10 +636,21 @@ def _parse_mappings(raw: dict) -> dict:
         # Design 3.3: conflict policy is a MANDATORY per-write-mapping declaration with no
         # default. Refusing the package at load time is the only way that stays true — a
         # default applied quietly here would be exactly the silent choice the rule forbids.
-        if access in WRITE_ACCESS and policy is None:
+        #
+        # `pack` is exempt, and not as a convenience. Conflict policies govern the
+        # CLOSED-world engine, where two actions can contest ownership of the same tag.
+        # Files use the open-world engine, which hard-blocks instead of negotiating (§6.1):
+        # an action writing over a user-owned file is refused outright. Demanding a policy
+        # here would ask the author to choose between options that do not exist.
+        if access in WRITE_ACCESS and policy is None and kind != "pack":
             raise ValueError(
                 f"mapping '{name}' has access='{access}' but declares no conflict_policy; "
                 f"one of {', '.join(CONFLICT_POLICIES)} is required")
+        if policy is not None and kind == "pack":
+            raise ValueError(
+                f"mapping '{name}' is kind 'pack' and cannot declare a conflict_policy — "
+                f"files are governed by the open-world engine's hard block, not by policy "
+                f"(design 6.1)")
         if policy is not None and policy not in CONFLICT_POLICIES:
             raise ValueError(
                 f"mapping '{name}': invalid conflict_policy '{policy}' "
@@ -638,6 +660,19 @@ def _parse_mappings(raw: dict) -> dict:
             # to offer every entry of every registry — which is not a contract.
             raise ValueError(
                 f"mapping '{name}' is kind 'registry_entry' but declares no registry_type")
+        pack_kind = spec.get("pack_kind")
+        if kind == "pack":
+            # Without it the picker cannot know whether to offer datapacks or resource
+            # packs, and the action cannot know which capability it needs. Same reasoning
+            # as registry_type on a registry_entry: an untyped slot is not a contract.
+            if pack_kind not in PACK_KINDS:
+                raise ValueError(
+                    f"mapping '{name}' is kind 'pack' and needs "
+                    f"pack_kind = one of {', '.join(PACK_KINDS)}")
+        elif pack_kind is not None:
+            raise ValueError(
+                f"mapping '{name}': pack_kind only applies to 'pack' mappings, "
+                f"not kind '{kind}'")
         cardinality = spec.get("cardinality", "one")
         if cardinality not in CARDINALITIES:
             raise ValueError(
@@ -673,6 +708,7 @@ def _parse_mappings(raw: dict) -> dict:
             conflict_policy=policy,
             required_shape=shape,
             requires_values=tuple(raw_values or ()),
+            pack_kind=pack_kind,
         )
     return mappings
 

@@ -12,6 +12,7 @@ point as its single argument.
 import json
 
 from packsmith.core.bindings import policy_key
+from packsmith.core.capabilities import CapabilityError
 
 try:
     import json5 as _json5
@@ -383,6 +384,77 @@ class _Filesystem:
         return _FileHandle(self._staging, path, self._action_ref)
 
 
+class _PackNamespace:
+    """``pack.datapacks`` / ``pack.resourcepacks`` — provider-routed writes (design 7.3).
+
+    The action never learns which loader is installed. It names a pack the *user* bound to
+    the step and a namespace path, and the active provider (§8.1) computes where that lands
+    — which is what makes an action portable across Paxi, OpenLoader and Moonlight.
+
+    Unlike ``filesystem``, this resolver checks that the **pack** exists. §7.3 says
+    resolvers don't check whether the target *file* exists, and that still holds; a missing
+    pack is a different thing. A directory with no `pack.mcmeta` is not loaded by Minecraft
+    at all, so writing into a pack that isn't there succeeds, changes nothing in-game, and
+    looks exactly like it worked.
+    """
+
+    # Minecraft's own structure, not the loader's: `data/` is datapack territory and
+    # `assets/` is resource pack territory (§6.5).
+    _ROOTS = {"datapacks": "data", "resourcepacks": "assets"}
+
+    def __init__(self, staging, action_ref, targets, kind):
+        self._staging = staging
+        self._action_ref = action_ref
+        self._targets = targets
+        self._kind = kind
+
+    @property
+    def _noun(self):
+        return "datapack" if self._kind == "datapacks" else "resource pack"
+
+    def resolve(self, pack, namespace, path):
+        if self._staging is None:
+            raise CapabilityError(
+                f"{self._kind} capability is not available for this step (no file store)")
+        provider = self._targets.provider_for(self._kind) if self._targets else None
+        if provider is None:
+            raise CapabilityError(
+                f"nothing in this profile provides '{self._kind}.write' — install a global "
+                f"pack loader such as Paxi (design 8.1)")
+        if not pack:
+            raise CapabilityError(
+                f"no {self._noun} was given — bind one to a 'pack' mapping on this step "
+                f"rather than naming it in the action (design 3.3)")
+        available = self._targets.available(self._kind) or []
+        if pack not in available:
+            raise CapabilityError(
+                f"there is no {self._noun} called '{pack}' — writing into it would produce "
+                f"a folder the game silently ignores")
+        member = f"{self._ROOTS[self._kind]}/{namespace}/{str(path).lstrip('/')}"
+        target = provider.override_path(self._targets.root, pack, member, kind=self._kind)
+        rel = target.relative_to(self._targets.root).as_posix()
+        return _FileHandle(self._staging, rel, self._action_ref)
+
+
+class _Capabilities:
+    """``pack.capabilities`` — introspection (design 7.4), for actions that declare a
+    capability optional and branch on whether it is there."""
+
+    def __init__(self, table):
+        self._table = table
+
+    def has(self, name) -> bool:
+        return bool(self._table is not None and self._table.satisfies(name))
+
+    def version(self, name):
+        """The active provider's version, or None. Providers carry no version yet (§7.1's
+        versioning model is declared, not implemented), so this answers None until they do
+        — which is the same answer as "no provider", deliberately: an action must not read
+        a missing version as a satisfied one."""
+        provider = self._table.provider_for(name) if self._table is not None else None
+        return getattr(provider, "version", None)
+
+
 class _Step:
     """``pack.step`` — the bindings and configuration the user set on this job step."""
 
@@ -396,7 +468,7 @@ class Pack:
 
     def __init__(self, *, staging, tag_store, packdump, action_ref,
                  file_staging=None, mappings=None, config=None, conflict_policies=None,
-                 blueprint_staging=None, blueprint_store=None):
+                 blueprint_staging=None, blueprint_store=None, pack_targets=None):
         self.action_ref = action_ref
         self._log = []
         # Set by fail(); None means "no deliberate failure was requested".
@@ -408,6 +480,14 @@ class Pack:
                                       conflict_policies=conflict_policies, log=self.log) \
             if blueprint_store is not None else None
         self.filesystem = _Filesystem(file_staging, action_ref)
+        # Provider-routed (§7.3): the same two namespaces exist whether or not a loader is
+        # installed, and refuse with a message naming what is missing rather than being
+        # absent — `pack.datapacks` raising AttributeError would tell the author nothing.
+        self.datapacks = _PackNamespace(file_staging, action_ref, pack_targets, "datapacks")
+        self.resourcepacks = _PackNamespace(file_staging, action_ref, pack_targets,
+                                            "resourcepacks")
+        self.capabilities = _Capabilities(
+            pack_targets.table if pack_targets is not None else None)
         self.step = _Step(mappings, config)
 
     def log(self, level, message):

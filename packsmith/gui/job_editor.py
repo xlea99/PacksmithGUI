@@ -249,9 +249,10 @@ class StepEditorDialog(QDialog):
     """Fill in what a step needs. Mappings and config are one list of slots."""
 
     def __init__(self, manifest, tag_store, step, parent=None, blueprint_store=None,
-                 packdump=None):
+                 packdump=None, pack_targets=None):
         super().__init__(parent)
         self._dump = packdump
+        self._pack_targets = pack_targets
         self.setWindowTitle(f"Step — {manifest.name or manifest.action_id}")
         self.setMinimumWidth(480)
         self._manifest = manifest
@@ -330,6 +331,27 @@ class StepEditorDialog(QDialog):
         if not slot.required:
             combo.addItem("(unbound)", None)
 
+        if slot.kind == "pack":
+            # 3.3: a pack is bound like any other artifact, so this is the same picker
+            # gesture as choosing a tag — and the same one the JAR viewer's save-as-override
+            # prompt already uses, because "which pack does this go into" is one question
+            # whether a person or an action is asking it.
+            packs = self._packs_for(slot)
+            if packs is None:
+                combo.addItem("(no pack loader installed — see design 8.1)", None)
+                combo.setEnabled(False)
+                return combo
+            for pack_name in packs:
+                combo.addItem(pack_name, pack_name)
+            if not packs:
+                combo.addItem(f"(no {slot.pack_kind[:-1]}s yet)", None)
+                combo.setEnabled(False)
+            # Listed in LOAD ORDER, and later packs win — the same warning the override
+            # dialog carries, for the same reason.
+            combo.setToolTip("Listed in load order — later packs override earlier ones")
+            _select_stored(combo, current)
+            return combo
+
         if slot.kind == "registry_entry":
             return _EntryField(slot.registry_type,
                                self._registry_entries(slot.registry_type), current)
@@ -358,6 +380,20 @@ class StepEditorDialog(QDialog):
         _select_stored(combo, current)
         return combo
 
+    def _packs_for(self, slot):
+        """Pack names in load order, or None when no loader provides this kind at all.
+
+        None and [] have to stay distinct all the way to the picker: "install a loader" and
+        "make your first datapack" are different instructions, and collapsing them would
+        send the user looking in the wrong place.
+        """
+        if self._pack_targets is None:
+            return None
+        try:
+            return self._pack_targets.available(slot.pack_kind)
+        except OSError:
+            return []
+
     def _registry_entries(self, registry_type) -> list:
         if self._dump is None:
             return []
@@ -372,6 +408,8 @@ class StepEditorDialog(QDialog):
         """
         if slot.kind == "registry_entry":
             return [(e, e, []) for e in self._registry_entries(slot.registry_type)]
+        if slot.kind == "pack":
+            return [(p, p, []) for p in (self._packs_for(slot) or [])]
         if self._blueprints is None:
             return []
         if slot.kind == "blueprint_instance":
@@ -480,7 +518,7 @@ class JobEditorTab(QWidget):
     run_requested = Signal(object)  # Job
 
     def __init__(self, job, *, job_store, package_index, tag_store, parent=None,
-                 blueprint_store=None, packdump=None):
+                 blueprint_store=None, packdump=None, pack_targets=None):
         super().__init__(parent)
         self._job_id = job.id
         self._jobs = job_store
@@ -488,6 +526,7 @@ class JobEditorTab(QWidget):
         self._tags = tag_store
         self._blueprints = blueprint_store
         self._dump = packdump
+        self._pack_targets = pack_targets
 
         root = QVBoxLayout(self)
         root.setContentsMargins(8, 8, 8, 8)
@@ -560,6 +599,15 @@ class JobEditorTab(QWidget):
     def job(self):
         return self._jobs.get(self._job_id)
 
+    def set_packdump(self, packdump):
+        """Adopt a newly imported dump (design 3.1).
+
+        The tab flags steps whose bindings no longer resolve, and a mod update is exactly
+        what breaks one — so this has to re-run that check, not just swap the reference.
+        """
+        self._dump = packdump
+        self.refresh()
+
     def refresh(self):
         job = self.job()
         if job is None:
@@ -578,7 +626,8 @@ class JobEditorTab(QWidget):
                 for problem in step_problems(job, package_index=self._packages,
                                              tag_store=self._tags,
                                              blueprint_store=self._blueprints,
-                                             packdump=self._dump):
+                                             packdump=self._dump,
+                                             pack_targets=self._pack_targets):
                     self._problems.setdefault(problem.step_id, []).append(problem)
             except Exception:        # a cosmetic check must never stop the tab opening
                 pass
@@ -717,7 +766,7 @@ class JobEditorTab(QWidget):
             return
         dlg = StepEditorDialog(manifest, self._tags, step, self,
                                blueprint_store=self._blueprints,
-                               packdump=self._dump)
+                               packdump=self._dump, pack_targets=self._pack_targets)
         if not dlg.exec():
             return
         # Re-record what the bound tags are called. Saving a step is an assertion that it

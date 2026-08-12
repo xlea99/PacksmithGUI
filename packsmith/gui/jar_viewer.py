@@ -15,11 +15,12 @@ from pathlib import Path
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QTreeWidgetItem,
+    QMenu, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QTreeWidgetItem,
     QAbstractItemView, QHeaderView,
 )
 
 from packsmith.core.archives import ArchiveError, read_entries, summarise
+from packsmith.core.capabilities import override_kind
 from packsmith.gui.shell import style
 from packsmith.gui.shell.tree import PanelTree
 
@@ -41,6 +42,8 @@ class JarViewerTab(QWidget):
     """A read-only tree of an archive's contents."""
 
     status = Signal(str)
+    member_activated = Signal(str, str)   # archive path (absolute), member path
+    override_requested = Signal(str, str)  # archive path, member path
 
     def __init__(self, archive_path, parent=None):
         super().__init__(parent)
@@ -78,6 +81,9 @@ class JarViewerTab(QWidget):
         self._tree.header().setSectionResizeMode(0, QHeaderView.Stretch)
         self._tree.header().setSectionResizeMode(1, QHeaderView.ResizeToContents)
         self._tree.header().setSectionResizeMode(2, QHeaderView.ResizeToContents)
+        self._tree.itemDoubleClicked.connect(self._on_double_clicked)
+        self._tree.setContextMenuPolicy(Qt.CustomContextMenu)
+        self._tree.customContextMenuRequested.connect(self._on_context_menu)
         root.addWidget(self._tree)
 
         self._banner = QLabel()
@@ -165,6 +171,37 @@ class JarViewerTab(QWidget):
             self.status.emit(f"{sum(1 for e in visible if not e.is_dir):,} matching files")
 
     # --- for the window ----------------------------------------------------
+
+    def _on_double_clicked(self, item, _column=0):
+        path = item.data(0, _ROLE_PATH)
+        if path and not path.endswith("/"):
+            self.member_activated.emit(self.path, path)
+
+    def _on_context_menu(self, pos):
+        menu = self._menu_for(self._tree.itemAt(pos))
+        if menu is not None:
+            menu.exec(self._tree.mapToGlobal(pos))
+
+    def _menu_for(self, item):
+        """Save-as-override is offered only where it means something (§6.5).
+
+        A file under `data/` or `assets/` can be shadowed by a datapack or resource pack.
+        A `.class` file, `META-INF/`, or the mod's own `mods.toml` cannot — there is no
+        override target for compiled code, and there never will be. Offering the action
+        everywhere and failing afterwards would teach the user to distrust the menu.
+        """
+        path = item.data(0, _ROLE_PATH) if item is not None else None
+        if not path or path.endswith("/"):
+            return None
+        menu = QMenu(self)
+        kind = override_kind(path)
+        if kind is not None:
+            noun = "datapack" if kind == "datapacks" else "resource pack"
+            menu.addAction(f"Save as override into a {noun}…",
+                           lambda: self.override_requested.emit(self.path, path))
+            menu.addSeparator()
+        menu.addAction("Open", lambda: self.member_activated.emit(self.path, path))
+        return menu
 
     def selected_path(self):
         item = self._tree.currentItem()

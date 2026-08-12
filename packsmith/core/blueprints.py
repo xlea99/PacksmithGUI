@@ -164,6 +164,16 @@ class BlueprintStore:
         self._db = db
         self._dump = packdump
 
+    def set_packdump(self, packdump):
+        """Point at a newly adopted dump (design 3.1).
+
+        The store reads ``_dump`` lazily, at validation time — so there is no derived state
+        to rebuild here, only the reference to swap. Every holder of a packdump implements
+        this method; see ``MainWindow._rebind_packdump`` for why that is a rule rather than
+        a convenience.
+        """
+        self._dump = packdump
+
     # --- schemas -----------------------------------------------------------
 
     def define(self, name: str, description: str = "") -> "Blueprint":

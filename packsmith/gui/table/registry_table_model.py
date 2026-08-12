@@ -57,6 +57,21 @@ class RegistryTableModel(QAbstractTableModel):
         self._evaluate()
         self.endResetModel()
 
+    def set_packdump(self, packdump):
+        """Adopt a newly imported dump and re-run (design 3.1).
+
+        A full reset, because the registry underneath decides the *rows*: entries a mod
+        update added or removed change row count and order, so patching cells would leave
+        the table describing a registry that no longer exists.
+
+        The edit stack is deliberately kept. Its commands address cells by
+        (registry_type, entry_id, tag_name), which survives a registry change — an undo
+        onto an entry the new dump dropped writes an orphan, and orphans are a state the
+        Errors panel already reports.
+        """
+        self._packdump = packdump
+        self.reevaluate()
+
     def set_filter(self, filter_node):
         """Replace the query's filter and re-evaluate. The view's scope + columns are
         unchanged, so column layout / delegates / edit toggles stay valid. This is the

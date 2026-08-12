@@ -35,6 +35,12 @@ class RegistryPanel(Panel):
 
         self.refresh()
 
+    def set_packdump(self, packdump):
+        """Adopt a newly imported dump (design 3.1). This panel is the entry counts, so it
+        is the most visible place a stale registry would show."""
+        self._packdump = packdump
+        self.refresh()
+
     def refresh(self):
         self._tree.clear()
         registries = self._packdump.registry or {}

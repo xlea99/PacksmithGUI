@@ -49,7 +49,7 @@ class JobResult:
 
 def run_job(job, *, job_store, package_index, tag_store, packdump,
             file_store=None, history=None, job_history=None,
-            blueprint_store=None) -> JobResult:
+            blueprint_store=None, pack_targets=None) -> JobResult:
     """Run every step of ``job`` in order, honouring each step's error policy.
 
     Returns a JobResult; never raises for a failing step — failures are captured, exactly
@@ -73,7 +73,8 @@ def run_job(job, *, job_store, package_index, tag_store, packdump,
     run_id = job_history.start(job.id, job.name) if job_history is not None else None
     ctx = _Context(job_store=job_store, package_index=package_index, tag_store=tag_store,
                    packdump=packdump, file_store=file_store, history=history,
-                   job_run_id=run_id, blueprint_store=blueprint_store)
+                   job_run_id=run_id, blueprint_store=blueprint_store,
+                   pack_targets=pack_targets)
 
     status, _halted = _run_steps(job, ctx, seen=frozenset({job.id}))
     if job_history is not None:
@@ -93,6 +94,8 @@ class _Context:
     history: object = None
     job_run_id: int = None
     blueprint_store: object = None
+    # Which datapacks/resource packs exist, per the active loader (design 3.3 / 8.1).
+    pack_targets: object = None
     results: list = field(default_factory=list)
     position: int = 0
     not_run: int = 0
@@ -176,7 +179,8 @@ def _run_action_step(step, ctx) -> StepResult:
     try:
         mappings, config = resolve_step(manifest, blueprint_store=ctx.blueprint_store,
                                         bindings=step.bindings, packdump=ctx.packdump,
-                                        config=step.config, tag_store=ctx.tag_store)
+                                        config=step.config, tag_store=ctx.tag_store,
+                                        pack_targets=ctx.pack_targets)
     except ValueError as e:
         return _record_failure(ctx, step, action_ref, f"step is not runnable: {e}")
 
@@ -184,7 +188,7 @@ def _run_action_step(step, ctx) -> StepResult:
     return run_action(
         fn, tag_store=ctx.tag_store, packdump=ctx.packdump, action_ref=action_ref,
         mappings=mappings, config=config, file_store=ctx.file_store, history=ctx.history,
-        blueprint_store=ctx.blueprint_store,
+        blueprint_store=ctx.blueprint_store, pack_targets=ctx.pack_targets,
         conflict_policies=conflict_policies_for(manifest, mappings),
         history_context={"job_run_id": ctx.job_run_id, "step_id": step.id,
                          "position_in_run": ctx.position},

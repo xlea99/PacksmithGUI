@@ -21,6 +21,8 @@ implement.
 """
 from pathlib import Path
 
+from packsmith.core.archives import ArchiveError, read_member
+
 from packsmith.core.files import FileOwnershipError
 
 
@@ -154,4 +156,108 @@ class PackageFileSource(DocumentSource):
     def can_unlock(self, path):
         # Downloaded source is read-only by provenance, not by a claim someone can release.
         # Editing it would silently fork a package that still reports its upstream version.
+        return False
+
+
+# A jar member is addressed as "<archive>!<member>" — the separator Java's own `jar:` URLs
+# use, and one that cannot occur in a zip entry name.
+MEMBER_SEPARATOR = "!"
+
+# §6.3: "JAR-extracted non-overridable files — class files, META-INF/, mods.toml,
+# pack.mcmeta at a jar root". These are read-only *forever*, not pending a feature: there
+# is no override target for compiled code or a mod's own manifest. Keeping the distinction
+# from the start means the message can say which kind of "no" this is.
+_NEVER_OVERRIDABLE_SUFFIXES = (".class",)
+_OVERRIDABLE_ROOTS = ("data/", "assets/")
+
+
+def split_member(path: str) -> tuple[str, str]:
+    """``"mods/foo.jar!assets/x.json"`` -> ``("mods/foo.jar", "assets/x.json")``."""
+    archive, separator, member = str(path).partition(MEMBER_SEPARATOR)
+    if not separator:
+        raise ValueError(f"not a jar member path: {path!r}")
+    return archive, member
+
+
+def member_path(archive_rel: str, member: str) -> str:
+    return f"{archive_rel}{MEMBER_SEPARATOR}{member}"
+
+
+def is_overridable(member: str) -> bool:
+    """Could this member ever be overridden by a datapack or resource pack (§6.5)?
+
+    Content under `data/` and `assets/` can: that is exactly what a datapack or resource
+    pack replaces. Compiled classes and the mod's own metadata cannot, at any point, by
+    anything — which is why they are a permanent read-only rather than a deferred one.
+    """
+    if member.lower().endswith(_NEVER_OVERRIDABLE_SUFFIXES):
+        return False
+    return member.startswith(_OVERRIDABLE_ROOTS)
+
+
+class JarMemberSource(DocumentSource):
+    """One file *inside* an archive, read straight out of it (design 6.5).
+
+    Nothing is extracted. §6.5 exists because peeking into a mod currently "requires an
+    external tool that extracts files to a scratch directory just to view them", so a
+    viewer that quietly did the same thing would have solved nothing — it would only have
+    moved the scratch directory somewhere the user can't see it.
+
+    **Everything here is read-only**, and §6.3 gives the two reasons that differ: a class
+    file has no override target and never will, while a datapack JSON has one — you take an
+    editable copy with save-as-override (§6.5) and edit that. The reader is told which,
+    because "you can't edit this" and "edit the copy instead" are different instructions.
+
+    A jar is never modified either way. That is not a limitation to lift later: the whole
+    override mechanism exists because the mod's own file stays exactly as it shipped.
+    """
+
+    name = "jar"
+
+    def __init__(self, instance_root):
+        self._root = Path(instance_root).resolve()
+
+    def _archive(self, path: str) -> Path:
+        archive_rel, _member = split_member(path)
+        resolved = (self._root / archive_rel).resolve()
+        if not resolved.is_relative_to(self._root):
+            raise ValueError(f"Path escapes the instance root: {archive_rel}")
+        return resolved
+
+    def raw(self, path: str) -> bytes:
+        """The member's bytes, for classifying it before deciding how to render it."""
+        archive_rel, member = split_member(path)
+        return read_member(self._archive(path), member)
+
+    def read(self, path):
+        try:
+            return self.raw(path).decode("utf-8")
+        except (ArchiveError, ValueError):
+            return None
+        except UnicodeDecodeError:
+            # The caller classifies first, so this is the belt-and-braces case: a member
+            # that sniffed as text but isn't all the way down.
+            return None
+
+    def write(self, path, content):
+        archive_rel, member = split_member(path)
+        raise ArchiveError(
+            f"'{member}' lives inside {Path(archive_rel).name} and cannot be edited in "
+            f"place — a jar is never modified (design 6.5).")
+
+    def read_only_reason(self, path):
+        try:
+            archive_rel, member = split_member(path)
+        except ValueError:
+            return "inside an archive"
+        archive_name = Path(archive_rel).name
+        if is_overridable(member):
+            return (f"inside {archive_name} — right-click it in the jar and choose "
+                    f"\"Save as override\" to get an editable copy (design 6.5)")
+        return (f"inside {archive_name}, and has no override target — jars are never "
+                f"modified (design 6.5)")
+
+    def can_unlock(self, path):
+        # A provenance lock, not a claim: there is nothing to release. The bytes belong to
+        # a mod's jar, and no amount of ownership changes that.
         return False

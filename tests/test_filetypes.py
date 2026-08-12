@@ -22,7 +22,15 @@ def test_archives_go_to_the_jar_viewer(name):
     assert ft.classify(name, b"PK\x03\x04\x14\x00") == ft.ARCHIVE
 
 
-@pytest.mark.parametrize("name", ["level.dat", "r.0.0.mca", "build.nbt", "x.dat_old"])
+@pytest.mark.parametrize("name", ["r.0.0.mca", "r.-1.2.mcr"])
+def test_region_files_are_not_nbt(name):
+    """A `.mca` is a container of up to 1024 separately-compressed chunks, not a tag tree.
+    It used to classify as NBT, which would send it to a viewer that can only report it as
+    broken — and they are the bulk of a world by size, so that would be the common case."""
+    assert ft.classify(name) == ft.REGION
+
+
+@pytest.mark.parametrize("name", ["level.dat", "build.nbt", "x.dat_old", "a.schematic"])
 def test_nbt_extensions_go_to_the_nbt_editor(name):
     assert ft.classify(name, b"\x1f\x8b\x08\x00") == ft.NBT
 
@@ -38,8 +46,22 @@ def test_an_unlisted_text_file_still_opens():
     assert ft.classify("config/weird.somemodcfg", b"a = 1\nb = 2\n") == ft.TEXT
 
 
-def test_a_png_is_binary():
-    assert ft.classify("pack.png", b"\x89PNG\r\n\x1a\n\x00\x00") == ft.BINARY
+def test_a_png_goes_to_the_image_viewer():
+    """This asserted BINARY until there was somewhere better to send it. A png IS binary —
+    it just isn't *only* binary, and "binary" is the answer for files nothing can show."""
+    assert ft.classify("pack.png", b"\x89PNG\r\n\x1a\n\x00\x00") == ft.IMAGE
+
+
+def test_an_image_is_recognised_by_its_bytes_under_any_name():
+    """Textures inside jars are what this is for: `.png` is reliable, but a mod that ships
+    a texture under some other extension should still open in the viewer."""
+    assert ft.classify("icon.dat_backup", b"\x89PNG\r\n\x1a\n\x00\x00") == ft.IMAGE
+    assert ft.classify("photo", b"\xff\xd8\xff\xe0\x00\x10JFIF") == ft.IMAGE
+
+
+def test_a_class_file_is_still_binary():
+    """The image check sits before the NUL check, so it must not swallow everything."""
+    assert ft.classify("Mod.class", b"\xca\xfe\xba\xbe\x00\x00\x004") == ft.BINARY
 
 
 def test_a_non_utf8_config_is_not_fed_to_the_text_editor():
