@@ -19,6 +19,14 @@ cannot arrive. **There is no queue.** §3.3.2 wants a background thread with a g
 that waits until something actually runs long enough to hurt (SQLite connections are
 per-thread, so it isn't free), and whoever builds it is implementing the queue for the
 first time rather than moving an existing one.
+
+Synchronous has since been **decided rather than merely tolerated** (Open Questions, async
+job runs): a run cannot safely permit a packdump adopt, a profile switch, a second job or
+L2 edits, so threading would buy a responsive window with nothing safe to do in it. What
+blocking genuinely costs is that the OS marks the app Not Responding, at which point working
+and crashed look identical — and that is what ``on_progress`` addresses, without any of the
+concurrency. The runner stays GUI-free: it calls a plain function and never learns that the
+GUI's handler repaints.
 """
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -26,6 +34,7 @@ from datetime import datetime, timezone
 from packsmith.core.bindings import (
     resolve_step, conflict_policies_for, stale_bindings)
 from packsmith.core.runner import run_action, StepResult
+from packsmith.common.logging import log
 
 
 @dataclass
@@ -47,9 +56,47 @@ class JobResult:
         return [r for r in self.step_results if not r.ok]
 
 
+@dataclass(frozen=True)
+class StepProgress:
+    """Reported as each action step begins and ends (design 3.3.2).
+
+    Exists so a caller can say *what is happening* while it happens. The runner stays
+    GUI-free — it calls a plain function and knows nothing about what that function does;
+    the GUI's handler is where "repaint the window" lives.
+
+    ``phase`` is "start" before the step runs and "done" after, and both are reported: the
+    interesting moment for a slow step is the one *before* it, because that is when you find
+    out which step is slow.
+    """
+    phase: str                  # "start" | "done"
+    position: int               # 1-based, counting action steps only
+    total: int                  # action steps reachable from this job, 0 if unknown
+    action_ref: str
+    result: object = None       # the StepResult, on "done"
+
+
+def count_action_steps(job, job_store, seen=frozenset()) -> int:
+    """How many action steps this job can reach, following nested jobs once each.
+
+    A *total*, not a prediction: a step that halts the run means fewer actually execute.
+    Reporting "3 of 7" and stopping at 4 is honest; claiming 4 was the total all along
+    would not be.
+    """
+    if job is None or job.id in seen:
+        return 0
+    seen = seen | {job.id}
+    total = 0
+    for step in job.steps:
+        if step.is_action:
+            total += 1
+        elif step.ref_job_id:
+            total += count_action_steps(job_store.get(step.ref_job_id), job_store, seen)
+    return total
+
+
 def run_job(job, *, job_store, package_index, tag_store, packdump,
             file_store=None, history=None, job_history=None,
-            blueprint_store=None, pack_targets=None) -> JobResult:
+            blueprint_store=None, pack_targets=None, on_progress=None) -> JobResult:
     """Run every step of ``job`` in order, honouring each step's error policy.
 
     Returns a JobResult; never raises for a failing step — failures are captured, exactly
@@ -74,7 +121,8 @@ def run_job(job, *, job_store, package_index, tag_store, packdump,
     ctx = _Context(job_store=job_store, package_index=package_index, tag_store=tag_store,
                    packdump=packdump, file_store=file_store, history=history,
                    job_run_id=run_id, blueprint_store=blueprint_store,
-                   pack_targets=pack_targets)
+                   pack_targets=pack_targets, on_progress=on_progress,
+                   total_steps=count_action_steps(job, job_store))
 
     status, _halted = _run_steps(job, ctx, seen=frozenset({job.id}))
     if job_history is not None:
@@ -96,6 +144,11 @@ class _Context:
     blueprint_store: object = None
     # Which datapacks/resource packs exist, per the active loader (design 3.3 / 8.1).
     pack_targets: object = None
+    on_progress: object = None
+    total_steps: int = 0
+    # Counted separately from `position`, which is a history column and is also bumped by
+    # steps that never ran. Progress is about what the user is watching.
+    reported: int = 0
     results: list = field(default_factory=list)
     position: int = 0
     not_run: int = 0
@@ -110,7 +163,9 @@ def _run_steps(job, ctx, seen) -> tuple[str, bool]:
         policy = job.on_error_for(step)
 
         if step.is_action:
+            _report(ctx, "start", step.action_ref)
             result = _run_action_step(step, ctx)
+            _report(ctx, "done", step.action_ref, result)
             ctx.results.append(result)
             if not result.ok:
                 any_failure = True
@@ -144,6 +199,26 @@ def _run_steps(job, ctx, seen) -> tuple[str, bool]:
             any_failure = True
 
     return ("partial" if any_failure else "success"), False
+
+
+def _report(ctx, phase: str, action_ref: str, result=None) -> None:
+    """Tell the caller where the run is up to.
+
+    Best-effort on purpose: a handler that raises must never take the run down with it. A
+    job left half-applied because a log widget threw would be a catastrophic trade for a
+    cosmetic feature, and the staging design's promises are about *actions* failing, not
+    about the observer failing.
+    """
+    if phase == "start":
+        ctx.reported += 1
+    if ctx.on_progress is None:
+        return
+    try:
+        ctx.on_progress(StepProgress(
+            phase=phase, position=ctx.reported, total=ctx.total_steps,
+            action_ref=action_ref or "?", result=result))
+    except Exception:
+        log.warning("A job progress handler raised; the run continues", exc_info=True)
 
 
 def _remaining(job, index) -> int:

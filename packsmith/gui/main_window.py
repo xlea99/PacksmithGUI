@@ -13,7 +13,7 @@ from pathlib import Path
 
 from PySide6.QtWidgets import (
     QMainWindow, QVBoxLayout, QHBoxLayout, QWidget, QLabel, QPushButton,
-    QHeaderView, QSplitter, QInputDialog, QMessageBox,
+    QHeaderView, QSplitter, QInputDialog, QMessageBox, QApplication,
 )
 from PySide6.QtCore import Qt, QEvent
 from PySide6.QtGui import QShortcut, QKeySequence
@@ -21,8 +21,8 @@ from PySide6.QtGui import QShortcut, QKeySequence
 from packsmith.core.profile import Profile, list_profiles
 from packsmith.core.archives import ArchiveError, read_member
 from packsmith.core.capabilities import (
-    CapabilityError, DATAPACKS_WRITE, RESOURCEPACKS_WRITE, PackTargets, override_kind,
-    pack_format_for, resolve)
+    CapabilityError, DATAPACKS_WRITE, PACK_LOADER_SETTING, RESOURCEPACKS_WRITE,
+    PackTargets, override_kind, pack_format_for, resolve)
 from packsmith.core.launchers import locate_for
 from packsmith.core.packdiff import summarise_diff, tags_at_risk
 from packsmith.integrations import PACK_LOADERS
@@ -297,7 +297,7 @@ class MainWindow(QMainWindow):
 
         # §8.1: the loader detected in this pack, or None. It is what gives Smart Mode
         # its categories — with no loader mod there are no global datapacks to categorise.
-        self._loaders = resolve(self._packdump, loaders=PACK_LOADERS)
+        self._loaders = self._resolve_loaders()
         active_loader = self._loaders.provider_for(DATAPACKS_WRITE)
         self._files_panel = FilesPanel(self._file_store, loader=active_loader)
         self._files_panel._mc_version = self._profile.mc_version
@@ -1030,7 +1030,7 @@ class MainWindow(QMainWindow):
         """
         if self._profile is None:
             return
-        dialog = SettingsDialog(self._profile, parent=self)
+        dialog = SettingsDialog(self._profile, packdump=self._packdump, parent=self)
         if not dialog.exec() or dialog.result_settings is None:
             return
         self._profile.settings = dialog.result_settings
@@ -1040,7 +1040,34 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Couldn't save settings", str(e))
             return
         self._apply_jar_setting()
+        self._apply_loader_setting()
         self._set_status("Settings saved")
+
+    def _resolve_loaders(self, dump=None):
+        """The capability resolution table for this profile (§7.1 / §8.1).
+
+        One place, because getting it slightly different in two would mean the app disagreed
+        with itself about which loader receives overrides. Both arguments matter: the
+        instance lets each loader read its own config and report what it *actually* offers,
+        and the stored preference decides who wins a contested capability — without it the
+        winner is alphabetical, which on a pack holding both Paxi and Moonlight silently
+        hands Moonlight the overrides.
+        """
+        return resolve(dump if dump is not None else self._packdump,
+                       loaders=PACK_LOADERS,
+                       preferred=self._profile.settings.get(PACK_LOADER_SETTING),
+                       instance_root=self._profile.mc_path)
+
+    def _apply_loader_setting(self):
+        """Re-resolve capabilities against the newly chosen loader (§8.1).
+
+        The same call `_rebind_packdump` makes, for the same reason: the resolution table is
+        derived, so it is recomputed rather than patched — and the Files panel's Smart Mode
+        is built out of whichever loader won.
+        """
+        self._loaders = self._resolve_loaders()
+        if getattr(self, "_files_panel", None) is not None:
+            self._files_panel.set_loader(self._loaders.provider_for(DATAPACKS_WRITE))
 
     def _apply_jar_setting(self):
         """Re-locate the client jar and hand it to everything that reads it."""
@@ -1071,7 +1098,7 @@ class MainWindow(QMainWindow):
                 rebind(dump)
         # §8.1: a mod update can install or remove the pack loader itself, so the resolution
         # table is derived from the dump and has to be recomputed rather than kept.
-        self._loaders = resolve(dump, loaders=PACK_LOADERS)
+        self._loaders = self._resolve_loaders(dump)
         if getattr(self, "_files_panel", None) is not None:
             self._files_panel.set_loader(self._loaders.provider_for(DATAPACKS_WRITE))
         self._refresh_header()
@@ -2355,19 +2382,28 @@ class MainWindow(QMainWindow):
             self._bottom.set_status(f"[{job.name}] has no steps")
             return
 
+        # Runs are SYNCHRONOUS, and deliberately so: §3.3 promises they are globally
+        # serialized, and a blocked window is that promise enforced by physics rather than
+        # by a lock somebody has to remember to hold. What a frozen window costs is not
+        # "you can't click" — nothing would be safe to click mid-run anyway — it is that
+        # after a few seconds the OS marks the app Not Responding, at which point working
+        # and crashed look identical. That is what this reporting is for.
+        if getattr(self, "_job_running", False):
+            return                      # `processEvents` below lets the button be clicked again
+        self._job_running = True
+        QApplication.setOverrideCursor(Qt.WaitCursor)
         self._bottom.log(f"=== running job '{job.name}' ===")
-        result = run_job(job, blueprint_store=self._blueprints,
-                         job_store=self._jobs, package_index=self._packages,
-                         tag_store=self._tags, packdump=self._packdump,
-                         file_store=self._file_store, history=self._history,
-                         job_history=self._job_history,
-                         pack_targets=self._pack_targets())
-
-        for step in result.step_results:
-            for level, message in step.log_lines:
-                self._bottom.log(f"  [{level}] {message}")
-            if not step.ok:
-                self._bottom.log(f"  [error] {step.action_ref}: {step.reason}")
+        try:
+            result = run_job(job, blueprint_store=self._blueprints,
+                             job_store=self._jobs, package_index=self._packages,
+                             tag_store=self._tags, packdump=self._packdump,
+                             file_store=self._file_store, history=self._history,
+                             job_history=self._job_history,
+                             pack_targets=self._pack_targets(),
+                             on_progress=self._on_job_progress)
+        finally:
+            QApplication.restoreOverrideCursor()
+            self._job_running = False
 
         summary = (f"[{job.name}] {result.status} — {len(result.step_results)} step(s) run"
                    + (f", {result.not_run} not reached" if result.not_run else ""))
@@ -2377,6 +2413,32 @@ class MainWindow(QMainWindow):
             self._bottom.expand(1)      # surface Job Results when something went wrong
 
         self._refresh_after_run()
+
+    def _on_job_progress(self, progress):
+        """Say what is happening, while it happens (design 3.3.2).
+
+        Two things, and the second is the point. The step's own log lines are written as it
+        finishes rather than in a batch afterwards, so a long job reads like a log instead
+        of arriving all at once. And the event loop is pumped, which keeps the window
+        painting — without it the OS marks the app Not Responding and the user cannot tell
+        a working job from a hung one.
+
+        Pumping events means a click can land mid-run; `_run_job` guards re-entry, and
+        nothing else here mutates state.
+        """
+        where = (f"{progress.position}/{progress.total}" if progress.total
+                 else str(progress.position))
+        if progress.phase == "start":
+            # Announced BEFORE the step, because on a slow job the thing you want to know
+            # is which step is slow — and afterwards is too late to learn it.
+            self._bottom.set_status(f"Running step {where} — {progress.action_ref}…")
+        else:
+            step = progress.result
+            for level, message in getattr(step, "log_lines", ()):
+                self._bottom.log(f"  [{level}] {message}")
+            if step is not None and not step.ok:
+                self._bottom.log(f"  [error] {step.action_ref}: {step.reason}")
+        QApplication.processEvents()
 
     def _new_job(self):
         name, ok = QInputDialog.getText(self, "New Job", "Name:")

@@ -18,6 +18,12 @@ result. Modelling the loaders as interchangeable would make that distinction uns
 A pack may be a folder or a zip. Packsmith writes folders — a zip would have to be
 rebuilt on every edit, and the whole point of an override is that you can go and look at
 it — but both are listed, because the user's packs contain both.
+
+**The directories appear lazily.** On a fresh install that has only reached the main menu,
+`config/paxi/` holds `resourcepacks/` and its order file and nothing else; `datapacks/`
+turns up once a world has been loaded. So a missing folder means "not yet", never "this
+loader is unavailable" — the capability is decided by the mod being installed, and the
+directory is created on demand when something is written into it.
 """
 import json
 from pathlib import Path
@@ -37,8 +43,11 @@ class PaxiProvider(PackLoaderProvider):
 
     name = "Paxi"
     mod_id = "paxi"
+    mod_id_verified = True          # seen in a real packdump's mod list
     capabilities = (DATAPACKS_READ, DATAPACKS_WRITE, DATAPACKS_ORDERING,
                     RESOURCEPACKS_READ, RESOURCEPACKS_WRITE, RESOURCEPACKS_ORDERING)
+    summary = ("Datapacks and resource packs, with explicit load ordering. The only "
+               "supported loader that can order both.")
 
     def root(self, instance_root) -> Path:
         return Path(instance_root) / "config" / "paxi"

@@ -3,6 +3,47 @@ from contextlib import contextmanager
 from pathlib import Path
 from packsmith.common.logging import log
 
+# The shape of the tables below (design 9.2). Bump this whenever a change makes an older
+# database no longer usable as-is, and add whatever brings one forward in `_migrate`.
+#
+# Stored in SQLite's own `user_version` pragma rather than a table of ours: it costs no
+# schema, cannot itself need migrating, and is readable from a database too broken to
+# query. **The stamp is the part with a deadline** — every other piece of migration
+# machinery can be built the day a change needs it, but a database holding work you care
+# about that cannot say what shape it is has permanently lost the ability to be reasoned
+# about. Hence this landing long before there is anything to migrate.
+SCHEMA_VERSION = 1
+
+
+class SchemaTooNewError(RuntimeError):
+    """This database was written by a newer Packsmith than the one opening it."""
+
+
+def _shape_of(conn) -> dict:
+    """``{table: {column names}}`` for a live connection."""
+    tables = [row[0] for row in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")]
+    return {t: {row[1] for row in conn.execute(f'PRAGMA table_info("{t}")')} for t in tables}
+
+
+def _drift_between(expected: dict, found: dict) -> list:
+    """How ``found`` fails to be ``expected``, in words, or [] when it doesn't.
+
+    Deliberately one-directional: a table or column the code no longer declares is left
+    alone rather than reported. Extra state is inert — nothing reads it — while *missing*
+    state is what breaks a query, and rebuilding a perfectly working database over a
+    leftover column would be destruction with no upside.
+    """
+    problems = []
+    for table, columns in expected.items():
+        if table not in found:
+            problems.append(f"{table} is missing")
+            continue
+        absent = columns - found[table]
+        if absent:
+            problems.append(f"{table} is missing {', '.join(sorted(absent))}")
+    return problems
+
 
 # Handles all reads/writes to a single profile's SQLite database.
 # One profile = one .db file = one UserDB instance.
@@ -18,6 +59,7 @@ class UserDB:
         self._drop_stale_tables()
         self._ensure_tables()
         self._migrate()
+        self._settle_schema_version()
         log.info(f"UserDB connected: {db_path}")
 
     # Tables whose *shape* changed incompatibly, which CREATE TABLE IF NOT EXISTS cannot
@@ -38,8 +80,11 @@ class UserDB:
             log.info("Dropped the pre-3.2.2 blueprint stub tables")
 
     # Creates any/all tables that don't exist. Safe to call repeatedly
-    def _ensure_tables(self):
-        c = self._conn
+    def _ensure_tables(self, conn=None):
+        """Create anything missing. ``conn`` lets a throwaway in-memory database be built
+        from this same DDL, which is how `_expected_shape` knows what "current" means
+        without a hand-maintained column list to drift out of date."""
+        c = conn or self._conn
         c.executescript("""
             -- Tag definitions: what tags exist and what type they are. Definitions are
             -- STRICTLY scoped to a single registry type (design 3.2.1): a `remove` tag on
@@ -270,6 +315,82 @@ class UserDB:
             );
         """)
         c.commit()
+
+    # --- schema versioning (design 9.2) ------------------------------------------------
+
+    def _expected_shape(self) -> dict:
+        """``{table: {columns}}`` as *today's code* declares it.
+
+        Built by running the same DDL into a throwaway in-memory database rather than
+        listing the columns by hand. A hand-written list is a second source of truth, and
+        the failure it produces is the worst kind — the check passes while disagreeing with
+        the schema it is supposed to be checking.
+        """
+        reference = sqlite3.connect(":memory:")
+        try:
+            self._ensure_tables(reference)
+            return _shape_of(reference)
+        finally:
+            reference.close()
+
+    def _settle_schema_version(self):
+        """Bring this database to `SCHEMA_VERSION`, or rebuild it if it cannot get there.
+
+        Three cases, and the ordering matters:
+
+        1. **Already current** — nothing to do.
+        2. **Newer than this build** — refuse, loudly. Opening it would let old code write
+           rows a newer schema will not understand, and rebuilding would destroy work that
+           a newer Packsmith did. Neither is recoverable, so this is the one case that
+           stops rather than acts.
+        3. **Older or unstamped** — the additive passes above have already run, so compare
+           what is actually here against what the code declares. Matching means the
+           database was always fine and merely unlabelled: stamp it. Genuinely drifted
+           means rebuild.
+        """
+        found = self._conn.execute("PRAGMA user_version").fetchone()[0]
+        if found == SCHEMA_VERSION:
+            return
+        if found > SCHEMA_VERSION:
+            raise SchemaTooNewError(
+                f"{self._path} was written by a newer Packsmith (schema v{found}; this "
+                f"build understands v{SCHEMA_VERSION}). Update Packsmith rather than "
+                f"opening it with this version, which would corrupt it.")
+
+        drift = _drift_between(self._expected_shape(), _shape_of(self._conn))
+        if drift:
+            log.warning("Rebuilding %s — its schema has drifted: %s", self._path,
+                        "; ".join(drift))
+            self._rebuild()
+        self._stamp(SCHEMA_VERSION)
+        if found == 0 and not drift:
+            log.info("Stamped %s as schema v%d (it was already current)",
+                     self._path, SCHEMA_VERSION)
+
+    def _stamp(self, version: int):
+        # PRAGMA doesn't take parameters, hence the f-string; `version` is an int constant
+        # from this module and never user input.
+        self._conn.execute(f"PRAGMA user_version = {int(version)}")
+        self._conn.commit()
+
+    def _rebuild(self):
+        """Drop every table this database holds and recreate them empty.
+
+        Tables rather than the file, so an open connection stays valid and Windows' file
+        locking is never involved. `foreign_keys` is suspended for the drops — dropping in
+        any order otherwise trips a constraint against a table that is about to go too.
+        """
+        self._conn.execute("PRAGMA foreign_keys = OFF")
+        try:
+            for row in self._conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' "
+                    "AND name NOT LIKE 'sqlite_%'").fetchall():
+                self._conn.execute(f'DROP TABLE IF EXISTS "{row["name"]}"')
+            self._conn.commit()
+        finally:
+            self._conn.execute("PRAGMA foreign_keys = ON")
+        self._ensure_tables()
+        self._migrate()
 
     # Idempotent, additive migrations for databases created before a column existed.
     # There's no migration framework yet (see design 9.2 live question) — for indev this

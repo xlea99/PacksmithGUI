@@ -70,13 +70,32 @@ class PackLoaderProvider:
 
     name = "unnamed"
     mod_id = None                  # what to look for in the packdump's mod list
-    capabilities = ()
+    capabilities = ()              # the most this loader can ever offer
+    # Whether `mod_id` was read from a real jar's mods.toml or inferred. False means a
+    # detection miss would be SILENT — the loader simply never appears — so it is recorded
+    # rather than assumed correct. See tests/test_pack_loaders.py.
+    mod_id_verified = False
+    summary = ""                   # one line, for the settings dropdown
 
     def detect(self, packdump) -> bool:
         """Is this loader installed in the pack? (§8.1: scan the packdump's mod list.)"""
         if packdump is None or not self.mod_id:
             return False
         return self.mod_id in packdump.mods
+
+    def available_capabilities(self, instance_root) -> tuple:
+        """What this loader offers *in this instance*, which is not always `capabilities`.
+
+        Three of the four supported loaders can be turned down in their own config files:
+        Open Loader disables data or resource packs independently, Moonlight disables its
+        global folder by setting the path to an empty string, and Global Packs is a list of
+        paths that can simply be emptied. So "the mod is installed" does not mean "the
+        capability is there", and asking the config is the only honest answer.
+
+        ``instance_root`` of None means "answer statically" — for callers that have a
+        packdump but no instance on disk.
+        """
+        return tuple(self.capabilities)
 
     def datapack_root(self, instance_root):
         raise NotImplementedError
@@ -129,6 +148,11 @@ class ResolutionTable:
                 for name in sorted(self.entries)]
 
 
+# The user's sticky choice of loader (§8.1: "sticky per profile"). It stores a provider
+# *name*, not an index — a list position would silently point at a different loader the
+# moment one is installed or removed.
+PACK_LOADER_SETTING = "pack_loader"
+
 WRITE_CAPABILITY = {"datapacks": DATAPACKS_WRITE, "resourcepacks": RESOURCEPACKS_WRITE}
 READ_CAPABILITY = {"datapacks": DATAPACKS_READ, "resourcepacks": RESOURCEPACKS_READ}
 
@@ -172,12 +196,17 @@ class PackTargets:
         return list(provider.packs(self._root, pack_kind))
 
 
-def resolve(packdump, *, loaders=(), preferred=None) -> ResolutionTable:
+def resolve(packdump, *, loaders=(), preferred=None, instance_root=None) -> ResolutionTable:
     """Build a profile's resolution table from the loaders that detect as present.
 
     ``preferred`` is the user's sticky per-profile choice (§8.1): when two loaders both
     provide `datapacks.write`, Packsmith picks a default and lets the user change it,
     rather than guessing differently on each launch.
+
+    ``instance_root`` lets each loader read its own config and answer what it *actually*
+    offers here — Open Loader with resource packs switched off provides `datapacks.*` and
+    nothing else. Without it the answer falls back to each loader's static maximum, which
+    is right for callers holding a packdump but no instance on disk.
     """
     table = ResolutionTable()
     for capability in BUILT_IN:
@@ -190,7 +219,7 @@ def resolve(packdump, *, loaders=(), preferred=None) -> ResolutionTable:
     active.sort(key=lambda loader: (loader.name != preferred, loader.name))
     for loader in active:
         table.providers[loader.name] = loader
-        for capability in loader.capabilities:
+        for capability in loader.available_capabilities(instance_root):
             existing = table.entries.get(capability)
             if existing is None:
                 table.entries[capability] = Resolution(capability, loader.name)
