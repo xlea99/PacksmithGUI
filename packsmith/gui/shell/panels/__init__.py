@@ -7,6 +7,12 @@ each panel is going to be.
 
 ``PANEL_SPECS`` is the single source the sidebar builds from: adding a panel is adding a
 row here (plus, eventually, a real widget in place of the stub).
+
+**The order is two groups, separated by a rule**, because the panels answer two different
+questions. The first three are *where you work* — the views you read, the files you edit,
+the automation you run. The second three are *the vocabulary those are expressed in* — the
+tags and blueprints you define, and the registry they describe. Sitting a divider between
+them means the strip can be aimed at by half before it is read at all.
 """
 from dataclasses import dataclass
 
@@ -14,26 +20,18 @@ from dataclasses import dataclass
 @dataclass(frozen=True)
 class PanelSpec:
     key: str
-    letter: str      # the icon-strip badge (no icon assets yet — letters per §4.1's V/B/T/F/R/J/A)
+    letter: str      # fallback badge, used only if the icon font fails to load (see icons.py)
     title: str
     description: str
+    group: int = 1   # a change of group draws a separator in the strip
 
 
 PANEL_SPECS = [
+    # --- where you work ---------------------------------------------------------------
     PanelSpec(
         "views", "V", "Views",
         "Searchable list of saved view configurations. Double-click opens the View in "
         "its renderer — usually a registry table. Ships with sensible defaults.",
-    ),
-    PanelSpec(
-        "blueprints", "B", "Blueprints",
-        "Browse blueprint schemas and instances as a tree. Click a schema to see all "
-        "instances; click an instance to open an editor tab.",
-    ),
-    PanelSpec(
-        "tags", "T", "Tags",
-        "All declared tags. Click to edit a definition. Quick-action to spawn a minimal "
-        "view scoped to one tag.",
     ),
     PanelSpec(
         "files", "F", "Files",
@@ -41,18 +39,29 @@ PANEL_SPECS = [
         "through integrations.",
     ),
     PanelSpec(
+        "automation", "A", "Automation",
+        "Jobs and Actions in one place. Jobs are what you run — pinned ones reach the "
+        "header's run control; Actions are the installed packages they are composed from. "
+        "Two tabs because they are different shapes, not because they are unrelated.",
+    ),
+
+    # --- the vocabulary it is expressed in ----------------------------------------------
+    PanelSpec(
+        "tags", "T", "Tags",
+        "All declared tags. Click to edit a definition. Quick-action to spawn a minimal "
+        "view scoped to one tag.",
+        group=2,
+    ),
+    PanelSpec(
+        "blueprints", "B", "Blueprints",
+        "Browse blueprint schemas and instances as a tree. Click a schema to see all "
+        "instances; click an instance to open an editor tab.",
+        group=2,
+    ),
+    PanelSpec(
         "registry", "R", "Registry",
         "Categorical registry-type list. Clicking a type opens a zero-tag table scoped "
         "to it — the fastest way to just look at everything.",
-    ),
-    PanelSpec(
-        "jobs", "J", "Jobs",
-        "The primary automation surface. Pinned jobs with one-click play buttons, all "
-        "jobs listed below, searchable.",
-    ),
-    PanelSpec(
-        "actions", "A", "Actions",
-        "Reference panel for installed actions, organized by package. Inspect manifests "
-        "and launch standalone runs.",
+        group=2,
     ),
 ]

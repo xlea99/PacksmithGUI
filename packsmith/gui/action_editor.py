@@ -26,8 +26,8 @@ from PySide6.QtWidgets import (
 from packsmith.core.packages import MANIFEST_NAME, SOURCE_SUFFIX, folders, source_files
 from packsmith.gui.shell import style
 
-_NEW_PACKAGE = "➕  New package…"
-_NEW_FILE = "➕  New file…"
+_NEW_PACKAGE = "New package…"
+_NEW_FILE = "New file…"
 _ROOT_FOLDER = "(package root)"
 
 

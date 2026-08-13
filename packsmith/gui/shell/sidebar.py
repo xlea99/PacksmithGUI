@@ -9,16 +9,19 @@ Clicking a different icon switches panels; clicking the active icon collapses th
 away, leaving just the strip.
 """
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtWidgets import QWidget, QVBoxLayout, QPushButton, QStackedWidget
+from PySide6.QtWidgets import (
+    QWidget, QVBoxLayout, QPushButton, QStackedWidget, QFrame)
 
-from packsmith.gui.shell import style
+from packsmith.gui.shell import icons, style
 from packsmith.gui.shell.panels import PANEL_SPECS
 
+# Colour only — deliberately no font-size or font-weight. A stylesheet's font rules beat
+# `setFont`, so specifying them here would squash the icon font back to a 13px bold text
+# face and undo the whole point. Size is set per button instead.
 _STRIP_BUTTON_QSS = f"""
     QPushButton {{
         background: transparent; color: {style.TEXT_MUTED};
         border: none; border-left: 2px solid transparent;
-        font-size: 13px; font-weight: bold;
     }}
     QPushButton:hover {{ color: {style.TEXT}; background: {style.BG_CHROME}; }}
     QPushButton:checked {{
@@ -48,8 +51,24 @@ class Sidebar(QWidget):
         self._current = None
         self._expanded = False
 
+        icon_font = icons.icon_font()
+        group = None
         for spec in PANEL_SPECS:
-            btn = QPushButton(spec.letter)
+            if group is not None and spec.group != group:
+                lay.addWidget(self._separator())
+            group = spec.group
+            # The letter is the fallback, not the plan: if the vendored font failed to load
+            # the strip still works, just less legibly. Refusing to start over an icon font
+            # would be a wild over-reaction.
+            mark = icons.glyph(spec.key) if icon_font else ""
+            btn = QPushButton(mark or spec.letter)
+            if mark:
+                btn.setFont(icon_font)
+            else:
+                fallback = btn.font()
+                fallback.setPointSize(10)
+                fallback.setBold(True)
+                btn.setFont(fallback)
             btn.setCheckable(True)
             btn.setFixedSize(style.SIDEBAR_STRIP_WIDTH, 34)
             btn.setToolTip(spec.title)
@@ -60,6 +79,19 @@ class Sidebar(QWidget):
             lay.addWidget(btn)
 
         lay.addStretch()
+
+    @staticmethod
+    def _separator() -> QWidget:
+        """The rule between panel groups.
+
+        Inset rather than full-bleed: a line touching both edges reads as the end of the
+        strip, which is the opposite of what it means here.
+        """
+        line = QFrame()
+        line.setFrameShape(QFrame.HLine)
+        line.setFixedHeight(9)
+        line.setStyleSheet(f"color: {style.BORDER}; margin: 4px 9px;")
+        return line
 
     def _on_click(self, key):
         if self._current == key and self._expanded:

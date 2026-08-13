@@ -11,7 +11,7 @@ condition clears. Nothing about it is timed, and nothing about it interrupts.
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import QWidget, QHBoxLayout, QLabel, QPushButton
 
-from packsmith.gui.shell import style
+from packsmith.gui.shell import icons, style
 
 
 class PackdumpBanner(QWidget):
@@ -36,7 +36,8 @@ class PackdumpBanner(QWidget):
         self._force.clicked.connect(self.force_requested)
         lay.addWidget(self._force)
 
-        close = self._button("✕")
+        close = self._button("")
+        icons.mark(close, "close", size=12)
         close.setFixedWidth(24)
         close.clicked.connect(self._dismiss)
         lay.addWidget(close)

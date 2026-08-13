@@ -23,7 +23,7 @@ from PySide6.QtWidgets import (
     QAbstractItemView,
 )
 
-from packsmith.gui.shell import style
+from packsmith.gui.shell import icons, style
 from packsmith.gui.shell.tree import PanelTree
 from packsmith.gui.shell.panels.base import Panel
 
@@ -114,7 +114,7 @@ class JobsPanel(Panel):
         self._tree.addTopLevelItem(header)
         header.setExpanded(True)
         for job in jobs:
-            item = QTreeWidgetItem(["▶", job.name])
+            item = QTreeWidgetItem([icons.ui("play") or "▶", job.name])
             item.setData(0, _ROLE_JOB, job)
             item.setToolTip(0, f"Run '{job.name}' now")
             steps = len(job.steps)

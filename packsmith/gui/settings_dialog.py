@@ -23,7 +23,7 @@ from PySide6.QtWidgets import (
 from packsmith.core import launchers
 from packsmith.core.capabilities import (
     DATAPACKS_ORDERING, DATAPACKS_WRITE, PACK_LOADER_SETTING,
-    RESOURCEPACKS_ORDERING, RESOURCEPACKS_WRITE)
+    RESOURCEPACKS_ORDERING, RESOURCEPACKS_WRITE, resolve)
 from packsmith.core.packdump import AUTO_ADOPT_SETTING
 from packsmith.integrations import PACK_LOADERS
 from packsmith.gui.load_order_dialog import LoadOrderDialog
@@ -150,13 +150,26 @@ class SettingsDialog(QDialog):
         else:
             stored = self._profile.settings.get(PACK_LOADER_SETTING)
             index = self._loader.findData(stored)
-            # A stored loader that has since been uninstalled falls back to the first
-            # rather than showing a name that isn't there — but the setting is left alone,
-            # so reinstalling the mod restores the user's choice instead of silently
-            # having lost it.
-            self._loader.setCurrentIndex(index if index >= 0 else 0)
+            if index < 0:
+                # Nothing chosen yet, or the chosen mod is gone. Show whoever `resolve`
+                # ACTUALLY picks rather than whoever happens to be listed first — those
+                # were two different orderings, and the dialog confidently displayed Paxi
+                # on a pack where every override was going to Moonlight. A settings screen
+                # that disagrees with the running app is worse than no settings screen.
+                index = max(0, self._loader.findData(self._resolved_loader_name()))
+            # The stored value is left alone when its mod is missing, so reinstalling it
+            # restores the user's choice rather than finding it silently overwritten.
+            self._loader.setCurrentIndex(index)
         self._refresh_loader_status()
         return holder
+
+    def _resolved_loader_name(self) -> str:
+        """Whichever loader the app is really writing overrides through right now."""
+        table = resolve(self._packdump, loaders=PACK_LOADERS,
+                        preferred=self._profile.settings.get(PACK_LOADER_SETTING),
+                        instance_root=self._profile.mc_path)
+        provider = table.provider_for(DATAPACKS_WRITE)
+        return provider.name if provider is not None else ""
 
     def _selected_loader(self):
         name = self._loader.currentData()

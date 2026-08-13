@@ -159,7 +159,7 @@ class _TemplateBar(QWidget):
         lay.addWidget(self._input, 1)
 
         self.show_button = _button(
-            "💡  Show",
+            "Show",
             "List this cell's suggestions without editing it  (Ctrl+Space)")
         lay.addWidget(self.show_button)
 
@@ -481,7 +481,7 @@ class BlueprintEditorTab(QWidget):
         bar_lay.addSpacing(8)
         bar_lay.addWidget(self._follow_tree)
 
-        self._save = _button("💾  Save view",
+        self._save = _button("Save view",
                              "Keep this as a named View, with its suggestions")
         self._save.clicked.connect(self.save_requested)
         bar_lay.addWidget(self._save)
@@ -522,6 +522,8 @@ class BlueprintEditorTab(QWidget):
         root.addWidget(self._overrides_panel)
 
         split = QSplitter(Qt.Horizontal)
+        split.setHandleWidth(style.SPLITTER_WIDTH)
+        split.setStyleSheet(style.SPLITTER_QSS)
 
         self._tree = _SchemaTree()
         self._tree.setColumnCount(2)

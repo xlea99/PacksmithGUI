@@ -236,12 +236,19 @@ def test_no_loader_lets_an_override_escape_its_pack(tmp_path, provider):
 
 # --- disambiguation, which is now a real situation -------------------------------------------
 
-def test_without_a_preference_the_winner_is_alphabetical_and_that_is_the_problem(tmp_path):
-    """Documents the hazard rather than endorsing it. On a pack holding Paxi and Moonlight —
-    the user's own — "Global Packs" and "Moonlight" both sort ahead of "Paxi", so overrides
-    would silently land somewhere the user never chose."""
+def test_without_a_preference_the_most_capable_loader_wins(tmp_path):
+    """This test used to assert the opposite and called it "the problem" — the winner was
+    alphabetical, so with all four installed "Global Packs" took it. That was documented as
+    a hazard and then happened for real: deep_end (Paxi + Moonlight, nothing chosen) sent
+    every override to Moonlight while the settings dialog displayed Paxi.
+
+    Alphabetical order is not an answer to "which loader should this pack use". Breadth is:
+    the default is whichever can satisfy the most actions.
+    """
     table = resolve(ALL_FOUR, loaders=PACK_LOADERS, instance_root=tmp_path)
-    assert table.entries[DATAPACKS_WRITE].provider == "Global Packs"
+    assert table.entries[DATAPACKS_WRITE].provider == "Paxi"
+    assert set(table.entries[DATAPACKS_WRITE].alternatives) == {
+        "Global Packs", "Moonlight", "Open Loader"}
 
 
 def test_the_stored_preference_decides_who_wins(tmp_path):
@@ -280,3 +287,41 @@ def test_without_an_instance_the_answer_falls_back_to_the_static_maximum():
     """Callers holding a packdump but no instance on disk still get a usable table."""
     table = resolve(ALL_FOUR, loaders=PACK_LOADERS)
     assert table.satisfies(DATAPACKS_WRITE) and table.satisfies(DATAPACKS_ORDERING)
+
+
+# --- the default chooser: capability breadth, not the alphabet -----------------------------
+#
+# Reported from real use: on deep_end (Paxi + Moonlight, nothing chosen) the Files panel
+# crashed opening Smart Mode, *and* Settings displayed "Paxi" while every override was
+# going to Moonlight. Two bugs from one cause — the resolver ranked alphabetically and
+# "Moonlight" < "Paxi", while the settings dialog listed PACK_LOADERS order.
+
+def test_the_most_capable_loader_wins_by_default(tmp_path):
+    """Moonlight is datapacks-only with no ordering; Paxi does both kinds and orders them.
+    Preferring breadth means the default is the loader that can satisfy the most actions."""
+    table = resolve(Dump("paxi", "moonlight"), loaders=PACK_LOADERS, instance_root=tmp_path)
+    assert table.entries[DATAPACKS_WRITE].provider == "Paxi"
+
+
+def test_breadth_beats_the_alphabet_specifically(tmp_path):
+    """The regression, named. Every other loader sorts before "Paxi", so an alphabetical
+    default hands the overrides away on any pack that has one of them too."""
+    for other in ("moonlight", "globalpacks", "openloader"):
+        table = resolve(Dump("paxi", other), loaders=PACK_LOADERS, instance_root=tmp_path)
+        assert table.entries[DATAPACKS_WRITE].provider == "Paxi", other
+
+
+def test_an_explicit_choice_still_beats_breadth(tmp_path):
+    """Preference is the user's, and it outranks any ranking we invent."""
+    table = resolve(Dump("paxi", "moonlight"), loaders=PACK_LOADERS,
+                    preferred="Moonlight", instance_root=tmp_path)
+    assert table.entries[DATAPACKS_WRITE].provider == "Moonlight"
+
+
+def test_a_loader_switched_off_does_not_win_on_breadth(tmp_path):
+    """Breadth is measured on what is actually AVAILABLE here, not on the class's maximum —
+    otherwise a disabled loader would out-rank a working one on paper."""
+    write_moonlight(tmp_path, "")               # Moonlight off
+    table = resolve(Dump("moonlight", "openloader"), loaders=PACK_LOADERS,
+                    instance_root=tmp_path)
+    assert table.entries[DATAPACKS_WRITE].provider == "Open Loader"

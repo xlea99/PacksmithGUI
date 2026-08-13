@@ -1,3 +1,4 @@
+import json
 import os
 import sys
 import tomllib
@@ -107,3 +108,75 @@ def load_config(path: Path) -> dict:
 
 GLOBAL_PATHS = ProjectPaths.build()
 CONFIG = load_config(GLOBAL_PATHS.config / "main.toml")
+
+
+# App STATE, as distinct from app config. Config is what the *user* writes — hand-edited
+# TOML, comments and all — and Packsmith must never rewrite it just to leave itself a
+# breadcrumb. State is the opposite: things the app remembers on the user's behalf, like
+# which profile was open last. Separate file, machine-owned, JSON so the standard library
+# can write it (tomllib reads TOML and cannot produce it).
+STATE_FILE = "state.json"
+
+
+def load_state() -> dict:
+    """What the app remembered last run. Missing or corrupt reads as "nothing".
+
+    Unlike `load_config`, a malformed file here is NOT an error: nobody wrote it by hand,
+    so there is no intent to respect, and refusing to launch over a damaged breadcrumb
+    would be a spectacular over-reaction to losing which profile was open.
+    """
+    try:
+        with open(GLOBAL_PATHS.config / STATE_FILE, "r", encoding="utf-8") as f:
+            state = json.load(f)
+        return state if isinstance(state, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def load_ui_state(profile: str) -> dict:
+    """Remembered layout for one profile — panel heights, and whatever else gets dragged.
+
+    Kept in state rather than in the profile's own `profile.json`, even though it is
+    per-profile. `profile.json` holds the pack's *contract* — instance path, MC version,
+    loader — which the user reads and sometimes edits. A splitter position is neither a
+    setting nor a contract; it is furniture the app moved because the user dragged it, and
+    it has no business in a file someone might open to check what version their pack is.
+    """
+    if not profile:
+        return {}
+    return load_state().get("ui", {}).get(profile, {}) or {}
+
+
+def save_ui_state(profile: str, **changes) -> None:
+    if not profile:
+        return
+    ui = load_state().get("ui", {})
+    ui[profile] = {**ui.get(profile, {}), **changes}
+    save_state(ui=ui)
+
+
+def save_state(**changes) -> None:
+    """Merge ``changes`` into the stored state. Best-effort — never fatal.
+
+    Merged rather than replaced so one caller cannot drop another's key, and swallowed
+    because failing to record a breadcrumb must not take down whatever the user was
+    actually doing.
+    """
+    state = load_state()
+    state.update(changes)
+    try:
+        path = GLOBAL_PATHS.config / STATE_FILE
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(state, f, indent=2)
+    except (OSError, ValueError, TypeError):
+        # Wider than OSError on purpose. An unusable path raises ValueError rather than
+        # OSError (an embedded null, for one), and a caller passing something JSON cannot
+        # serialise raises TypeError — and "best-effort" has to mean it, or the promise is
+        # only kept for the failures somebody happened to anticipate.
+        #
+        # Imported here, not at module scope: `logging` reads GLOBAL_PATHS back out of this
+        # module, so a top-level import is circular — and this module has to be importable
+        # before logging exists at all.
+        from packsmith.common.logging import log
+        log.warning("Could not write %s", STATE_FILE, exc_info=True)

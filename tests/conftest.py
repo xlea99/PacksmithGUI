@@ -10,8 +10,29 @@ tests and are kept out of this suite.
 """
 import pytest
 
+from packsmith.common import setup as app_setup
 from packsmith.core.db import UserDB
 from packsmith.core.tags import TagStore
+
+
+@pytest.fixture(autouse=True)
+def isolated_app_state(tmp_path, monkeypatch):
+    """Keep every test out of the developer's real `userdata/config/`.
+
+    App state (`state.json`) records the last-opened profile and remembered panel layouts,
+    and anything constructing a `MainWindow` writes to it. Without this, running the suite
+    quietly rewrote the developer's own state — a throwaway test profile became the one
+    that opened on next launch, and probe profiles accumulated layout entries forever.
+
+    Autouse rather than opt-in: the writes happen deep inside window construction, so a
+    test cannot reasonably know it needs the protection. It was a *debounced* write that
+    exposed this — a timer that outlived its test and landed in the real file after
+    teardown had already restored the path.
+    """
+    config = tmp_path / "app-config"
+    config.mkdir()
+    monkeypatch.setattr(app_setup.GLOBAL_PATHS, "config", config)
+    return config
 
 
 @pytest.fixture

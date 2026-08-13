@@ -24,8 +24,9 @@ from PySide6.QtWidgets import (
     QAbstractItemView, QComboBox, QInputDialog,
 )
 
+from packsmith.core.capabilities import DATAPACKS_WRITE, RESOURCEPACKS_WRITE
 from packsmith.core.files import FileStore
-from packsmith.gui.shell import style
+from packsmith.gui.shell import icons, style
 from packsmith.gui.shell.tree import PanelTree
 from packsmith.gui.shell.panels.base import Panel
 
@@ -163,11 +164,21 @@ class FilesPanel(Panel):
         loader loads them, because with Paxi that is a thing the user controls and needs
         to see.
         """
-        for label, kind in (("📦  Datapacks", "datapacks"),
-                            ("🎨  Resource Packs", "resourcepacks")):
+        # Only the kinds this loader actually has. Moonlight does global datapacks and has
+        # no concept of resource packs at all (§8.1), so asking it for that root raises —
+        # and asking unconditionally is what took the whole panel down.
+        offered = set(self._loader.available_capabilities(self._files.root))
+        for label, kind, capability in (
+                ("Datapacks", "datapacks", DATAPACKS_WRITE),
+                ("Resource Packs", "resourcepacks", RESOURCEPACKS_WRITE)):
+            if capability not in offered:
+                continue
             root = (self._loader.datapack_root(self._files.root) if kind == "datapacks"
                     else self._loader.resourcepack_root(self._files.root))
             category = QTreeWidgetItem([label])
+            # A datapack is a pack, not a folder — the category deserves its own mark
+            # rather than the generic folder every other row already uses.
+            category.setIcon(0, icons.ui_icon(kind, colour=style.TEXT))
             category.setData(0, _ROLE_CATEGORY, kind)
             category.setData(0, _ROLE_IS_DIR, True)
             # Marked loaded, because its children are built right here. Without this the
@@ -240,6 +251,7 @@ class FilesPanel(Panel):
             item.setData(0, _ROLE_IS_DIR, entry.is_dir())
             if entry.is_dir():
                 item.setData(0, _ROLE_LOADED, False)
+                item.setIcon(0, icons.file_icon(entry.name, True, colour=style.TEXT))
                 item.addChild(QTreeWidgetItem(["…"]))   # placeholder so it shows an arrow
             else:
                 self._style_file(item, rel)
@@ -249,16 +261,31 @@ class FilesPanel(Panel):
                 parent_item.addChild(item)
 
     def _style_file(self, item, rel):
-        """§6.2 Tracked vs Untracked: owned files render normally with an ownership dot,
+        """§6.2 Tracked vs Untracked: owned files render normally with an ownership badge,
         untouched ones render muted. Not hidden — "hiding them would make the browser
-        useless" — just visibly not-yet-tracked."""
+        useless" — just visibly not-yet-tracked.
+
+        Two channels, and they answer different questions: the icon's **shape** is what the
+        file is, and its **colour** is whose it is. The name's colour then only has to carry
+        tracked-versus-not, which is what §6.2 asks it for.
+
+        This replaced a tiny corner badge. A whole glyph in the ownership colour is legible
+        at a glance where a 9px dot needed looking for — and the badge had been sitting in
+        the icon slot, so the type icon could not have coexisted with it anyway.
+        """
+        name = rel.rsplit("/", 1)[-1]
         ownership = self._owners.get(_norm(rel))
         if ownership is None:
             item.setForeground(0, QColor(style.TEXT_FAINT))
+            item.setIcon(0, icons.file_icon(name, colour=style.TEXT_FAINT))
             item.setToolTip(0, f"{rel}\nuntouched — no ownership record")
             return
         kind = ownership.get("kind")
-        item.setIcon(0, _owner_dot(style.OWNER_USER if kind == "user" else style.OWNER_ACTION))
+        # The ICON-weight ownership colours, not the accent pair: a stroked glyph in
+        # `OWNER_USER` measures 2.0:1 against this background, which is invisible.
+        item.setIcon(0, icons.file_icon(
+            name,
+            colour=style.OWNER_USER_ICON if kind == "user" else style.OWNER_ACTION_ICON))
         item.setForeground(0, QColor(style.TEXT))
         who = "you" if kind == "user" else (ownership.get("action_ref") or "an action")
         item.setToolTip(0, f"{rel}\nowned by {who}")

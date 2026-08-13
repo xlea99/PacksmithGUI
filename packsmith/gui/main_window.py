@@ -15,10 +15,15 @@ from PySide6.QtWidgets import (
     QMainWindow, QVBoxLayout, QHBoxLayout, QWidget, QLabel, QPushButton,
     QHeaderView, QSplitter, QInputDialog, QMessageBox, QApplication,
 )
-from PySide6.QtCore import Qt, QEvent
+from PySide6.QtCore import Qt, QEvent, QTimer
 from PySide6.QtGui import QShortcut, QKeySequence
 
+from packsmith.common.setup import (
+    load_state, load_ui_state, save_state, save_ui_state)
 from packsmith.core.profile import Profile, list_profiles
+
+# Which profile was open last (§4.1). App STATE, not config — see `common/setup.py`.
+LAST_PROFILE_KEY = "last_profile"
 from packsmith.core.archives import ArchiveError, read_member
 from packsmith.core.capabilities import (
     CapabilityError, DATAPACKS_WRITE, PACK_LOADER_SETTING, RESOURCEPACKS_WRITE,
@@ -57,7 +62,7 @@ from packsmith.gui.demo_views import demo_views
 from packsmith.gui.queries import blueprint_query, browse_query, tag_query
 from packsmith.gui.query_constructor import QueryConstructorDialog
 from packsmith.gui.tag_editor import TagCreateDialog, EnumValuesDialog
-from packsmith.gui.shell import style
+from packsmith.gui.shell import icons, style
 from packsmith.gui.shell.sidebar import Sidebar, PanelStack
 from packsmith.gui.shell.workspace import Workspace
 from packsmith.gui.shell.bottom_panel import BottomPanel
@@ -74,6 +79,7 @@ from packsmith.gui.editor.sources import (
     InstanceFileSource, JarMemberSource, PackageFileSource, is_overridable, member_path,
     split_member)
 from packsmith.gui.shell.panels.actions_panel import ActionsPanel
+from packsmith.gui.shell.panels.automation_panel import AutomationPanel
 from packsmith.gui.shell.panels.blueprints_panel import BlueprintsPanel
 from packsmith.gui.query_bar import QueryBar, combine
 from packsmith.core.query.ast import Blueprint as QueryBlueprint, QueryError
@@ -87,6 +93,7 @@ from packsmith.gui.override_dialog import OverrideTargetDialog
 from packsmith.gui.packdump_diff import PackdumpDiffTab
 from packsmith.gui.jar_viewer import JarViewerTab
 from packsmith.gui.nbt_viewer import NbtViewerTab
+from packsmith.gui.run_control import RunControl
 from packsmith.gui.settings_dialog import SettingsDialog
 from packsmith.gui.job_editor import JobEditorTab
 from packsmith.gui.table.registry_table_model import RegistryTableModel
@@ -142,11 +149,21 @@ class MainWindow(QMainWindow):
         under one developer's home directory: a guaranteed launch crash on any other
         machine, and on that one machine it quietly invented a profile nobody asked for.
         First run now opens the gated window instead, which is what §3.1 describes —
-        Packsmith "won't let you do anything until it loads its first packdump"."""
+        Packsmith "won't let you do anything until it loads its first packdump".
+
+        §4.1: "Packsmith remembers the last active profile and auto-loads it on startup."
+        A remembered profile that has since been deleted falls through to the old fallback
+        rather than blocking startup — the breadcrumb is a convenience, never a dependency.
+        """
         existing = list_profiles()
+        if not existing:
+            return ""
+        remembered = load_state().get(LAST_PROFILE_KEY)
+        if remembered in existing:
+            return remembered
         if "packsmith_test" in existing:
             return "packsmith_test"
-        return existing[0] if existing else ""
+        return existing[0]
 
     def _enter_profile(self, name: str):
         """Open a profile and build the window around it."""
@@ -159,7 +176,26 @@ class MainWindow(QMainWindow):
         self._seed_packages()
         self._seed_jobs()
         self._build_shell()
+        # Into the Logs tab as well as the file: opening a profile is the single most
+        # consequential thing that happens at launch — it decides which registry, which
+        # database and which instance everything else is about — and until now the only
+        # trace of it was in the log file nobody has open.
+        remembered = load_ui_state(name).get("last_job")
+        self._run_control.set_jobs(self._jobs.all(), readiness=self._job_problems,
+                                   select=remembered)
+        self._bottom.log(f"Profile '{name}' loaded")
+        self._remember_profile(name)
         self._report_import(self._import_result, initial=True)
+
+    @staticmethod
+    def _remember_profile(name: str):
+        """Record the profile for next launch (§4.1).
+
+        Written on ENTRY rather than on exit, so a crash or a force-quit still leaves the
+        right breadcrumb — the whole point is surviving an untidy shutdown.
+        """
+        if name:
+            save_state(**{LAST_PROFILE_KEY: name})
 
     def _load_profile(self, name: str):
         self._blocked = None
@@ -329,13 +365,21 @@ class MainWindow(QMainWindow):
         self._actions_panel.rename_folder_requested.connect(self._rename_package_folder)
         self._actions_panel.delete_folder_requested.connect(self._delete_package_folder)
 
+        # Jobs and Actions share one slot (§4.1). Both panels are built exactly as before —
+        # every signal above is untouched — and the wrapper only decides where they sit.
+        self._automation_panel = AutomationPanel(self._jobs_panel, self._actions_panel)
+        self._automation_panel.show_tab(
+            load_ui_state(self._profile.name if self._profile else "")
+            .get("automation_tab", "jobs"))
+        self._automation_panel._tabs.currentChanged.connect(
+            lambda _: self._remember_automation_tab())
+
         live = {
             "views": self._views_panel,
             "registry": self._registry_panel,
             "tags": self._tags_panel,
-            "jobs": self._jobs_panel,
             "files": self._files_panel,
-            "actions": self._actions_panel,
+            "automation": self._automation_panel,
             "blueprints": self._blueprints_panel,
         }
         panels = {
@@ -345,11 +389,12 @@ class MainWindow(QMainWindow):
         # How each live panel reloads itself from its store (see _show_panel).
         self._panel_reloaders = {
             "views": self._reload_views,
-            "jobs": self._reload_jobs,
             "tags": self._tags_panel.refresh,
             "files": self._files_panel.refresh,
             "registry": self._registry_panel.refresh,
-            "actions": self._actions_panel.refresh,
+            # Reloads BOTH tabs: the stack keeps hidden widgets alive, so refreshing only
+            # the visible one leaves the other sitting on stale data.
+            "automation": self._reload_automation,
             "blueprints": self._blueprints_panel.refresh,
         }
 
@@ -411,14 +456,36 @@ class MainWindow(QMainWindow):
         self._refresh_packdump_panel()
 
         vertical = QSplitter(Qt.Vertical)
+        vertical.setHandleWidth(style.SPLITTER_WIDTH)
+        vertical.setStyleSheet(style.SPLITTER_QSS)
         vertical.addWidget(self._workspace)
         vertical.addWidget(self._bottom)
         vertical.setStretchFactor(0, 1)
         vertical.setStretchFactor(1, 0)
         vertical.setCollapsible(1, False)
         vertical.setSizes([1000, self._bottom.collapsed_height()])
+        # A splitter told to hold the panel at its collapsed height will keep doing so
+        # forever, so opening a tab would show a sliver rather than a panel. The panel says
+        # when it opens and shuts; the window, which owns the splitter, does the resizing.
+        self._bottom.expanded_changed.connect(
+            lambda opened, s=vertical: self._resize_bottom(s, opened))
+        # Dragging the divider IS how the height is set — there is no dialog for it — so the
+        # drag has to be what gets remembered.
+        self._bottom_height = load_ui_state(
+            self._profile.name if self._profile else "").get("bottom_height") or 0
+        self._bottom_save = QTimer(self)
+        self._bottom_save.setSingleShot(True)
+        self._bottom_save.setInterval(500)
+        self._bottom_save.timeout.connect(self._save_bottom_height)
+        vertical.splitterMoved.connect(
+            lambda _pos, _i, s=vertical: self._on_bottom_dragged(s))
+        # The panel collapses during its own construction, before that signal existed, so
+        # the handle starts out live over an unresizable panel unless it is synced once.
+        self._resize_bottom(vertical, self._bottom.is_expanded)
 
         horizontal = QSplitter(Qt.Horizontal)
+        horizontal.setHandleWidth(style.SPLITTER_WIDTH)
+        horizontal.setStyleSheet(style.SPLITTER_QSS)
         horizontal.addWidget(self._panel_stack)
         horizontal.addWidget(vertical)
         horizontal.setStretchFactor(0, 0)
@@ -439,7 +506,57 @@ class MainWindow(QMainWindow):
                 QShortcut(QKeySequence.Redo, self, activated=self._redo),
                 QShortcut(QKeySequence("Ctrl+`"), self,
                           activated=lambda: self._bottom.toggle()),
+                QShortcut(QKeySequence("Ctrl+R"), self,
+                          activated=self._run_selected_job),
             ]
+
+    def _resize_bottom(self, splitter, opened: bool):
+        """Give the bottom panel room when it opens, and take it back when it shuts.
+
+        The height is remembered — per profile, across sessions — rather than snapping back
+        to a default each time. It is never *set* anywhere: you drag the panel and that is
+        the setting. Somewhere to configure it would be worse than the dragging.
+        """
+        total = sum(splitter.sizes())
+        # The handle follows the panel: draggable only while there is content to resize.
+        # The height cap already makes a collapsed drag do nothing, but a live handle over
+        # a dead divider still offers a resize cursor and invites the attempt.
+        handle = splitter.handle(1)
+        if handle is not None:
+            handle.setEnabled(opened)
+            handle.setCursor(Qt.SplitVCursor if opened else Qt.ArrowCursor)
+        if not opened:
+            self._remember_bottom_height(splitter)
+            splitter.setSizes([total - self._bottom.collapsed_height(),
+                               self._bottom.collapsed_height()])
+            return
+        wanted = self._bottom_height or self._bottom.expanded_height()
+        # Never taller than the window can spare, never shorter than a sliver — a
+        # remembered height from a bigger monitor must not swallow the workspace.
+        wanted = max(self._bottom.minimum_expanded_height(),
+                     min(wanted, max(total - 200, self._bottom.minimum_expanded_height())))
+        splitter.setSizes([total - wanted, wanted])
+
+    def _on_bottom_dragged(self, splitter):
+        if not self._bottom.is_expanded:
+            return          # dragging a shut panel is not a height worth keeping
+        self._remember_bottom_height(splitter)
+        self._bottom_save.start()
+
+    def _remember_bottom_height(self, splitter):
+        """Capture the current height, if the panel is actually open enough to have one."""
+        height = splitter.sizes()[1]
+        if height > self._bottom.collapsed_height():
+            self._bottom_height = height
+
+    def _save_bottom_height(self):
+        """Persist the dragged height for this profile.
+
+        Debounced: `splitterMoved` fires on every mouse-move of a drag, and writing the
+        state file on each of them would be dozens of writes a second for one gesture.
+        """
+        if self._profile is not None and self._bottom_height:
+            save_ui_state(self._profile.name, bottom_height=int(self._bottom_height))
 
     def _build_header(self) -> QWidget:
         header = QWidget()
@@ -457,8 +574,17 @@ class MainWindow(QMainWindow):
         self._header_info.setStyleSheet(f"font-size: 12px; color: {style.TEXT_MUTED};")
         self._refresh_header()
 
+        # The run control sits between the profile name and the pack facts, in the header's
+        # otherwise empty middle. §3.3.2 calls jobs "rarely edited but constantly re-run",
+        # and an IDE answers that with a toolbar control rather than by making you dock a
+        # panel to press play. See gui/run_control.py.
+        self._run_control = RunControl()
+        self._run_control.run_requested.connect(self._run_job)
+
         lay.addWidget(name)
         lay.addStretch()
+        lay.addWidget(self._run_control)
+        lay.addSpacing(14)
         lay.addWidget(self._header_info)
         return header
 
@@ -947,8 +1073,9 @@ class MainWindow(QMainWindow):
         if errors is not None:
             errors.refresh()
             if errors.has_problems():
+                # Was `show_panel("errors")` followed by `expand(1)` — and index 1 is Job
+                # Results, so surfacing the errors immediately switched away from them.
                 self._bottom.show_panel("errors")
-                self._bottom.expand(1)
 
     def _force_import(self):
         result = self._import_result
@@ -1263,8 +1390,8 @@ class MainWindow(QMainWindow):
             views_menu.addAction(label).setEnabled(False)
 
         profiles_menu = bar.addMenu("Profiles")
-        profiles_menu.addAction("Switch Profile…", self._open_profile)
         profiles_menu.addAction("New Profile…", self._new_profile)
+        profiles_menu.addAction("Switch Profile…", self._open_profile)
 
         help_menu = bar.addMenu("Help")
         help_menu.addAction("About Packsmith").setEnabled(False)
@@ -1359,7 +1486,8 @@ class MainWindow(QMainWindow):
 
         # ⚙ — edit this view's query. The query is the view's stable identity, so editing
         # it is a deliberate act behind the gear, not an always-on filter bar.
-        gear = QPushButton("⚙")
+        gear = QPushButton()
+        icons.mark(gear, "settings", size=13)
         gear.setFixedSize(28, 24)
         gear.setToolTip("Edit this view's query")
         gear.setStyleSheet(f"""
@@ -1461,6 +1589,64 @@ class MainWindow(QMainWindow):
         userdata, not game files."""
         return self._open_document("package", path)
 
+    def _tab_icon(self, source, path):
+        """The file-type icon for a document tab (design 6.2's vocabulary, reused).
+
+        Documents only. A View, a blueprint grid or a job editor is not a file, and giving
+        one a paper-and-lines glyph would say something untrue about what it is — the tab
+        bar is heterogeneous by design (§4.2), so an icon here has to mean "this is a file"
+        rather than just "this is a tab".
+
+        For a jar member the icon comes from the MEMBER's name, not the jar's — the tab is
+        showing `recipes/stone.json`, so a zip glyph would describe the container instead of
+        what you are looking at.
+        """
+        name = Path(split_member(path)[1]).name if source == "jar" else Path(path).name
+        return icons.file_icon(name, colour=self._tab_icon_colour(source, path))
+
+    def _tab_icon_colour(self, source, path) -> str:
+        """Whose the open file is, in the same colours the Files panel uses (§6.1).
+
+        Ownership is the fact the whole file engine turns on — an action's write to a
+        user-owned file is hard-blocked, and a user's write to an action-owned one is a loud
+        transfer — so knowing whose a file is *while you are editing it* is worth a tab
+        icon. Muted for a jar member because it is nobody's to own: the mod's copy must stay
+        exactly as it shipped (§6.5).
+
+        Untracked reads as normal rather than faint. In the Files panel faint means "not yet
+        tracked" among hundreds of rows; in a tab bar it would mean "this thing you have
+        open is somehow lesser", and untracked is simply the default state of a file.
+        """
+        if source == "jar":
+            return style.TEXT_MUTED
+        if source != "instance":
+            return style.TEXT           # a package's own sources are yours by construction
+        try:
+            ownership = self._file_store.ownership(path)
+        except Exception:
+            return style.TEXT
+        if not ownership:
+            return style.TEXT
+        return (style.OWNER_USER_ICON if ownership.get("kind") == "user"
+                else style.OWNER_ACTION_ICON)
+
+    def _refresh_tab_icons(self):
+        """Re-colour every open document tab.
+
+        Called wherever ownership can move: the first keystroke in an editor claims a file,
+        a job run claims whatever it wrote, the Files panel can take or release one, and
+        saving an NBT tree claims it. A tab showing yesterday's owner would be worse than
+        showing none — the colour is only worth having if it is current.
+        """
+        for (kind, key), tab in list(self._open_tabs.items()):
+            if kind != "doc":
+                continue
+            try:
+                source, path = self._editor_host.split_key(key)
+                self._workspace.set_tab_icon(tab, self._tab_icon(source, path))
+            except Exception:
+                continue        # a cosmetic pass must never break on one odd tab
+
     def _open_document(self, source, path):
         key = self._editor_host.key_for(source, path)
         existing = self._open_tabs.get(("doc", key))
@@ -1482,7 +1668,7 @@ class MainWindow(QMainWindow):
                 lambda _archive, member, rel=path: self._open_jar_member(rel, member))
             tab.override_requested.connect(
                 lambda _archive, member, rel=path: self._save_as_override(rel, member))
-            self._workspace.add_tab(tab, Path(path).name)
+            self._workspace.add_tab(tab, Path(path).name, icon=self._tab_icon(source, path))
             self._open_tabs[("doc", key)] = tab
             self._set_status(f"{Path(path).name} — {tab._summary.text()}")
             return tab
@@ -1496,7 +1682,7 @@ class MainWindow(QMainWindow):
                 lambda data, s=source, p=path, t=tab: self._save_nbt(s, p, t, data))
             tab.dirty_changed.connect(
                 lambda dirty, p=path, t=tab: self._on_tab_dirty(t, Path(p).name, dirty))
-            self._workspace.add_tab(tab, Path(path).name)
+            self._workspace.add_tab(tab, Path(path).name, icon=self._tab_icon(source, path))
             self._open_tabs[("doc", key)] = tab
             self._set_status(f"{Path(path).name} — {tab._summary.text()}")
             return tab
@@ -1506,13 +1692,13 @@ class MainWindow(QMainWindow):
             data = self._bytes_for(source, path)
             tab = ImageViewerTab(data or b"", Path(path).name)
             tab.status.connect(self._set_status)
-            self._workspace.add_tab(tab, Path(path).name)
+            self._workspace.add_tab(tab, Path(path).name, icon=self._tab_icon(source, path))
             self._open_tabs[("doc", key)] = tab
             self._set_status(f"{Path(path).name} — {tab._info.text()}")
             return tab
         if kind != filetypes.TEXT:
             tab = UnsupportedFileTab(path, kind)
-            self._workspace.add_tab(tab, Path(path).name)
+            self._workspace.add_tab(tab, Path(path).name, icon=self._tab_icon(source, path))
             self._open_tabs[("doc", key)] = tab
             self._set_status(f"{Path(path).name} — {filetypes.describe(kind)}")
             return tab
@@ -1526,12 +1712,12 @@ class MainWindow(QMainWindow):
             # needs to survive it — this is the last guard, not the first.
             log.info("Falling back to the placeholder for %s: %s", path, e)
             tab = UnsupportedFileTab(path, filetypes.BINARY)
-            self._workspace.add_tab(tab, Path(path).name)
+            self._workspace.add_tab(tab, Path(path).name, icon=self._tab_icon(source, path))
             self._open_tabs[("doc", key)] = tab
             self._set_status(f"{Path(path).name} — can't be opened as text ({e})")
             return tab
         tab.unlock_requested.connect(self._request_unlock)
-        self._workspace.add_tab(tab, Path(path).name)
+        self._workspace.add_tab(tab, Path(path).name, icon=self._tab_icon(source, path))
         self._open_tabs[("doc", key)] = tab
         tab.activate()
         return tab
@@ -1582,6 +1768,7 @@ class MainWindow(QMainWindow):
             self._set_status(f"Save failed: {e}")
             return
         tab.mark_saved()
+        self._refresh_tab_icons()
         self._set_status(f"Saved {path} — {len(data):,} bytes")
         self._files_panel.refresh()          # the save may have claimed ownership
 
@@ -2003,10 +2190,15 @@ class MainWindow(QMainWindow):
         # the one that is.
         if self._workspace.current_widget() is tab:
             self._refresh_status()
+        if is_dirty:
+            # §6.2: "editing is the gesture that tracks it" — the first keystroke claims
+            # the file, so the tab turns yours now rather than waiting for a save.
+            self._refresh_tab_icons()
 
     def _on_document_saved(self, key):
         source, path = self._editor_host.split_key(key)
         self._set_status(f"Saved {path}")
+        self._refresh_tab_icons()
         if source == "instance":
             self._files_panel.refresh()      # the save may have claimed ownership
 
@@ -2232,6 +2424,7 @@ class MainWindow(QMainWindow):
         self._reload_blueprint_tabs()
         self._blueprints_panel.refresh()
         self._files_panel.refresh()
+        self._refresh_tab_icons()      # the run may have claimed a file you have open
         # An open editor's lock was decided when it opened. If the run took a file the user
         # had open, the tab has to stop looking editable — the save is refused either way
         # (§6.1), but discovering that at Ctrl+S is a worse way to learn it.
@@ -2252,6 +2445,7 @@ class MainWindow(QMainWindow):
                  if not self._editor_host.is_locked(key)]
         if freed:
             message += "  The open tab is editable now."
+        self._refresh_tab_icons()
         self._set_status(message)
 
     def _job_problems(self, job):
@@ -2391,6 +2585,7 @@ class MainWindow(QMainWindow):
         if getattr(self, "_job_running", False):
             return                      # `processEvents` below lets the button be clicked again
         self._job_running = True
+        self._run_control.set_running(True)
         QApplication.setOverrideCursor(Qt.WaitCursor)
         self._bottom.log(f"=== running job '{job.name}' ===")
         try:
@@ -2404,13 +2599,16 @@ class MainWindow(QMainWindow):
         finally:
             QApplication.restoreOverrideCursor()
             self._job_running = False
+            self._run_control.set_running(False)
 
         summary = (f"[{job.name}] {result.status} — {len(result.step_results)} step(s) run"
                    + (f", {result.not_run} not reached" if result.not_run else ""))
         self._bottom.log(summary)
         self._bottom.set_status(summary)
         if result.status != "success":
-            self._bottom.expand(1)      # surface Job Results when something went wrong
+            # By key, not position: a bare index means a different tab the moment
+            # BOTTOM_TABS is reordered, and it silently means the wrong one.
+            self._bottom.show_panel("job_results")
 
         self._refresh_after_run()
 
@@ -2487,7 +2685,45 @@ class MainWindow(QMainWindow):
         self._reload_jobs()
 
     def _reload_jobs(self):
-        self._jobs_panel.set_jobs(self._jobs.all())
+        jobs = self._jobs.all()
+        self._jobs_panel.set_jobs(jobs)
+        control = getattr(self, "_run_control", None)
+        if control is not None:
+            # Same list, same readiness function as the panel. Two surfaces disagreeing
+            # about whether a job can run is worse than either being wrong alone.
+            control.set_jobs(jobs, readiness=self._job_problems)
+            self._remember_selected_job()
+
+    def _reload_automation(self):
+        self._reload_jobs()
+        self._actions_panel.refresh()
+
+    def _remember_automation_tab(self):
+        """Which half you were last on, per profile — authoring sessions and running
+        sessions are different moods, and being dropped back into the wrong one is a small
+        papercut that repeats."""
+        panel = getattr(self, "_automation_panel", None)
+        if panel is not None and self._profile is not None:
+            save_ui_state(self._profile.name, automation_tab=panel.current_key)
+
+    def _remember_selected_job(self):
+        """Persist which job is picked, so the header comes back where you left it.
+
+        Per profile, in UI state rather than settings — you never *set* this, you just pick
+        a job and that is the picking.
+        """
+        control = getattr(self, "_run_control", None)
+        if control is not None and self._profile is not None:
+            job_id = control.current_job_id()
+            if job_id is not None:
+                save_ui_state(self._profile.name, last_job=int(job_id))
+
+    def _run_selected_job(self):
+        """Ctrl+R. The whole point of the control: re-running without going anywhere."""
+        control = getattr(self, "_run_control", None)
+        job = control.current_job() if control is not None else None
+        if job is not None:
+            self._run_job(job)
 
     # --- dev seed ----------------------------------------------------------
 

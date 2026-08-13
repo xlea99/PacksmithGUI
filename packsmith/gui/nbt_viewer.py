@@ -37,7 +37,7 @@ from PySide6.QtWidgets import (
 )
 
 from packsmith.core import nbt
-from packsmith.gui.shell import style
+from packsmith.gui.shell import icons, style
 from packsmith.gui.shell.tree import PanelTree
 
 _ROLE_TAG = Qt.UserRole
@@ -267,6 +267,7 @@ class NbtViewerTab(QWidget):
         self._slots.append((container, key))
         item.setData(0, _ROLE_TAG, len(self._tags) - 1)
         item.setData(0, _ROLE_PATH, path)
+        self._set_type_icon(item, tag)
         item.setForeground(1, style.qt_colour(style.TEXT_FAINT))
         if children_of(tag):
             item.setData(0, _ROLE_LOADED, False)
@@ -278,6 +279,21 @@ class NbtViewerTab(QWidget):
         parent.addChild(item) if parent is not self._tree.invisibleRootItem() \
             else self._tree.addTopLevelItem(item)
         return item
+
+    def _set_type_icon(self, item, tag):
+        """Mark the row with its tag type.
+
+        Redundant with the Type column on purpose, and earning its place on a different
+        axis: an NBT tree is deep and you scan it *vertically*, so shape tells you "this
+        branch is structure, that one is leaves" without reading a word. A 337,000-node
+        `level.dat` is not a document you read — it is one you skim.
+
+        Containers are lit, leaves are muted, which is the same "what can I act on" language
+        the Files and JAR trees use: only a leaf is editable (§6.4 — structure editing is
+        deferred), so only a leaf invites a double-click.
+        """
+        colour = style.TEXT_MUTED if is_leaf(tag) else style.TEXT
+        item.setIcon(0, icons.tag_icon(type_name(tag), colour=colour))
 
     def _tag_of(self, item):
         """The real Python tag behind a row (see the note in __init__)."""
@@ -322,6 +338,7 @@ class NbtViewerTab(QWidget):
             self._slots.append((container, key))
             item.setData(0, _ROLE_TAG, len(self._tags) - 1)
             item.setData(0, _ROLE_PATH, path)
+            self._set_type_icon(item, tag)
             item.setForeground(1, style.qt_colour(style.TEXT_FAINT))
             # Editable here too: finding a value by filtering and then having to clear the
             # filter and hunt for it in the tree would make the filter useless for the

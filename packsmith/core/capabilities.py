@@ -216,7 +216,17 @@ def resolve(packdump, *, loaders=(), preferred=None, instance_root=None) -> Reso
     active = [loader for loader in loaders if loader.detect(packdump)]
     # The preferred loader goes first, so it wins every capability it offers and the
     # others land in `alternatives` — which is exactly the disambiguation §7.1 describes.
-    active.sort(key=lambda loader: (loader.name != preferred, loader.name))
+    #
+    # With nothing preferred, the **most capable** loader wins, ties broken by name. This
+    # replaces plain alphabetical ordering, which was arbitrary in a way that bit
+    # immediately: on a pack holding Paxi and Moonlight — a common pairing, since Moonlight
+    # is a general-purpose library packs acquire transitively — "Moonlight" sorted first and
+    # quietly took the overrides, despite doing datapacks only and no ordering. Preferring
+    # breadth means the default answer is the one that can satisfy the most actions, and it
+    # only ever applies until the user chooses (§8.1).
+    active.sort(key=lambda loader: (loader.name != preferred,
+                                    -len(loader.available_capabilities(instance_root)),
+                                    loader.name))
     for loader in active:
         table.providers[loader.name] = loader
         for capability in loader.available_capabilities(instance_root):

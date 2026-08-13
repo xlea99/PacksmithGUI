@@ -32,10 +32,20 @@ class Panel(QWidget):
         self._layout = QVBoxLayout(self)
         self._layout.setContentsMargins(0, 0, 0, 0)
         self._layout.setSpacing(0)
-        self._layout.addWidget(PanelHeader(title))
+        self._header = PanelHeader(title)
+        self._layout.addWidget(self._header)
 
     def body(self) -> QVBoxLayout:
         return self._layout
+
+    def hide_header(self):
+        """Drop the title strip, for a panel nested inside another one.
+
+        A panel usually owns the top of the sidebar and names itself there. Nested in a
+        tab, that name is already on the tab — two labels for one thing, stacked, is just
+        clutter reading as a bug.
+        """
+        self._header.hide()
 
 
 class StubPanel(Panel):

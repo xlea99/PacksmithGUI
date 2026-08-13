@@ -94,7 +94,7 @@ def test_honest_mode_is_still_the_default(panel):
 def test_smart_mode_shows_the_two_supercategories(panel):
     view, _, _ = panel
     view._mode.setCurrentIndex(1)
-    assert [c.text(0) for c in categories(view)] == ["📦  Datapacks", "🎨  Resource Packs"]
+    assert [c.text(0) for c in categories(view)] == ["Datapacks", "Resource Packs"]
 
 
 def test_packs_appear_under_their_category(panel):
@@ -225,3 +225,55 @@ def test_a_name_with_a_separator_is_refused(panel):
     answers["text"] = "sneaky/../../escape"
     view._new_pack("datapacks")
     assert not (files.root / "escape").exists()
+
+
+# --- a loader that does not do both kinds -------------------------------------------------
+#
+# Reported from real use: opening Smart Mode on deep_end threw
+# `CapabilityError: Moonlight does not load global resource packs` and left the panel
+# showing datapacks only. The panel asked for both roots unconditionally.
+
+def test_smart_mode_survives_a_datapacks_only_loader(user_db, tmp_path):
+    """Moonlight has no concept of resource packs — not disabled, absent — so asking it for
+    that root raises. Smart Mode must show the categories the loader HAS rather than
+    assuming every loader does both."""
+    from packsmith.core.files import FileStore
+    from packsmith.gui.shell.panels.files_panel import FilesPanel
+    from packsmith.integrations.moonlight import MoonlightProvider
+
+    root = tmp_path / "instance"
+    (root / "moonlight-global-datapacks" / "tweaks").mkdir(parents=True)
+    panel = FilesPanel(FileStore(user_db, root), loader=MoonlightProvider())
+    try:
+        panel._smart = True
+        panel.refresh()          # used to raise CapabilityError and take the panel down
+
+        labels = [panel._tree.topLevelItem(i).text(0)
+                  for i in range(panel._tree.topLevelItemCount())]
+        assert any("Datapacks" in label for label in labels)
+        assert not any("Resource Pack" in label for label in labels), \
+            "offered a category the loader cannot provide"
+    finally:
+        panel.deleteLater()
+
+
+def test_smart_mode_shows_both_kinds_for_a_loader_that_has_both(user_db, tmp_path):
+    """The carve-out must be about the loader, not a blanket removal of resource packs."""
+    from packsmith.core.files import FileStore
+    from packsmith.gui.shell.panels.files_panel import FilesPanel
+    from packsmith.integrations.paxi import PaxiProvider
+
+    root = tmp_path / "instance"
+    paxi = PaxiProvider()
+    paxi.create_pack(root, "tweaks")
+    paxi.create_pack(root, "skins", kind="resourcepacks")
+    panel = FilesPanel(FileStore(user_db, root), loader=paxi)
+    try:
+        panel._smart = True
+        panel.refresh()
+        labels = [panel._tree.topLevelItem(i).text(0)
+                  for i in range(panel._tree.topLevelItemCount())]
+        assert any("Datapacks" in label for label in labels)
+        assert any("Resource Pack" in label for label in labels)
+    finally:
+        panel.deleteLater()

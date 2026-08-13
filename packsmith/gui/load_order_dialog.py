@@ -20,7 +20,7 @@ from PySide6.QtWidgets import (
     QDialogButtonBox, QComboBox,
 )
 
-from packsmith.gui.shell import style
+from packsmith.gui.shell import icons, style
 
 KINDS = (("datapacks", "Datapacks"), ("resourcepacks", "Resource Packs"))
 
@@ -57,11 +57,13 @@ class LoadOrderDialog(QDialog):
 
         arrows = QVBoxLayout()
         arrows.addStretch()
-        self._up = QPushButton("▲")
+        self._up = QPushButton()
+        icons.mark(self._up, "up")
         self._up.setFixedWidth(34)
         self._up.clicked.connect(lambda: self._move(-1))
         arrows.addWidget(self._up)
-        self._down = QPushButton("▼")
+        self._down = QPushButton()
+        icons.mark(self._down, "down")
         self._down.setFixedWidth(34)
         self._down.clicked.connect(lambda: self._move(1))
         arrows.addWidget(self._down)

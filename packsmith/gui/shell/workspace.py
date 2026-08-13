@@ -5,9 +5,10 @@ which is what §4.2 means by "one Qt-owned tab bar." When nothing is open the wo
 shows a hint pointing at the sidebar, because the sidebar is how you open things.
 """
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtWidgets import QWidget, QVBoxLayout, QStackedWidget, QTabWidget, QLabel
+from PySide6.QtWidgets import (
+    QWidget, QVBoxLayout, QStackedWidget, QTabWidget, QLabel, QPushButton, QTabBar)
 
-from packsmith.gui.shell import style
+from packsmith.gui.shell import icons, style
 
 
 class Workspace(QWidget):
@@ -60,12 +61,47 @@ class Workspace(QWidget):
     def _sync(self):
         self._stack.setCurrentWidget(self._tabs if self._tabs.count() else self._empty)
 
-    def add_tab(self, widget, title, *, select=True) -> QWidget:
-        self._tabs.addTab(widget, title)
+    def add_tab(self, widget, title, *, icon=None, select=True) -> QWidget:
+        index = self._tabs.addTab(widget, title)
+        if icon is not None:
+            self._tabs.setTabIcon(index, icon)
+        self._install_close_button(index, widget)
         if select:
             self._tabs.setCurrentWidget(widget)
         self._sync()
         return widget
+
+    def _install_close_button(self, index, widget):
+        """Replace Qt's stock close button with a Phosphor ✕.
+
+        The default is drawn by the platform style — on Windows a small red-tinted square
+        that looks nothing like the rest of the chrome. Qt only lets a *stylesheet* replace
+        it with an image URL, which would mean shipping a PNG; a per-tab widget avoids that
+        and colours like everything else.
+
+        It closes by **widget**, never by the index captured here: tabs are movable, so an
+        index goes stale the moment one is dragged, and the stale one would close somebody
+        else's tab.
+        """
+        button = QPushButton()
+        icons.mark(button, "close", size=9)
+        button.setFixedSize(16, 16)
+        button.setCursor(Qt.PointingHandCursor)
+        button.setToolTip("Close")
+        button.setStyleSheet(f"""
+            QPushButton {{
+                background: transparent; color: {style.TEXT_FAINT};
+                border: none; border-radius: 8px; padding: 0;
+            }}
+            QPushButton:hover {{ background: {style.BG_CHROME}; color: {style.TEXT}; }}
+        """)
+        button.clicked.connect(lambda: self.close_widget(widget))
+        self._tabs.tabBar().setTabButton(index, QTabBar.RightSide, button)
+
+    def close_widget(self, widget):
+        index = self._tabs.indexOf(widget)
+        if index >= 0:
+            self._close_tab(index)
 
     def _on_current_changed(self, index):
         widget = self._tabs.widget(index)
@@ -94,6 +130,11 @@ class Workspace(QWidget):
             return False
         self._tabs.setCurrentIndex(idx)
         return True
+
+    def set_tab_icon(self, widget, icon):
+        idx = self._tabs.indexOf(widget)
+        if idx >= 0:
+            self._tabs.setTabIcon(idx, icon)
 
     def set_tab_title(self, widget, title):
         idx = self._tabs.indexOf(widget)

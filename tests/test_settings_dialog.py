@@ -299,3 +299,22 @@ def test_there_is_no_load_order_setting(detectable):
     text = " ".join(child.text() for child in dialog.findChildren(type(dialog._jar_status)))
     assert "load order" not in text.lower()
     assert not hasattr(dialog, "_load_order")
+
+
+def test_the_dialog_shows_the_loader_the_app_is_actually_using(undetectable):
+    """Reported from real use: on a Paxi + Moonlight pack with nothing chosen, the dialog
+    displayed "Paxi" while every override went to Moonlight — two different orderings, the
+    combo listing PACK_LOADERS order and the resolver sorting alphabetically.
+
+    A settings screen that disagrees with the running app is worse than no settings screen,
+    so the displayed default is whatever `resolve` actually picks.
+    """
+    from packsmith.core.capabilities import DATAPACKS_WRITE, resolve
+    from packsmith.integrations import PACK_LOADERS
+
+    dump = Dump("paxi", "moonlight")
+    dialog = dialog_with_loaders(undetectable, "paxi", "moonlight")
+    actual = resolve(dump, loaders=PACK_LOADERS,
+                     instance_root=undetectable.mc_path).provider_for(DATAPACKS_WRITE)
+
+    assert dialog._loader.currentData() == actual.name

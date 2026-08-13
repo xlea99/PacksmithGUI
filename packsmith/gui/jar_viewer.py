@@ -21,7 +21,8 @@ from PySide6.QtWidgets import (
 
 from packsmith.core.archives import ArchiveError, read_entries, summarise
 from packsmith.core.capabilities import override_kind
-from packsmith.gui.shell import style
+from packsmith.gui.editor.sources import is_overridable
+from packsmith.gui.shell import icons, style
 from packsmith.gui.shell.tree import PanelTree
 
 _ROLE_PATH = Qt.UserRole
@@ -153,15 +154,28 @@ class JarViewerTab(QWidget):
                 "" if entry.is_dir else human_size(entry.compressed),
             ])
             item.setData(0, _ROLE_PATH, entry.path)
+            # Colour says what you can DO with it, the same way it does in the Files panel
+            # (§6.2) — there it is ownership, here it is overridability (§6.5). Everything
+            # used to be muted alike, which said nothing: the one fact that matters in a
+            # jar is whether a file can be copied back out as an override, and a `.class`
+            # never can.
             if entry.is_dir:
+                item.setIcon(0, icons.file_icon(entry.name, True, colour=style.TEXT))
                 item.setForeground(0, style.qt_colour(style.TEXT))
             elif entry.is_nested_archive:
                 # Marked, not opened. Recursing into a jar-in-a-jar is its own step, and
                 # a marker is what makes that discoverable when it arrives.
+                item.setIcon(0, icons.file_icon(entry.name, colour=style.ACCENT_EDGE))
                 item.setForeground(0, style.qt_colour(style.ACCENT_EDGE))
                 item.setToolTip(0, f"{entry.path} — a nested archive")
+            elif is_overridable(entry.path):
+                item.setIcon(0, icons.file_icon(entry.name, colour=style.TEXT))
+                item.setForeground(0, style.qt_colour(style.TEXT))
+                item.setToolTip(0, f"{entry.path}\ncan be saved as an override")
             else:
+                item.setIcon(0, icons.file_icon(entry.name, colour=style.TEXT_FAINT))
                 item.setForeground(0, style.qt_colour(style.TEXT_MUTED))
+                item.setToolTip(0, f"{entry.path}\nno override target — §6.3")
             parent.addChild(item)
             if entry.is_dir:
                 nodes[key] = item

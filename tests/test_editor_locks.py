@@ -75,12 +75,21 @@ def test_the_files_panel_take_reaches_the_open_tab(host):
     assert host.is_locked("instance:cfg.json")
 
     said = []
-    window = type("W", (), {"_editor_host": host, "_set_status": lambda s, m: said.append(m)})()
+    recoloured = []
+    window = type("W", (), {
+        "_editor_host": host,
+        "_set_status": lambda s, m: said.append(m),
+        # Ownership moving is also what the tab icons are coloured by (§6.1), so the
+        # handler re-colours them; the stub has to model that or it is testing a
+        # `MainWindow` that no longer exists.
+        "_refresh_tab_icons": lambda s: recoloured.append(True),
+    })()
     files.claim("cfg.json", owner="user")
     MainWindow._file_ownership_changed(window, "You took ownership of cfg.json.")
 
     assert not host.is_locked("instance:cfg.json"), "the tab kept a lock that no longer existed"
     assert "editable now" in said[0], "and said nothing about it"
+    assert recoloured, "the tab icon still shows the previous owner"
 
 
 def test_a_locked_save_says_why_instead_of_vanishing(host):

@@ -18,7 +18,7 @@ from PySide6.QtWidgets import (
 from packsmith.core.bindings import (
     binding_id, binding_name, mapping_mismatches, record_names, step_problems)
 from packsmith.core.shapes import describe_shape
-from packsmith.gui.shell import style
+from packsmith.gui.shell import icons, style
 from packsmith.gui.shell.picker import PickerPopup, _token_match
 from packsmith.gui.shell.tree import PanelTree
 
@@ -544,7 +544,8 @@ class JobEditorTab(QWidget):
         self._default_policy.currentIndexChanged.connect(self._on_policy_changed)
         header.addWidget(self._default_policy)
         header.addStretch()
-        run = QPushButton("▶  Run job")
+        run = QPushButton()
+        icons.mark(run, "play", text="Run job")
         run.setStyleSheet(f"""
             QPushButton {{
                 background: #24402a; color: #8fd39a; border: 1px solid #4a8055;
@@ -576,9 +577,11 @@ class JobEditorTab(QWidget):
                             ("＋ Job step", self._add_job_step),
                             ("Edit…", self._edit_step),
                             ("Remove", self._remove_step),
-                            ("↑", lambda: self._move(-1)),
-                            ("↓", lambda: self._move(+1))):
+                            (icons.ui("up") or "↑", lambda: self._move(-1)),
+                            (icons.ui("down") or "↓", lambda: self._move(+1))):
             btn = QPushButton(label)
+            if label in (icons.ui("up"), icons.ui("down")) and icons.family():
+                btn.setFont(icons.icon_font(12))
             btn.setFixedHeight(24)
             btn.setStyleSheet(f"""
                 QPushButton {{
