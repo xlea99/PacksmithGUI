@@ -1,5 +1,5 @@
 from PySide6.QtWidgets import QStyledItemDelegate, QLineEdit, QStyle, QApplication
-from PySide6.QtCore import Qt, QModelIndex, QSortFilterProxyModel, QRegularExpression
+from PySide6.QtCore import Qt, QModelIndex, QRegularExpression
 from PySide6.QtGui import QPainter, QPalette, QColor, QRegularExpressionValidator
 
 from packsmith.gui.table.cells.ownership import paint_ownership_bar
@@ -13,20 +13,6 @@ class NumCellDelegate(QStyledItemDelegate):
     Invalid input → brief red flash, revert to previous value.
     Delete/Backspace clears to unset (handled by the view)."""
 
-    def _source_model(self, model):
-        if isinstance(model, QSortFilterProxyModel):
-            return model.sourceModel()
-        return model
-
-    def _source_col(self, model, index: QModelIndex) -> int:
-        if isinstance(model, QSortFilterProxyModel):
-            return model.mapToSource(index).column()
-        return index.column()
-
-    def _is_editing(self, model, index: QModelIndex) -> bool:
-        source = self._source_model(model)
-        return source.is_editing(self._source_col(model, index))
-
     def paint(self, painter: QPainter, option, index: QModelIndex):
         self.initStyleOption(option, index)
         style = QApplication.style()
@@ -34,10 +20,8 @@ class NumCellDelegate(QStyledItemDelegate):
         paint_ownership_bar(painter, option, index)
 
         value = index.data(Qt.DisplayRole) or ""
-        editing = self._is_editing(index.model(), index)
 
         painter.save()
-        painter.setOpacity(1.0 if editing else 0.5)
 
         text_rect = option.rect.adjusted(6, 0, -6, 0)
         if value:
@@ -50,9 +34,6 @@ class NumCellDelegate(QStyledItemDelegate):
         painter.restore()
 
     def createEditor(self, parent, option, index: QModelIndex):
-        if not self._is_editing(index.model(), index):
-            return None
-
         editor = QLineEdit(parent)
         editor.setAlignment(Qt.AlignRight)
         # Allow digits, commas, underscores, periods, optional leading minus

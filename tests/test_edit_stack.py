@@ -122,3 +122,111 @@ def test_a_batch_undo_restores_differing_values(store):
         edit(store, e, "tier", "late") for e in ("a", "b")]))
     stack.undo()
     assert [store.get_tag(REG, e, "tier") for e in ("a", "b")] == ["early", "mid"]
+
+
+# --- when the world moves under the stack -----------------------------------
+#
+# A stack outlives the shape of the data it describes. Undefine a tag, drop a value from
+# an enum, and an edit from ten minutes ago wants to restore a state the store will now
+# refuse. Every one of these was found by attacking the stack rather than by using it.
+
+from packsmith.gui.table.edit_commands import UndoBlocked
+
+
+def test_a_refused_undo_does_not_destroy_the_command(store):
+    """The nastiest of them. `undo()` popped the command, *then* applied it — so a refusal
+    left the edit in neither stack. Un-undoable and un-redoable, gone, with the exception
+    continuing on into Qt's shortcut handler.
+    """
+    stack = EditStack(store)
+    store.assign(REG, ENTRY, "tier", "original")
+    stack.execute(edit(store, ENTRY, "tier", "edited"))
+    store.undefine(REG, "tier")
+
+    with pytest.raises(UndoBlocked):
+        stack.undo()
+
+    assert stack.can_undo, "the edit was swallowed by its own failure"
+    assert not stack.can_redo, "a failed undo must not count as done"
+
+
+def test_a_refused_undo_can_be_retried_once_the_cause_is_fixed(store):
+    """Which is the point of keeping it: the refusal is a condition, not a verdict."""
+    stack = EditStack(store)
+    store.assign(REG, ENTRY, "tier", "original")
+    stack.execute(edit(store, ENTRY, "tier", "edited"))
+    store.undefine(REG, "tier")
+    with pytest.raises(UndoBlocked):
+        stack.undo()
+
+    store.define(REG, "tier", "string")           # the user puts the tag back
+    assert stack.undo()
+    assert store.get_tag(REG, ENTRY, "tier") == "original"
+
+
+def test_the_refusal_says_what_the_store_said(store):
+    """"Can't undo" alone is useless — the reason is what tells you it is fixable."""
+    stack = EditStack(store)
+    store.assign(REG, ENTRY, "tier", "original")
+    stack.execute(edit(store, ENTRY, "tier", "edited"))
+    store.undefine(REG, "tier")
+
+    with pytest.raises(UndoBlocked) as caught:
+        stack.undo()
+    assert "tier" in caught.value.reason
+
+
+def test_an_enum_value_dropped_from_its_definition_blocks_rather_than_crashes(tags):
+    """Editing a definition is allowed; the old value stops being writable. Undo must
+    refuse in a way the UI can report, not raise a bare ValueError at a shortcut."""
+    tags.define(REG, "phase", "enum", enum_values=["early", "late"])
+    tags.assign(REG, ENTRY, "phase", "early")
+    stack = EditStack(tags)
+    stack.execute(TagEditCommand(REG, ENTRY, "phase",
+                                 tags.assignment(REG, ENTRY, "phase"), "late"))
+
+    tags.undefine(REG, "phase")
+    tags.define(REG, "phase", "enum", enum_values=["late"])
+    with pytest.raises(UndoBlocked):
+        stack.undo()
+    assert stack.can_undo
+
+
+def test_a_batch_that_cannot_finish_reverts_nothing(tags):
+    """A batch is several writes. A refusal partway used to leave half the selection
+    reverted and half not — and nothing anywhere recording which half."""
+    tags.define(REG, "phase", "enum", enum_values=["early", "late"])
+    tags.assign(REG, "mod:a", "phase", "early")
+    tags.assign(REG, "mod:b", "phase", "late")
+    stack = EditStack(tags)
+    stack.execute(BatchEditCommand("bulk", [
+        TagEditCommand(REG, "mod:a", "phase", tags.assignment(REG, "mod:a", "phase"), "late"),
+        TagEditCommand(REG, "mod:b", "phase", tags.assignment(REG, "mod:b", "phase"), "late"),
+    ]))
+    assert [tags.get_tag(REG, e, "phase") for e in ("mod:a", "mod:b")] == ["late", "late"]
+
+    # 'early' is no longer writable, so restoring mod:a must fail — and mod:b must not be
+    # quietly restored on its own.
+    tags.undefine(REG, "phase")
+    tags.define(REG, "phase", "enum", enum_values=["late"])
+    tags.assign(REG, "mod:a", "phase", "late")
+    tags.assign(REG, "mod:b", "phase", "late")
+
+    with pytest.raises(UndoBlocked):
+        stack.undo()
+    assert [tags.get_tag(REG, e, "phase") for e in ("mod:a", "mod:b")] == ["late", "late"], \
+        "half the batch was reverted"
+
+
+def test_a_refused_redo_keeps_the_command_too(store):
+    """Same invariant, mirrored. Redo popped before applying as well."""
+    stack = EditStack(store)
+    store.assign(REG, ENTRY, "tier", "original")
+    stack.execute(edit(store, ENTRY, "tier", "edited"))
+    stack.undo()
+    assert stack.can_redo
+
+    store.undefine(REG, "tier")
+    with pytest.raises(UndoBlocked):
+        stack.redo()
+    assert stack.can_redo, "the redo was swallowed by its own failure"

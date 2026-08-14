@@ -1,5 +1,5 @@
 from PySide6.QtWidgets import QStyledItemDelegate, QComboBox, QStyle, QApplication
-from PySide6.QtCore import Qt, QModelIndex, QSortFilterProxyModel, QPointF, QRect, QEvent, QTimer
+from PySide6.QtCore import Qt, QModelIndex, QPointF, QRect, QEvent, QTimer
 from PySide6.QtGui import QPainter, QPalette, QColor, QPolygonF
 
 from packsmith.gui.table.cells.ownership import paint_ownership_bar
@@ -17,23 +17,8 @@ class EnumCellDelegate(QStyledItemDelegate):
 
     Delete/Backspace clears non-defaulted enums (handled by the view)."""
 
-    def _source_model(self, model):
-        if isinstance(model, QSortFilterProxyModel):
-            return model.sourceModel()
-        return model
-
-    def _source_col(self, model, index: QModelIndex) -> int:
-        if isinstance(model, QSortFilterProxyModel):
-            return model.mapToSource(index).column()
-        return index.column()
-
-    def _is_editing(self, model, index: QModelIndex) -> bool:
-        source = self._source_model(model)
-        return source.is_editing(self._source_col(model, index))
-
     def _get_definition(self, model, index: QModelIndex) -> dict | None:
-        source = self._source_model(model)
-        return source.tag_definition_for_column(self._source_col(model, index))
+        return model.tag_definition_for_column(index.column())
 
     def _arrow_rect(self, option) -> QRect:
         """The clickable arrow button area on the right side of the cell."""
@@ -47,10 +32,8 @@ class EnumCellDelegate(QStyledItemDelegate):
         paint_ownership_bar(painter, option, index)
 
         value = index.data(Qt.DisplayRole) or ""
-        editing = self._is_editing(index.model(), index)
 
         painter.save()
-        painter.setOpacity(1.0 if editing else 0.5)
 
         # Text
         text_rect = option.rect.adjusted(6, 0, -22, 0)
@@ -61,34 +44,32 @@ class EnumCellDelegate(QStyledItemDelegate):
             painter.setPen(QColor("#555555"))
             painter.drawText(text_rect, Qt.AlignLeft | Qt.AlignVCenter, "----")
 
-        # Arrow button
-        if editing:
-            arrow = self._arrow_rect(option)
-            inset = arrow.adjusted(1, 3, -2, -3)
+        # Arrow button — always drawn now that a column is not armed before it will
+        # accept anything. It doubles as the affordance: an enum cell looks like a
+        # dropdown because it is one.
+        arrow = self._arrow_rect(option)
+        inset = arrow.adjusted(1, 3, -2, -3)
 
-            # Border only, no fill
-            painter.setPen(QColor("#4a4a4a"))
-            painter.setBrush(Qt.NoBrush)
-            painter.drawRect(inset)
+        # Border only, no fill
+        painter.setPen(QColor("#4a4a4a"))
+        painter.setBrush(Qt.NoBrush)
+        painter.drawRect(inset)
 
-            # Triangle
-            cx = inset.center().x()
-            cy = inset.center().y()
-            painter.setPen(Qt.NoPen)
-            painter.setBrush(QColor("#aaaaaa"))
-            painter.setRenderHint(QPainter.Antialiasing)
-            painter.drawPolygon(QPolygonF([
-                QPointF(cx - 3, cy - 2),
-                QPointF(cx + 3, cy - 2),
-                QPointF(cx, cy + 2),
-            ]))
+        # Triangle
+        cx = inset.center().x()
+        cy = inset.center().y()
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor("#aaaaaa"))
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.drawPolygon(QPolygonF([
+            QPointF(cx - 3, cy - 2),
+            QPointF(cx + 3, cy - 2),
+            QPointF(cx, cy + 2),
+        ]))
 
         painter.restore()
 
     def editorEvent(self, event, model, option, index: QModelIndex) -> bool:
-        if not self._is_editing(model, index):
-            return False
-
         # Single click on the arrow button opens the editor via the standard path
         if event.type() == QEvent.MouseButtonRelease:
             if self._arrow_rect(option).contains(event.pos()):
@@ -100,9 +81,6 @@ class EnumCellDelegate(QStyledItemDelegate):
         return False
 
     def createEditor(self, parent, option, index: QModelIndex):
-        if not self._is_editing(index.model(), index):
-            return None
-
         defn = self._get_definition(index.model(), index)
         if not defn:
             return None

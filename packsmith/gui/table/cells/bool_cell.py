@@ -1,5 +1,5 @@
 from PySide6.QtWidgets import QStyledItemDelegate, QStyle, QStyleOptionButton, QApplication
-from PySide6.QtCore import Qt, QRect, QModelIndex, QEvent, QSortFilterProxyModel
+from PySide6.QtCore import Qt, QRect, QModelIndex, QEvent
 from PySide6.QtGui import QPainter
 
 from packsmith.gui.table.cells.ownership import paint_ownership_bar
@@ -8,13 +8,11 @@ from packsmith.gui.table.cells.ownership import paint_ownership_bar
 class BoolCellDelegate(QStyledItemDelegate):
     """Checkbox delegate for bool tag columns.
 
-    Click toggles between True and False (only when edit mode is on).
+    Click toggles between True and False.
     Delete/Backspace clears to unset (handled by the view, only for tags without defaults).
 
     Rendering is driven entirely by the model's data() — which already returns
-    default values for unset tags via get_tag(). No default-awareness needed here.
-
-    When edit mode is off, checkboxes render but don't respond to input."""
+    default values for unset tags via get_tag(). No default-awareness needed here."""
 
     def _get_value(self, index: QModelIndex):
         raw = index.data(Qt.DisplayRole)
@@ -23,20 +21,6 @@ class BoolCellDelegate(QStyledItemDelegate):
         if isinstance(raw, str):
             return raw.lower() == "true"
         return bool(raw)
-
-    def _source_model(self, model):
-        """Unwrap proxy to get the RegistryTableModel."""
-        if isinstance(model, QSortFilterProxyModel):
-            return model.sourceModel()
-        return model
-
-    def _is_editing(self, model, index: QModelIndex) -> bool:
-        source = self._source_model(model)
-        if isinstance(model, QSortFilterProxyModel):
-            col = model.mapToSource(index).column()
-        else:
-            col = index.column()
-        return source.is_editing(col)
 
     def _checkbox_rect(self, option) -> QRect:
         """Center a checkbox-sized rect within the cell."""
@@ -54,28 +38,30 @@ class BoolCellDelegate(QStyledItemDelegate):
         paint_ownership_bar(painter, option, index)
 
         value = self._get_value(index)
-        editing = self._is_editing(index.model(), index)
 
         checkbox_opt = QStyleOptionButton()
         checkbox_opt.rect = self._checkbox_rect(option)
 
+        # An unset cell stays faint — that is the tri-state showing "nobody has said",
+        # which is a fact about the cell rather than about whether a column was armed.
         if value is None:
             checkbox_opt.state = QStyle.State_Enabled | QStyle.State_NoChange
-            painter.setOpacity(0.2 if editing else 0.1)
+            painter.setOpacity(0.2)
         elif value:
             checkbox_opt.state = QStyle.State_Enabled | QStyle.State_On
-            painter.setOpacity(1.0 if editing else 0.5)
+            painter.setOpacity(1.0)
         else:
             checkbox_opt.state = QStyle.State_Enabled | QStyle.State_Off
-            painter.setOpacity(1.0 if editing else 0.5)
+            painter.setOpacity(1.0)
 
         style.drawControl(QStyle.CE_CheckBox, checkbox_opt, painter)
         painter.setOpacity(1.0)
 
     def editorEvent(self, event, model, option, index: QModelIndex) -> bool:
-        if not self._is_editing(model, index):
-            return False
-
+        # NOTE: with the per-column arming mode gone, a single click on the checkbox now
+        # toggles the cell directly. That is the one place the mode was genuinely earning
+        # something — the other three types only open on double-click or F2 — so this is
+        # deliberately left as-is pending a decision, not overlooked.
         if event.type() == QEvent.MouseButtonRelease:
             if self._checkbox_rect(option).contains(event.pos()):
                 return self._toggle(model, index)

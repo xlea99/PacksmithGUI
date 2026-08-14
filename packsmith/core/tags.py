@@ -378,6 +378,27 @@ class TagStore:
         return {row["entry_id"]: self._cast_tag_value(registry_type, tag_name, row["value"])
                 for row in rows}
 
+    def assignments(self, registry_type: str, tag_name: str) -> dict:
+        """Every stored assignment for one tag, `{entry_id: Assignment}` — value *and*
+        owner, in one query.
+
+        `column` is the display half; this is the half anything that has to **restore** a
+        cell needs, because an undo that puts the value back without its owner launders an
+        action's decision into the user's. Same reason `assignment` exists beside `get_tag`,
+        one scale up: a bulk edit over a selection was asking per cell, which is a query per
+        cell for an operation whose whole point is doing many at once.
+        """
+        definition = self.definition(registry_type, tag_name)
+        if definition is None:
+            return {}
+        rows = self._db.fetch_all(
+            "SELECT entry_id, value, owner_kind, owner_action_ref FROM tag_assignments "
+            "WHERE tag_id = ?", (definition["id"],))
+        return {row["entry_id"]: Assignment(
+            value=self._cast_tag_value(registry_type, tag_name, row["value"]),
+            owner=row["owner_kind"], action_ref=row["owner_action_ref"])
+            for row in rows}
+
     # Gets ALL tag assignments for a single entry.
     def get_all_tags(self, registry_type: str, entry_id: str) -> dict:
         rows = self._db.fetch_all(

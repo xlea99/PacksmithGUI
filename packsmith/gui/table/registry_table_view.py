@@ -1,5 +1,5 @@
 from PySide6.QtWidgets import QTableView, QApplication, QMenu
-from PySide6.QtCore import Qt, QSortFilterProxyModel, QMimeData
+from PySide6.QtCore import Qt, QMimeData
 
 from packsmith.gui.table.edit_commands import TagEditCommand, BatchEditCommand
 
@@ -11,7 +11,8 @@ class RegistryTableView(QTableView):
     Delete/Backspace: Clear selected tag cells to unset.
     Ctrl+C: Copy selected cells as TSV (plain text) + HTML table (rich paste).
     Right-click: the same operations, for people who don't know the keys yet.
-    All keyboard editing respects per-column edit mode."""
+
+    Tag cells are editable because they are tag cells; L1 columns never are."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -25,22 +26,85 @@ class RegistryTableView(QTableView):
         index = self.indexAt(pos)
         if not index.isValid():
             return
-        source = self._source_model()
-        editable = [i for i in self.selectionModel().selectedIndexes()
-                    if source.is_editing(self._source_col(i))
-                    and source.tag_type_for_column(self._source_col(i)) is not None]
+        self.menu_for(index).exec(self.viewport().mapToGlobal(pos))
+
+    def menu_for(self, index) -> QMenu:
+        """The context menu for the cell that was clicked.
+
+        **The menu follows the column you clicked, not the selection.** An L1 column — id,
+        mod, an attribute — is read-only for the life of the app (§3.1), so "Clear
+        assignment" is not a thing you could ever be offered there. Showing it greyed out
+        is not neutral either: a disabled destructive-sounding verb invites you to work out
+        what you did wrong, when the answer is that the column simply has no such concept.
+
+        So those get the short menu. Copy still earns its place — pulling a column of ids
+        out to somewhere else is most of what anybody does with them.
+
+        Split from the handler so it can be read without an `exec` blocking on a native
+        popup; the tab bar's ✕ menu is built the same way, for the same reason.
+        """
         menu = QMenu(self)
-        clear = menu.addAction(f"Clear {len(editable)} assignment(s)"
-                               if len(editable) != 1 else "Clear assignment")
-        clear.setEnabled(bool(editable))
-        clear.triggered.connect(self._bulk_clear)
+        if self.model().tag_type_for_column(index.column()) is not None:
+            count, defaulted = self._clearable()
+            # Offered only when there is something to clear. A pristine cell has no
+            # assignment to remove — `_bulk_clear` already skips it — so a greyed-out
+            # "Clear" was the menu describing a state the code had already handled.
+            if count:
+                clear = menu.addAction(self._clear_label(count, defaulted))
+                clear.triggered.connect(self._bulk_clear)
         copy = menu.addAction("Copy")
         copy.triggered.connect(self._copy_selection)
-        if not editable:
-            menu.addSeparator()
-            hint = menu.addAction("Turn on editing for this column to change values")
-            hint.setEnabled(False)
-        menu.exec(self.viewport().mapToGlobal(pos))
+        return menu
+
+    @staticmethod
+    def _clear_label(count: int, defaulted: bool) -> str:
+        """What clearing looks like from the user's side.
+
+        On a tag with a **default**, removing the assignment doesn't empty the cell — it
+        goes back to showing the default, so "Clear" describes a blank that never appears.
+
+        Deliberately *"Reset to default"* rather than *"Set to default"*: setting is what
+        the user does by typing the default value in, which writes a row they own and is a
+        genuinely different state from having never decided (§3.2.1 — "the default is NOT
+        written to the database"). "Reset" is the form-field sense, undoing a decision
+        rather than making one, which is exactly what this does.
+        """
+        if defaulted:
+            return "Reset to default" if count == 1 else f"Reset {count} cells to default"
+        return "Clear assignment" if count == 1 else f"Clear {count} assignments"
+
+    def _clearable(self):
+        """(how many selected cells actually hold an assignment, do they all have defaults).
+
+        Existence, not value: a pristine cell on a defaulted tag reads back *as* the
+        default, so asking the value can never tell the two apart.
+
+        Counted a column at a time rather than a cell at a time — one query per tag
+        involved instead of one per selected cell, which matters because "select the whole
+        column and right-click" is a completely ordinary thing to do.
+        """
+        source = self.model()
+        by_tag = {}
+        for idx in self.selectionModel().selectedIndexes():
+            tag_name = source.column_tag_name(idx.column())
+            entry_id = source.entry_at_row(idx.row())
+            if tag_name is None or entry_id is None:
+                continue
+            by_tag.setdefault(tag_name, set()).add(entry_id)
+
+        count, tags_hit = 0, []
+        for tag_name, entries in by_tag.items():
+            assigned = source._tag_store.column(source._registry_type, tag_name)
+            hits = entries & set(assigned)
+            if hits:
+                count += len(hits)
+                tags_hit.append(tag_name)
+
+        defaulted = bool(tags_hit) and all(
+            (source._tag_store.definition(source._registry_type, name) or {})
+            .get("default_value") is not None
+            for name in tags_hit)
+        return count, defaulted
 
     def keyPressEvent(self, event):
         key = event.key()
@@ -74,23 +138,16 @@ class RegistryTableView(QTableView):
 
         super().keyPressEvent(event)
 
-    def _source_model(self):
-        model = self.model()
-        if isinstance(model, QSortFilterProxyModel):
-            return model.sourceModel()
-        return model
+    def _priors_for(self, source, tag_names):
+        """`{tag_name: {entry_id: Assignment}}`, one query per tag rather than per cell.
 
-    def _source_col(self, proxy_index):
-        model = self.model()
-        if isinstance(model, QSortFilterProxyModel):
-            return model.mapToSource(proxy_index).column()
-        return proxy_index.column()
-
-    def _source_row(self, proxy_index):
-        model = self.model()
-        if isinstance(model, QSortFilterProxyModel):
-            return model.mapToSource(proxy_index).row()
-        return proxy_index.row()
+        Every bulk operation needs each cell's prior state to build an undoable command,
+        and each was asking the store cell by cell — a query per cell for an operation
+        whose entire purpose is doing many at once. Selecting a whole column and pressing
+        Delete is an ordinary thing to do, and that was 18,638 queries on a real pack.
+        """
+        return {name: source._tag_store.assignments(source._registry_type, name)
+                for name in tag_names}
 
     def _copy_selection(self):
         """Copy selected cells to clipboard as TSV + HTML table."""
@@ -140,18 +197,19 @@ class RegistryTableView(QTableView):
         if not text or "\t" in text or "\n" in text:
             return False  # multi-cell paste, not supported yet
 
-        source = self._source_model()
+        source = self.model()
         indexes = self.selectionModel().selectedIndexes()
         if not indexes:
             return False
 
+        priors = self._priors_for(source, {
+            source.column_tag_name(i.column()) for i in indexes
+            if source.column_tag_name(i.column()) is not None})
+
         edits = []
         for idx in indexes:
-            src_col = self._source_col(idx)
-            src_row = self._source_row(idx)
-
-            if not source.is_editing(src_col):
-                continue
+            src_col = idx.column()
+            src_row = idx.row()
 
             tag_type = source.tag_type_for_column(src_col)
             if tag_type is None:
@@ -166,7 +224,7 @@ class RegistryTableView(QTableView):
             tag_name = source.column_tag_name(src_col)
             if entry_id is None or tag_name is None:
                 continue
-            prior = source._tag_store.assignment(source._registry_type, entry_id, tag_name)
+            prior = priors[tag_name].get(entry_id)
 
             if prior is not None and prior.value == converted:
                 continue
@@ -222,14 +280,13 @@ class RegistryTableView(QTableView):
 
     def _bulk_toggle_bools(self) -> bool:
         """Space: set all selected bool cells to True, unless all are already True."""
-        source = self._source_model()
+        source = self.model()
         indexes = self.selectionModel().selectedIndexes()
 
-        # Filter to only bool columns that are in edit mode
         bool_indexes = []
         for idx in indexes:
-            src_col = self._source_col(idx)
-            if source.tag_type_for_column(src_col) == "bool" and source.is_editing(src_col):
+            src_col = idx.column()
+            if source.tag_type_for_column(src_col) == "bool":
                 bool_indexes.append(idx)
 
         if not bool_indexes:
@@ -240,16 +297,19 @@ class RegistryTableView(QTableView):
         all_true = all(v is True for v in values)
         new_value = False if all_true else True
 
-        # Build batch command
+        priors = self._priors_for(source, {
+            source.column_tag_name(i.column()) for i in bool_indexes
+            if source.column_tag_name(i.column()) is not None})
+
         edits = []
         for idx in bool_indexes:
-            src_row = self._source_row(idx)
-            src_col = self._source_col(idx)
+            src_row = idx.row()
+            src_col = idx.column()
             entry_id = source.entry_at_row(src_row)
             tag_name = source.column_tag_name(src_col)
             if entry_id is None or tag_name is None:
                 continue
-            prior = source._tag_store.assignment(source._registry_type, entry_id, tag_name)
+            prior = priors[tag_name].get(entry_id)
 
             if prior is not None and prior.value == new_value:
                 continue
@@ -274,18 +334,20 @@ class RegistryTableView(QTableView):
 
     def _bulk_clear(self) -> bool:
         """Delete/Backspace: clear all selected tag cells to unset."""
-        source = self._source_model()
+        source = self.model()
         indexes = self.selectionModel().selectedIndexes()
+
+        priors = self._priors_for(source, {
+            source.column_tag_name(i.column()) for i in indexes
+            if source.column_tag_name(i.column()) is not None})
 
         edits = []
         for idx in indexes:
-            src_col = self._source_col(idx)
-            if not source.is_editing(src_col):
-                continue
+            src_col = idx.column()
             if source.tag_type_for_column(src_col) is None:
                 continue  # fixed column
 
-            src_row = self._source_row(idx)
+            src_row = idx.row()
             entry_id = source.entry_at_row(src_row)
             tag_name = source.column_tag_name(src_col)
             if entry_id is None or tag_name is None:
@@ -293,7 +355,7 @@ class RegistryTableView(QTableView):
             # Existence, not value: a pristine cell on a defaulted tag reads back as the
             # default, so `is None` never fired and clearing it pushed a no-op edit whose
             # undo materialised the very assignment the clear was meant to avoid.
-            prior = source._tag_store.assignment(source._registry_type, entry_id, tag_name)
+            prior = priors[tag_name].get(entry_id)
 
             if prior is None:
                 continue

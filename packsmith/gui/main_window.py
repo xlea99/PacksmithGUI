@@ -37,6 +37,7 @@ from packsmith.core.packdump import (
     import_packdump, list_snapshots, previous_snapshot, revert_to_snapshot,
     snapshot_timeline)
 from packsmith.common.logging import log
+from packsmith.gui.table.edit_commands import UndoBlocked
 from packsmith.gui.profile_editor import (
     NewProfileDialog, OpenProfileDialog, confirm_force_import,
 )
@@ -1512,27 +1513,6 @@ class MainWindow(QMainWindow):
         gear.clicked.connect(lambda _=False, t=tab: self._edit_view_query(t))
         control_row.addWidget(gear)
 
-        tag_cols = [c for c in range(model.columnCount()) if model.is_tag_column(c)]
-        if tag_cols:
-            control_row.addSpacing(8)
-            control_row.addWidget(QLabel("Edit:"))
-            for col in tag_cols:
-                btn = QPushButton(model.column_tag_name(col))
-                btn.setCheckable(True)
-                btn.setFixedHeight(24)
-                btn.setStyleSheet(f"""
-                    QPushButton {{
-                        background-color: {style.BG_CHROME}; color: {style.TEXT_MUTED};
-                        border: 1px solid {style.BORDER}; padding: 2px 10px; font-size: 12px;
-                    }}
-                    QPushButton:checked {{
-                        background-color: {style.ACCENT}; color: {style.TEXT};
-                        border: 1px solid {style.ACCENT_EDGE};
-                    }}
-                """)
-                btn.toggled.connect(
-                    lambda checked, m=model, t=table, c=col: self._toggle_edit_mode(m, t, c, checked))
-                control_row.addWidget(btn)
         control_row.addStretch()
         layout.addLayout(control_row)
 
@@ -2272,10 +2252,6 @@ class MainWindow(QMainWindow):
             if tab is widget:
                 del self._open_tabs[key]
 
-    def _toggle_edit_mode(self, model, table, col, enabled):
-        model.set_editing(col, enabled)
-        table.viewport().update()
-
     def _edit_view_query(self, tab):
         """Edit the query behind a tab. If the tab renders a saved View, the change is
         persisted — editing the query IS editing the View."""
@@ -2553,14 +2529,28 @@ class MainWindow(QMainWindow):
         return self._tab_models.get(self._workspace.current_widget())
 
     def _undo(self):
-        model = self._active_model()
-        if model:
-            model.undo()
+        self._move_history("undo")
 
     def _redo(self):
+        self._move_history("redo")
+
+    def _move_history(self, direction: str):
+        """Ctrl+Z / Ctrl+Y, with the refusal reported rather than thrown.
+
+        An old edit can become unrestorable — the tag it names gets undefined, or an enum
+        value it holds is dropped from the definition. That used to raise straight out of
+        the shortcut into Qt, which is a traceback on the console and nothing at all for
+        the user. The stack survives a refusal, so saying why is enough: fix the cause and
+        the edit is still there to undo.
+        """
         model = self._active_model()
-        if model:
-            model.redo()
+        if model is None:
+            return
+        try:
+            getattr(model, direction)()
+        except UndoBlocked as blocked:
+            self._set_status(f"Can't {direction}: {blocked.reason}")
+            log.warning("%s refused: %s", direction, blocked.reason)
 
     # --- actions -----------------------------------------------------------
 

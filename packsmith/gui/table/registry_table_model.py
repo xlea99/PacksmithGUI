@@ -40,7 +40,6 @@ class RegistryTableModel(QAbstractTableModel):
         self._confirm_takeover = confirm_takeover
         self._registry_type = query.scope.type
         self._edit_stack = EditStack(tag_store)
-        self._editing_columns: set[int] = set()
         self._result = None
         self._evaluate()
 
@@ -263,21 +262,22 @@ class RegistryTableModel(QAbstractTableModel):
                 and row.values.get(self._column_name(col)) is None)
 
     # --- editing -----------------------------------------------------------
-
-    def is_editing(self, col: int) -> bool:
-        return col in self._editing_columns
-
-    def set_editing(self, col: int, enabled: bool):
-        if enabled:
-            self._editing_columns.add(col)
-        else:
-            self._editing_columns.discard(col)
+    #
+    # A tag cell is editable when it is a tag cell on a row that names an entry. There used
+    # to be a third condition: a per-column "Edit:" toggle above the table that armed a
+    # column before its cells would accept anything.
+    #
+    # That arming mode predated both systems that now do the job properly — §3.2.1's
+    # ownership and conflict policy for the collision that matters, and the undo stack for
+    # the misclick that doesn't. It also taxed all four column types to guard a risk that
+    # only existed in one: string, number and enum cells open on double-click or F2 anyway,
+    # so the mode was protecting them from a gesture they never accepted.
 
     def flags(self, index):
         base = Qt.ItemIsEnabled | Qt.ItemIsSelectable
         col = index.column()
         row = self._result.rows[index.row()]
-        if col in self._editing_columns and self.is_tag_column(col) and row.entry_id is not None:
+        if self.is_tag_column(col) and row.entry_id is not None:
             base |= Qt.ItemIsEditable
         return base
 
@@ -285,7 +285,7 @@ class RegistryTableModel(QAbstractTableModel):
         if role != Qt.EditRole:
             return False
         col = index.column()
-        if col not in self._editing_columns or not self.is_tag_column(col):
+        if not self.is_tag_column(col):
             return False
         row = self._result.rows[index.row()]
         if row.entry_id is None:   # computed/distinct row — nothing to write back to
@@ -344,16 +344,28 @@ class RegistryTableModel(QAbstractTableModel):
             )
 
     def _resync_values(self):
-        for row in self._result.rows:
-            if row.entry_id is None:
+        """Re-read every tag cell from the store, a **column at a time**.
+
+        Rows were the outer loop and `get_tag` the inner one — a query per cell, so a
+        single Delete on one cell re-read the entire table one row at a time: measured at
+        800ms for two tag columns over 18,638 entries, and it runs on every bulk edit, undo
+        and redo. Columns outside means one query per tag instead, and the default is
+        applied here because the map holds assigned cells only.
+        """
+        for col, field in enumerate(self._select):
+            if not isinstance(field, Tag):
                 continue
-            for col, field in enumerate(self._select):
-                if isinstance(field, Tag):
-                    name = self._column_name(col)
-                    row.values[name] = self._tag_store.get_tag(
-                        self._registry_type, row.entry_id, field.name)
+            name = self._column_name(col)
+            values = self._tag_store.column(self._registry_type, field.name)
+            default = self._tag_store.default_for(self._registry_type, field.name)
+            for row in self._result.rows:
+                if row.entry_id is not None:
+                    row.values[name] = values.get(row.entry_id, default)
 
     def undo(self):
+        """Undo one edit. Raises `UndoBlocked` when the store refuses, with the stack and
+        the store both untouched — so the caller can say why and the edit stays undoable
+        once the cause is fixed."""
         if self._edit_stack.can_undo:
             self._edit_stack.undo()
             self.emit_all_data_changed()

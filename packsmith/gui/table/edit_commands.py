@@ -91,8 +91,34 @@ class BatchEditCommand:
             tag_store.unassign(reg, ids, tag)
 
 
+class UndoBlocked(Exception):
+    """An undo (or redo) could not be applied, and the stack was left untouched.
+
+    The world moves under a stack: a tag gets undefined, an enum value is dropped from a
+    definition, and suddenly the state an old edit wants to restore is one the store will
+    refuse. That is not a bug to swallow — it is a real refusal with a real reason, and the
+    user can often fix the cause and try again. Carries `reason` for saying so out loud.
+    """
+
+    def __init__(self, reason, command):
+        super().__init__(reason)
+        self.reason = reason
+        self.command = command
+
+
 class EditStack:
-    """Undo/redo stack for tag edits."""
+    """Undo/redo stack for tag edits.
+
+    Two invariants, both of which cost real data before they were invariants:
+
+    * **A command is never dropped by a failed move.** The stack is mutated only after the
+      store accepts the change. Popping first meant a refusal deleted the command from the
+      undo stack without ever landing it in redo — the edit became both un-undoable and
+      un-redoable, and the exception went on to escape into Qt's shortcut handler.
+    * **A move is all-or-nothing.** A batch is several writes; a refusal partway through
+      used to leave half the selection reverted and half not, with no record of which. One
+      transaction makes "it didn't work" mean the store is exactly as it was.
+    """
 
     def __init__(self, tag_store):
         self._tag_store = tag_store
@@ -100,25 +126,39 @@ class EditStack:
         self._redo_stack: list[TagEditCommand | BatchEditCommand] = []
 
     def execute(self, command: TagEditCommand | BatchEditCommand):
-        command.apply(self._tag_store)
+        self._attempt(command.apply, command)
         self._undo_stack.append(command)
         self._redo_stack.clear()
 
     def undo(self) -> bool:
         if not self._undo_stack:
             return False
-        command = self._undo_stack.pop()
-        command.undo(self._tag_store)
+        command = self._undo_stack[-1]
+        self._attempt(command.undo, command)
+        self._undo_stack.pop()
         self._redo_stack.append(command)
         return True
 
     def redo(self) -> bool:
         if not self._redo_stack:
             return False
-        command = self._redo_stack.pop()
-        command.apply(self._tag_store)
+        command = self._redo_stack[-1]
+        self._attempt(command.apply, command)
+        self._redo_stack.pop()
         self._undo_stack.append(command)
         return True
+
+    def _attempt(self, move, command):
+        """Run one move inside a transaction, or leave the store and the stack alone."""
+        try:
+            with self._tag_store._db.transaction():
+                move(self._tag_store)
+        except UndoBlocked:
+            raise
+        except (ValueError, KeyError) as e:
+            # What the tag store raises when the world no longer permits the write: the
+            # tag was undefined, or the value is no longer one the definition allows.
+            raise UndoBlocked(str(e), command) from e
 
     @property
     def can_undo(self) -> bool:
