@@ -39,7 +39,6 @@ class RegistryTableModel(QAbstractTableModel):
         # None = no confirmation (headless use).
         self._confirm_takeover = confirm_takeover
         self._registry_type = query.scope.type
-        self._select = list(query.select)
         self._edit_stack = EditStack(tag_store)
         self._editing_columns: set[int] = set()
         self._result = None
@@ -81,6 +80,18 @@ class RegistryTableModel(QAbstractTableModel):
 
     # --- column helpers ----------------------------------------------------
 
+    @property
+    def _select(self) -> list:
+        """The fields behind the columns, taken from the **evaluated result**.
+
+        Not from `query.select`: a wildcard like `AllAttributes` expands during evaluation,
+        so the query says two fields while the table has three columns, and every
+        column-kind lookup indexes off the end of the list. Reading it from the result also
+        keeps it right after `reevaluate()` — adopting a dump that carries a new attribute
+        changes the column count, and a list captured in `__init__` would not have moved.
+        """
+        return self._result.select
+
     def _column_name(self, col: int) -> str:
         return self._result.columns[col].name
 
@@ -109,6 +120,86 @@ class RegistryTableModel(QAbstractTableModel):
         if 0 <= row < len(self._result.rows):
             return self._result.rows[row].entry_id
         return None
+
+    # --- sorting -----------------------------------------------------------
+    #
+    # Done here, with a key, rather than in a QSortFilterProxyModel with `lessThan`.
+    # Measured on a real pack's 18,638 items: the proxy called `lessThan` 201,292 times
+    # and `data()` 402,584 times to sort one column, taking **2.2 seconds** — and the view
+    # sorted twice on open (setSortingEnabled sorts, then sortByColumn sorts again), so
+    # every big view cost 4.5s before it appeared. A key function computes one value per
+    # row and lets C do the comparing: **3-8ms** for the same column.
+    #
+    # Pairwise comparison in Python is the whole problem. No amount of making `lessThan`
+    # cheaper fixes an O(n log n) count of Python calls; the count itself has to go.
+
+    def sort(self, column: int, order=Qt.AscendingOrder):
+        if not self._result.rows or not (0 <= column < self.columnCount()):
+            return
+        key = self._sort_key_for(column)
+
+        # Empty cells sink to the bottom in BOTH directions, so they are partitioned out
+        # rather than folded into the key — `reverse=True` would float them to the top,
+        # and "the blanks are wherever the arrow points" is not a useful sort.
+        blank, filled = [], []
+        for row in self._result.rows:
+            (blank if self._is_blank(row, column) else filled).append(row)
+        filled.sort(key=key, reverse=(order == Qt.DescendingOrder))
+
+        self.beginResetModel()
+        self._result.rows = filled + blank
+        self.endResetModel()
+
+    def _sorted_value(self, row, col: int):
+        """What a cell sorts by: its value, with the same id fallback the cell displays.
+
+        Reading the displayed value matters — an unlocalized entry renders its raw id
+        (§3.1), and sorting the underlying None instead would drop every one of them to
+        the bottom of a column where they visibly hold an id.
+        """
+        value = row.values.get(self._column_name(col))
+        if value is None and self._is_localization_fallback(row, col):
+            return row.entry_id
+        return value
+
+    def _is_blank(self, row, col: int) -> bool:
+        value = self._sorted_value(row, col)
+        return value is None or value == ""
+
+    def _sort_key_for(self, col: int):
+        """A key function for one column's type. Every branch returns the SAME shape of
+        tuple, so a column holding an odd value alongside its normal ones sorts oddly
+        rather than raising mid-sort."""
+        col_type = self.tag_type_for_column(col)
+
+        if col_type == "number":
+            def key(row):
+                try:
+                    return (0, float(self._sorted_value(row, col)), "")
+                except (TypeError, ValueError):
+                    return (1, 0.0, str(self._sorted_value(row, col)).lower())
+            return key
+
+        if col_type == "bool":
+            # False before True, which is the useful direction: "not yet decided" first.
+            return lambda row: (0, float(bool(self._sorted_value(row, col))), "")
+
+        if col_type == "enum":
+            # Declaration order is semantic — `tier` means early < mid < late < end, which
+            # alphabetical mangles into early/end/late/mid. Values outside the definition
+            # (an orphaned assignment) sort after the known ones rather than crashing.
+            defn = self.tag_definition_for_column(col)
+            values = defn.get("values", []) if defn else []
+            order = {v: i for i, v in enumerate(values)}
+
+            def key(row):
+                value = self._sorted_value(row, col)
+                if value in order:
+                    return (0, float(order[value]), "")
+                return (1, 0.0, str(value).lower())
+            return key
+
+        return lambda row: (0, 0.0, str(self._sorted_value(row, col)).lower())
 
     # --- Qt model interface ------------------------------------------------
 

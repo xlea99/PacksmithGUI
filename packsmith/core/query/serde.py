@@ -11,8 +11,8 @@ import dataclasses
 from packsmith.core.query import ast as _ast
 from packsmith.core.query.ast import (
     Query, Registry, Blueprint, Tag, Attribute, Slot,
-    Cmp, Has, And, Or, Not, Id, Mod, AllSlots, _Id, _Mod, _AllSlots, QueryError,
-    Count,
+    Cmp, Has, And, Or, Not, Id, Mod, AllSlots, AllAttributes, _Id, _Mod, _AllSlots,
+    _AllAttributes, QueryError, Count,
 )
 
 # Every dataclass in the AST module, discovered rather than listed.
@@ -30,7 +30,8 @@ _NODE_TYPES = {
 # Field-less singletons decode back to the *same object*, so `is` comparisons in the
 # evaluator keep working. (Generic construction would also compare equal — a frozen
 # dataclass with no fields equals any other instance — but identity is cheap to preserve.)
-_SINGLETONS = {"Id": Id, "Mod": Mod, "AllSlots": AllSlots, "_Count": Count}
+_SINGLETONS = {"Id": Id, "Mod": Mod, "AllSlots": AllSlots,
+               "AllAttributes": AllAttributes, "_Count": Count}
 
 
 def to_dict(node):
@@ -52,6 +53,8 @@ def _enc(v):
         return {"node": "Mod"}
     if isinstance(v, _AllSlots):
         return {"node": "AllSlots"}
+    if isinstance(v, _AllAttributes):
+        return {"node": "AllAttributes"}
     if isinstance(v, (list, tuple)):
         return [_enc(x) for x in v]
     if dataclasses.is_dataclass(v) and not isinstance(v, type):

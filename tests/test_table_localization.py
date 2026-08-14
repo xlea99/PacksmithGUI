@@ -86,3 +86,67 @@ def test_the_fallback_sorts_with_the_ids_rather_than_sinking_as_blank(model):
     values = [model.data(model.index(r, 1), Qt.DisplayRole)
               for r in range(model.rowCount())]
     assert "" not in values
+
+
+# --- wildcard columns (design 3.2.4's AllAttributes) -----------------------------------
+#
+# The model used to snapshot `query.select` in __init__. A wildcard expands during
+# EVALUATION, so the query said two fields while the table had three columns, and every
+# column-kind lookup ran off the end of the list — `IndexError` the moment the Registry
+# panel opened anything. The engine tests all passed: the mismatch only exists in the
+# model, which is exactly where nothing was looking.
+
+
+class WildcardDump(Dump):
+    def attribute(self, registry_type, entry_id, name):
+        if name == "localization_key" and entry_id == "mod:named":
+            return "fluid.mod.named"
+        return super().attribute(registry_type, entry_id, name)
+
+    def attributes_for(self, registry_type):
+        return ["localization", "localization_key"]
+
+
+@pytest.fixture
+def wildcard_model(tags):
+    from packsmith.core.query.ast import AllAttributes
+    query = Query(scope=Registry(REG), select=[Id, AllAttributes], order_by=[Id])
+    return RegistryTableModel(query, WildcardDump(), tags)
+
+
+def test_every_column_can_be_asked_what_kind_it_is(wildcard_model):
+    """The crash, as a test. Nothing exotic — just asking each column the question the
+    view asks while building itself."""
+    for col in range(wildcard_model.columnCount()):
+        wildcard_model.is_tag_column(col)
+        wildcard_model.column_tag_name(col)
+        wildcard_model.tag_type_for_column(col)
+
+
+def test_the_fields_line_up_with_the_columns(wildcard_model):
+    assert wildcard_model.columnCount() == 3
+    assert len(wildcard_model._select) == wildcard_model.columnCount()
+
+
+def test_the_columns_follow_a_dump_that_gains_an_attribute(tags):
+    """`reevaluate()` after adopting a new dump changes the column count. A field list
+    captured at construction would not have moved with it — the same desync, arriving
+    later and looking like a different bug."""
+    from packsmith.core.query.ast import AllAttributes
+
+    class Growing(WildcardDump):
+        names = ["localization"]
+
+        def attributes_for(self, registry_type):
+            return list(self.names)
+
+    dump = Growing()
+    query = Query(scope=Registry(REG), select=[Id, AllAttributes], order_by=[Id])
+    model = RegistryTableModel(query, dump, tags)
+    assert model.columnCount() == 2
+
+    dump.names = ["localization", "localization_key"]
+    model.reevaluate()
+
+    assert model.columnCount() == 3
+    assert len(model._select) == 3

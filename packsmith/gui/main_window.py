@@ -97,7 +97,6 @@ from packsmith.gui.run_control import RunControl
 from packsmith.gui.settings_dialog import SettingsDialog
 from packsmith.gui.job_editor import JobEditorTab
 from packsmith.gui.table.registry_table_model import RegistryTableModel
-from packsmith.gui.table.registry_sort_proxy import RegistrySortProxy
 from packsmith.gui.table.registry_table_view import RegistryTableView
 from packsmith.gui.table.cells.bool_cell import BoolCellDelegate
 from packsmith.gui.table.cells.enum_cell import EnumCellDelegate
@@ -313,8 +312,15 @@ class MainWindow(QMainWindow):
         self._views_panel.rename_requested.connect(self._rename_view)
         self._views_panel.delete_requested.connect(self._delete_view)
 
-        self._registry_panel = RegistryPanel(self._packdump)
+        # `None` when the profile has never said, which is what makes the panel fall back
+        # to its defaults — an empty saved list means the user unpinned everything and must
+        # not be handed the defaults back.
+        self._registry_panel = RegistryPanel(
+            self._packdump,
+            pins=load_ui_state(self._profile.name if self._profile else "")
+            .get("registry_pins"))
         self._registry_panel.registry_activated.connect(self._open_browse)
+        self._registry_panel.pins_changed.connect(self._remember_registry_pins)
 
         self._tags_panel = TagsPanel(self._tags)
         self._tags_panel.tag_activated.connect(self._open_tag_view)
@@ -1432,20 +1438,26 @@ class MainWindow(QMainWindow):
                                   tag_query(registry_type, tag_name))
 
     def _build_view_tab(self, query, view=None) -> QWidget:
-        """One tab rendering a query: model -> sort proxy -> table, with type-aware cell
-        delegates and per-tag edit-mode toggles."""
+        """One tab rendering a query: model -> table, with type-aware cell delegates
+        and per-tag edit-mode toggles. The model sorts itself; there is no proxy."""
         model = RegistryTableModel(query, self._packdump, self._tags,
                                    confirm_takeover=self._confirm_tag_takeover)
-        proxy = RegistrySortProxy()
-        proxy.setSourceModel(model)
 
         table = RegistryTableView()
-        table.setModel(proxy)
+        # The model sorts itself, so there is no proxy: a QSortFilterProxyModel compares
+        # pairwise through Python, which measured 2.2s per sort on an 18,638-row registry
+        # against 3ms for a key sort in the model. It was doing nothing else — filtering
+        # is the query's job, and the model already numbers its own vertical header.
+        table.setModel(model)
         table.setAlternatingRowColors(True)
         table.setSelectionBehavior(RegistryTableView.SelectItems)
         table.setSelectionMode(RegistryTableView.ExtendedSelection)
+        # Indicator first, THEN enable: `setSortingEnabled(True)` immediately sorts by the
+        # current section, so enabling and then calling sortByColumn sorted the whole table
+        # twice on open. The rows already arrive in the query's `order_by`, so this initial
+        # pass only has to agree with the arrow rather than discover anything.
+        table.horizontalHeader().setSortIndicator(0, Qt.AscendingOrder)
         table.setSortingEnabled(True)
-        table.sortByColumn(0, Qt.AscendingOrder)
 
         vh = table.verticalHeader()
         vh.setDefaultSectionSize(24)
@@ -2705,6 +2717,13 @@ class MainWindow(QMainWindow):
         panel = getattr(self, "_automation_panel", None)
         if panel is not None and self._profile is not None:
             save_ui_state(self._profile.name, automation_tab=panel.current_key)
+
+    def _remember_registry_pins(self, pins):
+        """Per profile, in UI state — a pin is furniture the user moved, like the panel
+        heights, not something they configured. Saved even when empty, because "I unpinned
+        them all" is an answer and the defaults must not creep back."""
+        if self._profile is not None:
+            save_ui_state(self._profile.name, registry_pins=list(pins))
 
     def _remember_selected_job(self):
         """Persist which job is picked, so the header comes back where you left it.

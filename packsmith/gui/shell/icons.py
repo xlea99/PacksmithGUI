@@ -30,12 +30,15 @@ from packsmith.common.logging import log
 FONT_PATH = Path(__file__).resolve().parents[1] / "vendor" / "phosphor" / "Phosphor.ttf"
 
 # Chosen for DISTINCT OUTLINES rather than for prettiness, because the outline is what a
-# glance actually resolves: grid, stacked cubes, angled pentagon, folder, cylinder,
+# glance actually resolves: grid, drafting sheet, angled pentagon, folder, cylinder,
 # triangle, box. Four of these panels are flavours of "structured data about things", which
 # is exactly where a careless set makes everything look alike.
+#
+# Blueprints was a `stack` and had to move: stacked bands and the registry's cylinder are
+# the same silhouette, and the two sit next to each other in the strip.
 GLYPHS = {
     "views": "",        # table — a View is a query, rendered as one
-    "blueprints": "",   # stack — instances stacked on a schema
+    "blueprints": "",   # blueprint
     "tags": "",         # tag
     "files": "",        # folder
     "registry": "",     # database — Layer 1, the read-only game data
@@ -131,6 +134,26 @@ def file_icon(name: str, is_dir: bool = False, *, colour: str, badge: str = None
     return _render(file_glyph(name, is_dir), colour, badge, size)
 
 
+# How much of the icon box the glyph's em fills, and how far down it is nudged.
+#
+# **Points were the bug.** The size was set in points while the box is in pixels, so a 16px
+# icon was drawn with a 13pt em — about 17.3px — and Phosphor's ink, which fills nearly its
+# whole em, ran off the top edge. Pixels make the fill a number we choose rather than one
+# the screen's DPI chooses for us.
+#
+# The nudge is optical, not geometric. Qt centres an icon on its box but centres *text* on
+# the font's line box, and a line box includes the descender — so the text a reader sees
+# sits lower than the row's true middle, and an icon centred beside it floats.
+#
+# The two numbers trade against each other, which is why they live together. Phosphor's ink
+# is about 81% of its em, so a 16px icon has roughly 4px of headroom in total and every
+# pixel of nudge spends some of it. One pixel down is what the largest glyph that still
+# fits can afford; buying a second would mean a fifth off the icon, and an icon a fifth
+# smaller to sit a pixel truer is a bad trade.
+GLYPH_FILL = 0.92
+GLYPH_NUDGE = 1 / 16
+
+
 def _render(glyph: str, colour: str, badge, size: int):
     """Paint one glyph into a cached QIcon."""
     from PySide6.QtCore import QRectF, Qt
@@ -140,23 +163,25 @@ def _render(glyph: str, colour: str, badge, size: int):
     if key in _ICON_CACHE:
         return _ICON_CACHE[key]
 
-    font = icon_font(size - 3)
-    if font is None:
+    name = family()
+    if not name:
         return QIcon()
 
     # Drawn at 2x and marked as such, so the glyph stays crisp on a scaled display rather
     # than being a blurry 16px bitmap stretched out.
     scale = 2
-    pixmap = QPixmap(size * scale, size * scale)
+    box = size * scale
+    pixmap = QPixmap(box, box)
     pixmap.fill(Qt.transparent)
     painter = QPainter(pixmap)
     painter.setRenderHint(QPainter.Antialiasing)
     painter.setRenderHint(QPainter.TextAntialiasing)
-    scaled = QFont(font)
-    scaled.setPointSizeF(font.pointSizeF() * scale)
+    scaled = QFont(name)
+    scaled.setPixelSize(max(1, round(box * GLYPH_FILL)))
     painter.setFont(scaled)
     painter.setPen(QColor(colour))
-    painter.drawText(pixmap.rect(), Qt.AlignCenter, glyph)
+    drop = round(box * GLYPH_NUDGE)
+    painter.drawText(pixmap.rect().adjusted(0, drop, 0, drop), Qt.AlignCenter, glyph)
 
     if badge:
         radius = 4.5 * scale

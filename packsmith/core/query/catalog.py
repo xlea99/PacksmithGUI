@@ -112,9 +112,16 @@ _COLUMN_TYPES = {
 class RegistryFieldCatalog:
     """Resolves field references for a single ``Registry`` scope.
 
-    Note: tag values are read per (entry, tag) via the tag store. Bulk-loading L2 for
-    a scope up front is a straightforward future optimization behind this same seam;
-    at Packsmith's ~2000-entry scale the per-cell reads are fine for v1.
+    **L2 is read a column at a time, not a cell at a time.** This used to do one query per
+    (entry, tag); measured against a real 300-mod pack that was 18,638 queries per tag
+    column — a three-tag view of `minecraft:item` fired 55,914 selects and took 1.2s to
+    open, where the same view now takes 27ms. The cost scaled with rows *times* columns,
+    so it worsened precisely as views became more useful.
+
+    Loaded **lazily, per field**: a resolver is built only for fields a query actually
+    names, so filtering by one tag doesn't drag in the columns beside it. The maps live as
+    long as the catalog, which is one evaluation — long enough to be worth loading, too
+    short to go stale.
     """
 
     def __init__(self, packdump, tag_store, registry_type: str):
@@ -125,6 +132,29 @@ class RegistryFieldCatalog:
         # the candidate finder (design 5.3) is a pure L1 id search and shouldn't have to
         # invent a tag store to run. Tags then simply have no value anywhere.
         self._defs = tag_store.definitions_for(registry_type) if tag_store else {}
+        # Memoised per catalog, so a tag named in both `select` and `filter` is loaded
+        # once. Never shared between catalogs: one is built per evaluation, which is
+        # exactly how long a snapshot of L2 can be trusted.
+        self._columns = {}
+
+    def _column(self, tag_name: str) -> dict:
+        if tag_name not in self._columns:
+            self._columns[tag_name] = self._tags.column(self._reg, tag_name)
+        return self._columns[tag_name]
+
+    def attribute_names(self) -> list:
+        """What ``AllAttributes`` expands to for this registry — the attributes the dump
+        actually carries here, not every attribute it knows how to answer.
+
+        Asked of the dump only when a query actually uses the wildcard, rather than in
+        ``__init__``. A catalog is built for *every* query, most of which name their columns
+        outright, so eager work here is work nobody asked for — and it would make
+        ``attributes_for`` a hard requirement of anything standing in for a packdump, which
+        is a lot of things that have no business knowing about attributes.
+        """
+        if self._dump is None:
+            return []
+        return list(self._dump.attributes_for(self._reg))
 
     def resolver(self, field) -> _Resolver:
         reg = self._reg
@@ -141,7 +171,11 @@ class RegistryFieldCatalog:
             col_type = defn["type"] if defn else "string"
             if self._tags is None:
                 return _Resolver(col_type, lambda e: None)
-            return _Resolver(col_type, lambda e: self._tags.get_tag(reg, e, name))
+            # A pristine cell shows the tag's default (§3.2.1), so the default is the
+            # miss-value rather than None — the column map holds assigned cells only.
+            values = self._column(name)
+            default = self._tags.default_for(reg, name)
+            return _Resolver(col_type, lambda e: values.get(e, default))
         if isinstance(field, Slot):
             raise QueryError("blueprint slots require a Blueprint scope (not supported in v1)")
         raise QueryError(f"not a field: {field!r}")
@@ -156,10 +190,13 @@ class RegistryFieldCatalog:
         `NOT HAS` returns nothing. 3.2.4 defines Has as "the tag is assigned", and only the
         row's existence answers that.
         """
-        reg = self._reg
         if isinstance(field, Tag) and self._tags is not None:
-            name = field.name
-            return lambda e: self._tags.assignment(reg, e, name) is not None
+            # The same loaded column: a key means a row exists, which *is* "assigned".
+            # Deliberately not "the value differs from the default" — a cell assigned the
+            # tag's own default is assigned, and that is the whole distinction Has exists
+            # to make.
+            assigned = self._column(field.name)
+            return lambda e: e in assigned
         # Everything else (id, mod, attributes) has no default to inflate, so presence is
         # just "the resolver found something".
         resolve = self.resolver(field)

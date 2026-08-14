@@ -48,12 +48,27 @@ class _Registry:
 
     def __init__(self, packdump):
         self._dump = packdump
+        self._members = {}      # registry_type -> set of ids, built on first `has`
 
     def entries(self, registry_type):
         return list(self._dump.registry.get(registry_type, {}).get("values", []))
 
     def has(self, registry_type, entry_id):
-        return entry_id in self._dump.registry.get(registry_type, {}).get("values", [])
+        """Membership, against a set built once per registry.
+
+        This was `in` against a **list**, which is a linear scan: 18,638 comparisons per
+        call on a real pack's item registry. Actions ask it in loops — the blueprint
+        suggester tests one candidate id per gap — so the natural way to write an action
+        was quietly quadratic.
+
+        Built lazily and per registry, because an action typically touches one or two out
+        of ~135 and paying for the rest would just move the cost.
+        """
+        members = self._members.get(registry_type)
+        if members is None:
+            members = set(self._dump.registry.get(registry_type, {}).get("values", []))
+            self._members[registry_type] = members
+        return entry_id in members
 
     def attribute(self, registry_type, entry_id, name):
         return self._dump.attribute(registry_type, entry_id, name)

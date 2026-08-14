@@ -7,6 +7,7 @@ as they grow. Not a theming system — just the palette the shell agrees on.
 BG_DEEP = "#1e1e1e"      # workspace / content background
 BG_PANEL = "#252525"     # panel + header backgrounds
 BG_CHROME = "#2d2d2d"    # buttons, tabs, inactive chrome
+BG_HOVER = "#383838"     # chrome under the pointer — one step up from BG_CHROME
 BORDER = "#3a3a3a"
 ACCENT = "#3a5070"       # selection blue
 ACCENT_EDGE = "#5080b0"

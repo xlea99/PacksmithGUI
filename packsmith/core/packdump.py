@@ -8,7 +8,28 @@ from packsmith.common.logging import log
 from packsmith.util.misc import raise_log, write_json
 from packsmith.core.profile import Profile
 
-_VALID_SCHEMAS = {1}
+# Dump schema versions this build can READ. Old ones are never dropped: a snapshot on disk
+# is an archive, not a cache — you cannot go back and re-dump a pack as it was six months
+# ago, so a bump that orphaned existing snapshots would be destroying the one copy of
+# something. New shapes are therefore additive (a block beside the old one), which lets an
+# older reader ignore what it doesn't know and a newer one tell absent from empty.
+#
+#   1 — meta, registries, localization display names.
+#   2 — localization gained `keys`: the translation key behind each display name.
+#
+# Mirrored in the mod as `DumpSchema.VERSION`; bump both together.
+_VALID_SCHEMAS = {1, 2}
+_CURRENT_SCHEMA = max(_VALID_SCHEMAS)
+
+
+class DumpTooNewError(ValueError):
+    """The dump came from a newer Packsmith than this one.
+
+    Distinct from an unreadable dump because the fix is different and the user can act on
+    it: a dump from the future is not corrupt, it just describes a shape this build has
+    never heard of, and guessing at it is how you silently drop the half you don't
+    understand. Mirrors `SchemaTooNewError` for profile.db, for the same reason.
+    """
 
 # This class handles reading/accessing values from a packdump. Immutable by design (and by gentleman's agreement)
 # if you're trying to edit a packdump you're doing something deeply wrong.
@@ -28,6 +49,11 @@ class Packdump:
 
         # Various attributes
         self._localizations = {}
+        # The translation key behind each display name: {registry_type: {entry_id: key}}.
+        # NOT nested under locale, unlike the names above — `block.spawn.anthill` is the
+        # same key whether you are reading English or German. Empty for schema-1 snapshots,
+        # which predate the mod harvesting it.
+        self._localization_keys = {}
 
         # Toggled locale
         self._active_locale = None
@@ -78,6 +104,14 @@ class Packdump:
         # short of deleting the packdump. Staleness the user cannot see a reason for is
         # worse than an extra snapshot.
         if self._localizations != other._localizations:
+            return False
+
+        # Keys too, and for a sharper reason than names. A mod update that moves an item's
+        # descriptionId changes no id, no count and often no display name — but it breaks
+        # every rename pointed at the old key. Left out of equality, that dump reads as
+        # "identical", import is skipped, and Packsmith keeps handing actions a key the game
+        # no longer answers to.
+        if self._localization_keys != other._localization_keys:
             return False
 
         return True
@@ -198,6 +232,38 @@ class Packdump:
         if loc_diffs:
             diffs["localizations"] = loc_diffs
 
+        # Diff translation keys. Reported separately from names because they mean different
+        # things to the reader: a changed *name* is cosmetic, a changed *key* silently
+        # invalidates anything written against the old one.
+        key_diffs = {}
+        self_reg_types = set(self._localization_keys)
+        other_reg_types = set(other._localization_keys)
+        if self_reg_types - other_reg_types:
+            key_diffs["only_in_self"] = list(self_reg_types - other_reg_types)
+        if other_reg_types - self_reg_types:
+            key_diffs["only_in_other"] = list(other_reg_types - self_reg_types)
+        key_changes = {}
+        for reg_type in self_reg_types & other_reg_types:
+            self_entries = self._localization_keys[reg_type]
+            other_entries = other._localization_keys[reg_type]
+            entry_diff = {}
+            self_ids, other_ids = set(self_entries), set(other_entries)
+            if self_ids - other_ids:
+                entry_diff["only_in_self"] = list(self_ids - other_ids)
+            if other_ids - self_ids:
+                entry_diff["only_in_other"] = list(other_ids - self_ids)
+            changed = {eid: (self_entries[eid], other_entries[eid])
+                       for eid in self_ids & other_ids
+                       if self_entries[eid] != other_entries[eid]}
+            if changed:
+                entry_diff["changed"] = changed
+            if entry_diff:
+                key_changes[reg_type] = entry_diff
+        if key_changes:
+            key_diffs["changed"] = key_changes
+        if key_diffs:
+            diffs["localization_keys"] = key_diffs
+
         return diffs
 
     #endregion === Comparison ===
@@ -224,6 +290,11 @@ class Packdump:
         if meta.get("type") != "packsmith_full_dump":
             raise_log(ValueError, f"meta.json type is '{meta.get('type')}', expected 'packsmith_full_dump'")
         schema = meta.get("schema_version")
+        if isinstance(schema, int) and schema > _CURRENT_SCHEMA:
+            raise_log(DumpTooNewError,
+                      f"This packdump is schema {schema}, but this build of Packsmith reads "
+                      f"up to {_CURRENT_SCHEMA}. Update Packsmith to open it — importing it "
+                      f"anyway would silently drop whatever the newer dump added.")
         if schema not in _VALID_SCHEMAS:
             raise_log(ValueError, f"Unsupported schema version: {schema}")
 
@@ -281,6 +352,18 @@ class Packdump:
             locals_dict = json.load(f)
         locale = locals_dict['locale']
         self._localizations[locale] = locals_dict["values"]
+        # Feature-detected rather than gated on the file's version number. The version says
+        # what a reader may expect; what a *file* actually contains is a separate question,
+        # and a dump whose meta and attribute files disagree about their version (easy
+        # enough to produce by hand, or by a half-finished mod build) should still load
+        # everything it genuinely has.
+        keys = locals_dict.get("keys")
+        if keys:
+            # One key map per dump, not per locale. Later locales re-state the same keys, so
+            # they merge rather than fight; if they ever disagreed the last would win, and
+            # that is the correct shrug for a field that cannot legitimately vary.
+            for reg_type, entries in keys.items():
+                self._localization_keys.setdefault(reg_type, {}).update(entries)
         if self._active_locale is None:
             self._active_locale = locale
 
@@ -328,12 +411,18 @@ class Packdump:
         # en_us — but archived snapshots are the thing you cannot go back and re-dump, so
         # a silent loss there is permanent.
         for locale, values in self._localizations.items():
-            write_json(attr_dir / f"localization.{locale}.json", {
+            payload = {
                 "schema_version": self._schema,
                 "type": "localization",
                 "locale": locale,
                 "values": values,
-            })
+            }
+            # Only written when this snapshot actually has them. Round-tripping a schema-1
+            # dump must produce a schema-1 dump: writing an empty `keys` block would claim
+            # the mod harvested nothing, when the truth is it was never asked.
+            if self._localization_keys:
+                payload["keys"] = self._localization_keys
+            write_json(attr_dir / f"localization.{locale}.json", payload)
 
         log.info(f"Packdump saved to {snapshot_path}")
 
@@ -397,16 +486,72 @@ class Packdump:
     #region === Helpers ===
 
     # Reads one L1 attribute of an entry (design 3.1). Attributes are dump-provided,
-    # per-entry data attached to (registry_type, entry_id) — today 'localization' is the
-    # first and only one. Returns None when the attribute is absent: the raw-id fallback is
-    # a renderer convenience, NOT the raw attribute, so callers that want a display string
-    # do `attribute(...) or entry_id` themselves.
+    # per-entry data attached to (registry_type, entry_id). Returns None when the attribute
+    # is absent: the raw-id fallback is a renderer convenience, NOT the raw attribute, so
+    # callers that want a display string do `attribute(...) or entry_id` themselves.
+    #
+    # Dispatched through a table rather than an `if name != "localization"` chain. That
+    # single line was the only thing between actions and every attribute we might ever
+    # harvest — the Starlark binding, the query catalog and the AST node were all already
+    # generic — so adding the second attribute meant unpicking a special case rather than
+    # extending anything.
     def attribute(self, registry_type: str, entry_id: str, name: str):
-        if name != "localization":
+        entry = self._ATTRIBUTES.get(name)
+        if entry is None:
             return None
+        return entry[0](self, registry_type, entry_id)
+
+    def _read_localization(self, registry_type: str, entry_id: str):
         if registry_type in self.localization:
             return self.localization[registry_type].get(entry_id)
         return None
+
+    def _has_localization(self, registry_type: str) -> bool:
+        return registry_type in self.localization
+
+    def _read_localization_key(self, registry_type: str, entry_id: str):
+        return self._localization_keys.get(registry_type, {}).get(entry_id)
+
+    def _has_localization_key(self, registry_type: str) -> bool:
+        return bool(self._localization_keys.get(registry_type))
+
+    # name -> (read it for one entry, does this registry carry it at all). The two live
+    # together because they are the same fact asked at different scales, and a reader
+    # without a prober is how a column ends up offered for a registry that has no values
+    # for it. Order is the order columns appear in.
+    _ATTRIBUTES = {
+        "localization": (_read_localization, _has_localization),
+        "localization_key": (_read_localization_key, _has_localization_key),
+    }
+
+    @classmethod
+    def attribute_names(cls) -> list:
+        """Every attribute name `attribute()` can answer for — what the view constructor
+        offers as columns. A class method because it is a property of this build, not of
+        one snapshot: an older dump simply answers None for what it doesn't carry, which is
+        the same thing it does for an entry a registry never had."""
+        return list(cls._ATTRIBUTES)
+
+    def attributes_for(self, registry_type: str) -> list:
+        """The attributes **this registry actually carries**, in `attribute_names()` order.
+
+        Different question from `attribute_names()`, and the difference is most of the
+        table: a pack dumps localization for a handful of registries out of ~135, so
+        offering every known attribute everywhere would give `minecraft:block_predicate_type`
+        two permanently empty columns. An empty column is not neutral — it reads as data
+        that failed to load rather than data that was never going to exist.
+        """
+        return [name for name, (_, has) in self._ATTRIBUTES.items()
+                if has(self, registry_type)]
+
+    def has_localization_keys(self) -> bool:
+        """Whether this snapshot carries translation keys at all.
+
+        Schema-1 dumps predate the mod harvesting them, so every key reads None — which is
+        indistinguishable, cell by cell, from an entry that genuinely has no key. Callers
+        that need to explain themselves (a job refusing to run, a column rendering empty)
+        need to know which of the two they are looking at."""
+        return bool(self._localization_keys)
 
     #endregion === Helpers
 

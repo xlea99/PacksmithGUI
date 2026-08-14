@@ -29,6 +29,14 @@ class Row:
 class Result:
     columns: list = field(default_factory=list)   # list[Column]
     rows: list = field(default_factory=list)       # list[Row]
+    # The AST field behind each column, positionally aligned with `columns`.
+    #
+    # Carried on the result rather than re-read from the query, because a wildcard
+    # (`AllSlots`, `AllAttributes`) means the query's own `select` no longer matches the
+    # table it produced — two entries in, three columns out. Anything that asks "what kind
+    # of field is column 2" has to ask the thing that was actually evaluated, or it indexes
+    # off the end of a list that was never the same length.
+    select: list = field(default_factory=list)     # list[AST field]
 
     @property
     def column_names(self) -> list:

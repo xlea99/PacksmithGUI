@@ -126,7 +126,7 @@ def test_the_strip_is_ordered_by_what_the_panels_are_for():
     order is a claim about meaning, so it is pinned rather than left to whoever edits the
     list next."""
     assert [spec.key for spec in PANEL_SPECS] == [
-        "views", "files", "automation", "tags", "blueprints", "registry"]
+        "views", "automation", "files", "tags", "blueprints", "registry"]
 
 
 def test_the_groups_are_contiguous():
@@ -221,3 +221,60 @@ def test_the_same_request_is_cached(qapp):
     first = icons.file_icon("a.json", colour=style.TEXT)
     second = icons.file_icon("b.json", colour=style.TEXT)
     assert first is second, "same glyph and colour should reuse one icon"
+
+
+# --- how the glyph sits in its box -----------------------------------------------------------
+
+def _ink_rows(icon, size=16):
+    """The rows carrying ink, in the pixmap's own pixels."""
+    image = icon.pixmap(size, size).toImage()
+    rows = [y for y in range(image.height())
+            if any(image.pixelColor(x, y).alpha() > 20 for x in range(image.width()))]
+    return rows, image.height()
+
+
+@pytest.mark.parametrize("name", ["options.txt", "emi.json", "pack.png", "Quark.jar"])
+def test_the_glyph_is_not_clipped_by_its_own_box(qapp, name):
+    """The size was set in **points** while the box is in **pixels**, so a 16px icon was
+    drawn with a ~17.3px em and Phosphor — which fills nearly its whole em — lost its top
+    row to the edge. It read as an icon sitting too high rather than as a cropped one,
+    which is why it survived a look.
+
+    Ink touching row 0 is the signature, and it comes back the moment anyone reaches for a
+    point size again.
+    """
+    from packsmith.gui.shell import style
+
+    rows, height = _ink_rows(icons.file_icon(name, colour=style.TEXT))
+    assert rows, "nothing was drawn at all"
+    assert rows[0] > 0, f"{name}: glyph is clipped against the top of its box"
+    assert rows[-1] < height - 1, f"{name}: glyph is clipped against the bottom of its box"
+
+
+def test_the_glyph_sits_slightly_low_on_purpose(qapp):
+    """Qt centres an icon on its box but centres *text* on the font's line box, which
+    reserves a descender whether the word has one or not — so a geometrically centred icon
+    floats above the text beside it. The nudge is what puts the two on one line, and a
+    "tidy" pass that re-centres the glyph would undo the fix without breaking anything
+    visibly enough to notice.
+    """
+    from packsmith.gui.shell import style
+
+    assert icons.GLYPH_NUDGE > 0
+    rows, height = _ink_rows(icons.file_icon("emi.json", colour=style.TEXT))
+    above, below = rows[0], height - 1 - rows[-1]
+    assert below < above, f"the glyph is centred ({above} above, {below} below), so it floats"
+
+
+def test_the_nudge_and_the_fill_are_still_compatible(qapp):
+    """These two numbers spend the same 4px of headroom, so raising either alone puts the
+    glyph back through the edge of its box. The clipping test above catches it, but this
+    says *why* — the pair has to be re-solved together, not adjusted one at a time.
+    """
+    from packsmith.gui.shell import style
+
+    rows, height = _ink_rows(icons.file_icon("emi.json", colour=style.TEXT))
+    ink = rows[-1] - rows[0] + 1
+    headroom = height - ink
+    assert headroom / 2 > icons.GLYPH_NUDGE * height, \
+        "the nudge is larger than the room the fill leaves for it"

@@ -5,18 +5,25 @@ panels hand you. They're ordinary queries with no special status; the difference
 one of these and a saved View is only that nobody named and kept it.
 """
 from packsmith.core.query import (
-    Query, Registry, Blueprint, Id, Attribute, Tag, AllSlots,
+    Query, Registry, Blueprint, Id, Attribute, Tag, AllSlots, AllAttributes,
 )
 
 
 def browse_query(registry_type: str) -> Query:
-    """A **zero-tag** table for a registry type (§4.1, Registry panel): just the entries
-    and their names. The fastest way to look at everything without configuring a View —
-    and visibly distinct from a curated View, which is the point. Add columns or a filter
-    through the ⚙ constructor and it becomes one."""
+    """A **zero-tag** table for a registry type (§4.1, Registry panel): the entries and
+    everything L1 knows about them. The fastest way to look at everything without
+    configuring a View — and visibly distinct from a curated View, which is the point. Add
+    a filter or tag columns through the ⚙ constructor and it becomes one.
+
+    ``AllAttributes`` rather than naming ``localization``: this is the "just show me
+    everything" table, and a frozen column list makes it quietly stop being that. When the
+    dump learned to harvest translation keys, this query would have kept showing precisely
+    what it showed the day before — the new fact reachable only by someone who already knew
+    to go looking for it.
+    """
     return Query(
         scope=Registry(registry_type),
-        select=[Id, Attribute("localization")],
+        select=[Id, AllAttributes],
         order_by=[Id],
     )
 

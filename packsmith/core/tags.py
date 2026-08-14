@@ -349,6 +349,35 @@ class TagStore:
             value=self._cast_tag_value(registry_type, tag_name, row["value"]),
             owner=row["owner_kind"], action_ref=row["owner_action_ref"])
 
+    def column(self, registry_type: str, tag_name: str) -> dict:
+        """Every stored value for one tag, as ``{entry_id: value}`` — a whole table column
+        in one query.
+
+        The per-cell reads this replaces were fine at the scale they were written for and
+        stopped being fine when a real pack turned up: `minecraft:item` holds 18,638
+        entries, so a three-tag view fired 55,914 selects and took over a second to open.
+        The cost scaled with rows *times* columns, which is to say it got worse exactly as
+        views got more useful.
+
+        **Only assigned cells appear**, and every assigned cell appears. A pristine cell is
+        absent rather than present-as-default, because those are different facts (§3.2.1)
+        and collapsing them is how `HAS` starts matching every entry. Callers wanting
+        display values apply the default themselves — see `TagStore.default_for`.
+
+        That "every assigned cell appears" is what lets the keys serve as the **existence**
+        channel too: a key here means a row exists, which is the definition of assigned.
+        A cell assigned the same value as its default is still in the map, so presence
+        survives being equal to the default — the distinction `HAS` depends on.
+        """
+        definition = self.definition(registry_type, tag_name)
+        if definition is None:
+            return {}
+        rows = self._db.fetch_all(
+            "SELECT entry_id, value FROM tag_assignments WHERE tag_id = ?",
+            (definition["id"],))
+        return {row["entry_id"]: self._cast_tag_value(registry_type, tag_name, row["value"])
+                for row in rows}
+
     # Gets ALL tag assignments for a single entry.
     def get_all_tags(self, registry_type: str, entry_id: str) -> dict:
         rows = self._db.fetch_all(

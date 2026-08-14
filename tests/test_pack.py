@@ -163,3 +163,26 @@ def test_an_action_can_still_retract_what_it_created_this_step(pack):
     p.tags.clear(REG, ENTRY, TAG)
     staging.commit()
     assert tags.get_ownership(REG, ENTRY, TAG) is None
+
+
+def test_registry_membership_does_not_scan(pack):
+    """`has` was `in` against a LIST — 18,638 comparisons per call on a real pack's items.
+    Actions ask it in loops (the blueprint suggester tests one candidate per gap), so the
+    obvious way to write an action was quietly quadratic.
+
+    Asserted on the built structure rather than on a clock, because a timing threshold on
+    a shared CI box is a flake generator.
+    """
+    p, _, _ = pack
+    assert p.registry.has(REG, "quark:rope")
+    assert not p.registry.has(REG, "nope:nope")
+    assert isinstance(p.registry._members[REG], set)
+
+
+def test_membership_is_built_per_registry_not_for_all_of_them(pack):
+    """~135 registries, of which an action touches one or two. Building the rest up front
+    would just move the cost somewhere it is harder to see."""
+    p, _, _ = pack
+    assert p.registry._members == {}
+    p.registry.has(REG, "quark:rope")
+    assert list(p.registry._members) == [REG]

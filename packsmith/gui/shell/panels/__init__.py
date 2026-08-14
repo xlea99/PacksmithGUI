@@ -9,8 +9,8 @@ each panel is going to be.
 row here (plus, eventually, a real widget in place of the stub).
 
 **The order is two groups, separated by a rule**, because the panels answer two different
-questions. The first three are *where you work* — the views you read, the files you edit,
-the automation you run. The second three are *the vocabulary those are expressed in* — the
+questions. The first three are *where you work* — the views you read, the automation you
+run, the files you edit. The second three are *the vocabulary those are expressed in* — the
 tags and blueprints you define, and the registry they describe. Sitting a divider between
 them means the strip can be aimed at by half before it is read at all.
 """
@@ -34,15 +34,15 @@ PANEL_SPECS = [
         "its renderer — usually a registry table. Ships with sensible defaults.",
     ),
     PanelSpec(
-        "files", "F", "Files",
-        "The semantic file browser — smart/honest modes, loader-aware path resolution "
-        "through integrations.",
-    ),
-    PanelSpec(
         "automation", "A", "Automation",
         "Jobs and Actions in one place. Jobs are what you run — pinned ones reach the "
         "header's run control; Actions are the installed packages they are composed from. "
         "Two tabs because they are different shapes, not because they are unrelated.",
+    ),
+    PanelSpec(
+        "files", "F", "Files",
+        "The semantic file browser — smart/honest modes, loader-aware path resolution "
+        "through integrations.",
     ),
 
     # --- the vocabulary it is expressed in ----------------------------------------------

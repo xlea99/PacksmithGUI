@@ -47,7 +47,7 @@ class Tag:
 
 @dataclass(frozen=True)
 class Attribute:
-    """An L1 packdump-provided attribute (today only ``localization``, design 3.1)."""
+    """An L1 packdump-provided attribute — ``localization``, ``localization_key`` (§3.1)."""
     name: str
 
 
@@ -74,6 +74,27 @@ class _AllSlots:
 
 
 AllSlots = _AllSlots()
+
+
+@dataclass(frozen=True)
+class _AllAttributes:
+    """Every attribute the scope's registry carries, in the dump's order.
+
+    ``AllSlots``' argument, one layer up: what a packdump knows about an entry is a **fact
+    about the dump**, not a preference of the view. The Registry panel's browse table froze
+    its columns at id-and-name, so when the dump learned to harvest translation keys the
+    default way of looking at a registry kept showing exactly what it showed before —
+    hiding, by omission, the thing that had just been added.
+
+    Expands to what a registry **actually has**, not to every attribute in existence: a pack
+    dumps localization for a handful of registries out of ~135, and a permanently empty
+    column reads as data that failed to load rather than data that never existed.
+
+    Naming attributes explicitly is still allowed and still means a curated subset.
+    """
+
+
+AllAttributes = _AllAttributes()
 
 
 # --- Scopes: the base row-source --------------------------------------------

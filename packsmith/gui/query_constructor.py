@@ -20,6 +20,7 @@ from packsmith.core.query.language import (
 from packsmith.core.query import (
     Query, Registry, Id, Mod, Tag, Attribute, Cmp, Has, Not, And, Or, column_name,
 )
+from packsmith.core.packdump import Packdump
 
 
 @dataclass
@@ -32,13 +33,21 @@ class FieldDesc:
 
 
 def registry_fields(tag_store, registry_type) -> list[FieldDesc]:
-    """Every field you can filter on for a registry scope: the intrinsics, the localization
-    attribute, and each registry-scoped tag."""
+    """Every field you can filter on for a registry scope: the intrinsics, the dump's
+    attributes, and each registry-scoped tag.
+
+    Attributes are asked of `Packdump` rather than listed here, because a hardcoded
+    `localization` was how the last one got missed — the query engine, the Starlark binding
+    and the catalog were all generic already, and only the two ends had a name written into
+    them. Offered for every registry, as `localization` always was: an attribute a registry
+    has no values for reads empty, which is the honest answer rather than a hidden column.
+    """
     fields = [
         FieldDesc("id", Id, "id", None, False),
         FieldDesc("mod", Mod, "string", None, False),
-        FieldDesc("localization", Attribute("localization"), "string", None, True),
     ]
+    fields += [FieldDesc(name, Attribute(name), "string", None, True)
+               for name in Packdump.attribute_names()]
     for name, defn in tag_store.definitions_for(registry_type).items():
         fields.append(FieldDesc(name, Tag(name), defn["type"], defn.get("values"), True))
     return fields

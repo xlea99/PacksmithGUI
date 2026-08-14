@@ -15,7 +15,8 @@ import re
 
 from packsmith.core.query.ast import (
     Query, Registry, Blueprint, Cmp, Has, And, Or, Not, VALID_OPS, QueryError,
-    AGGREGATES, Collect, CountDistinct, Slot, _AllSlots, _Count, _Id,
+    AGGREGATES, Collect, CountDistinct, Slot, Attribute, _AllSlots, _AllAttributes,
+    _Count, _Id,
 )
 from packsmith.core.query.catalog import (
     BlueprintFieldCatalog, RegistryFieldCatalog, _Resolver, column_name,
@@ -43,7 +44,7 @@ def evaluate(query, *, packdump=None, tag_store=None, blueprint_store=None) -> R
     select = _expand(select, catalog)
 
     if query.group_by:
-        return _grouped(query, catalog, entries)
+        return _grouped(query, catalog, entries, select)
 
     # WHERE
     predicate = _compile_filter(query.filter, catalog)
@@ -90,10 +91,10 @@ def evaluate(query, *, packdump=None, tag_store=None, blueprint_store=None) -> R
         Row(values=values, entry_id=(None if anonymous else entry_id))
         for (entry_id, values, _keys) in records
     ]
-    return Result(columns=columns, rows=rows)
+    return Result(columns=columns, rows=rows, select=list(select))
 
 
-def _grouped(query, catalog, entries) -> Result:
+def _grouped(query, catalog, entries, select) -> Result:
     """WHERE -> GROUP BY -> aggregate -> HAVING -> ORDER BY -> LIMIT.
 
     Grouped rows are **computed**: no single entry backs them, so they carry no
@@ -106,7 +107,7 @@ def _grouped(query, catalog, entries) -> Result:
 
     # The ordinary SQL rule, for the ordinary reason: anything else has no single value
     # for a group, so there is no honest thing to put in the cell.
-    for field in query.select:
+    for field in select:
         if isinstance(field, AGGREGATES):
             continue
         if column_name(field) not in group_names:
@@ -123,13 +124,13 @@ def _grouped(query, catalog, entries) -> Result:
         buckets.setdefault(key, []).append(entry)
 
     columns, rows = [], []
-    for field in query.select:
+    for field in select:
         columns.append(Column(column_name(field), _column_type(field, catalog)))
 
     # HAVING may name an aggregate that isn't selected — `HAVING count > 1` without a
     # count column is the normal way to write a duplicates report. Compute those too, then
     # project them back out.
-    needed = list(query.select) + [f for f in _fields_in(query.having)
+    needed = list(select) + [f for f in _fields_in(query.having)
                                    if isinstance(f, AGGREGATES)]
 
     for key, members in buckets.items():
@@ -156,7 +157,8 @@ def _grouped(query, catalog, entries) -> Result:
 
     if query.limit is not None:
         rows = rows[: query.limit]
-    return Result(columns=columns, rows=[Row(values=v, entry_id=None) for v in rows])
+    return Result(columns=columns, rows=[Row(values=v, entry_id=None) for v in rows],
+                  select=list(select))
 
 
 def _fields_in(node) -> list:
@@ -203,20 +205,27 @@ class _ValuesCatalog:
 
 
 def _expand(select, catalog):
-    """Replace ``AllSlots`` with the scope's actual slots, at evaluation time.
+    """Replace ``AllSlots`` / ``AllAttributes`` with what the scope actually holds, at
+    evaluation time.
 
     Expanding here rather than when the query is written is the point: the saved query
     keeps saying "every slot", so a schema that grows is reflected the next time the view
-    is opened instead of quietly under-reporting gaps.
+    is opened instead of quietly under-reporting gaps. The same is true one layer up — a
+    dump that learns a new attribute reaches existing views without rewriting them.
     """
-    if not any(isinstance(f, _AllSlots) for f in select):
+    wildcards = (_AllSlots, _AllAttributes)
+    if not any(isinstance(f, wildcards) for f in select):
         return select
-    if not isinstance(catalog, BlueprintFieldCatalog):
-        raise QueryError("AllSlots needs a Blueprint scope")
     expanded = []
     for field in select:
         if isinstance(field, _AllSlots):
+            if not isinstance(catalog, BlueprintFieldCatalog):
+                raise QueryError("AllSlots needs a Blueprint scope")
             expanded.extend(Slot(path) for path in catalog.slot_paths())
+        elif isinstance(field, _AllAttributes):
+            if not isinstance(catalog, RegistryFieldCatalog):
+                raise QueryError("AllAttributes needs a Registry scope")
+            expanded.extend(Attribute(name) for name in catalog.attribute_names())
         else:
             expanded.append(field)
     return expanded

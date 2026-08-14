@@ -326,3 +326,179 @@ def test_distinct_still_anonymises_a_genuinely_collapsed_row(world):
                           packdump=dump, tag_store=tags)
     assert all(row.entry_id is None for row in without_id.rows)
     assert len(without_id.rows) < len(dump.registry[REG]["values"])
+
+
+# --- AllAttributes: columns follow the dump ----------------------------------
+#
+# `AllSlots`' argument one layer up. What L1 knows about an entry is a fact about the
+# DUMP, not a preference of the view — so the Registry panel's "just show me everything"
+# table follows it rather than freezing a column list. It froze at id-and-name, and when
+# the dump learned to harvest translation keys the default way of looking at a registry
+# kept showing exactly what it showed the day before.
+
+
+class RicherDump(FakeDump):
+    """A dump carrying two attributes, and one registry that carries neither."""
+
+    def __init__(self, entries, localization=None, keys=None):
+        super().__init__(entries, localization)
+        self._keys = keys or {}
+
+    def attribute(self, registry_type, entry_id, name):
+        if name == "localization_key":
+            return self._keys.get((registry_type, entry_id))
+        return super().attribute(registry_type, entry_id, name)
+
+    def attributes_for(self, registry_type):
+        present = []
+        if any(rt == registry_type for rt, _ in self._loc):
+            present.append("localization")
+        if any(rt == registry_type for rt, _ in self._keys):
+            present.append("localization_key")
+        return present
+
+
+@pytest.fixture
+def richer(tags):
+    dump = RicherDump(
+        ["minecraft:stone", "minecraft:wheat"],
+        localization={(REG, "minecraft:stone"): "Stone",
+                      (REG, "minecraft:wheat"): "Wheat"},
+        keys={(REG, "minecraft:stone"): "block.minecraft.stone",
+              (REG, "minecraft:wheat"): "item.minecraft.wheat"},
+    )
+    return dump, tags
+
+
+def test_all_attributes_selects_every_attribute_the_registry_has(richer):
+    from packsmith.core.query import AllAttributes
+    dump, tags = richer
+    result = evaluate(Query(scope=Registry(REG), select=[Id, AllAttributes], order_by=[Id]),
+                      packdump=dump, tag_store=tags)
+    assert [c.name for c in result.columns] == ["id", "localization", "localization_key"]
+    assert result.rows[0].values["localization_key"] == "block.minecraft.stone"
+
+
+def test_a_registry_with_no_attributes_gets_no_phantom_columns(richer):
+    """A pack dumps localization for a handful of registries out of ~135. A permanently
+    empty column does not read as "nothing to show here" — it reads as data that failed to
+    load."""
+    from packsmith.core.query import AllAttributes
+    dump, tags = richer
+    dump.registry["minecraft:chunk_status"] = {"values": ["minecraft:full"]}
+    result = evaluate(Query(scope=Registry("minecraft:chunk_status"),
+                            select=[Id, AllAttributes]), packdump=dump, tag_store=tags)
+    assert [c.name for c in result.columns] == ["id"]
+
+
+def test_a_dump_that_gains_an_attribute_reaches_an_already_saved_query(richer):
+    """The whole reason expansion happens at evaluation. This is the exact case that
+    prompted it: the dump learned translation keys, and every saved browse query should
+    show them without being rewritten."""
+    from packsmith.core.query import AllAttributes
+    dump, tags = richer
+    query = Query(scope=Registry(REG), select=[Id, AllAttributes], order_by=[Id])
+
+    dump._keys = {}                          # as if dumped before keys were harvested
+    before = [c.name for c in evaluate(query, packdump=dump, tag_store=tags).columns]
+    assert before == ["id", "localization"]
+
+    dump._keys = {(REG, "minecraft:stone"): "block.minecraft.stone"}
+    after = [c.name for c in evaluate(query, packdump=dump, tag_store=tags).columns]
+    assert after == ["id", "localization", "localization_key"]
+
+
+def test_rows_stay_editable_under_all_attributes(richer):
+    """Attributes are read-only, but the ROW still names one entry — so tag columns added
+    beside them stay writable. Losing that would make the browse table read-only."""
+    from packsmith.core.query import AllAttributes
+    dump, tags = richer
+    result = evaluate(Query(scope=Registry(REG), select=[Id, AllAttributes]),
+                      packdump=dump, tag_store=tags)
+    assert all(row.editable for row in result.rows)
+
+
+def test_all_attributes_needs_a_registry_scope(richer):
+    from packsmith.core.query import AllAttributes
+    dump, tags = richer
+    with pytest.raises(QueryError):
+        evaluate(Query(scope=Blueprint("StoneType"), select=[Id, AllAttributes]),
+                 packdump=dump, tag_store=tags, blueprint_store=None)
+
+
+def test_all_attributes_round_trips_as_data(richer):
+    """serde's own comment warns this is a trap with a delay on it: encoding is generic,
+    decoding was hand-maintained, so a new node encodes fine and only fails on the way
+    back in — at load time, in a different session."""
+    from packsmith.core.query import AllAttributes
+    query = Query(scope=Registry(REG), select=[Id, AllAttributes], order_by=[Id])
+    restored = from_dict(json.loads(json.dumps(to_dict(query))))
+    assert restored == query
+    assert restored.select[1] is AllAttributes
+
+
+# --- L2 is read a column at a time (perf, and the correctness it must not trade away) ---
+#
+# One query per (entry, tag) meant 18,638 selects per tag column on a real pack — a
+# three-tag view took 1.2s to open. Loading the column in one query is 50x faster; these
+# pin the three facts that make it *the same answer*, since a wrong tag value doesn't
+# announce itself, it just quietly shows you the wrong thing.
+
+
+def test_a_pristine_cell_still_shows_the_tags_default(tags):
+    """The column map holds assigned cells only, so the default has to be the miss-value.
+    Get this wrong and every untouched cell reads empty instead of `false`."""
+    dump = FakeDump(["mod:a", "mod:b"])
+    tags.define(REG, "remove", "bool", default=False)
+    tags.assign(REG, "mod:a", "remove", True)
+
+    rows = {r.values["id"]: r.values["remove"] for r in evaluate(
+        Query(scope=Registry(REG), select=[Id, Tag("remove")]),
+        packdump=dump, tag_store=tags).rows}
+    assert rows == {"mod:a": True, "mod:b": False}
+
+
+def test_has_is_true_for_a_cell_assigned_its_own_default(tags):
+    """The distinction the whole engine's gap-finding idiom rests on. `remove = false`
+    deliberately asserted is ASSIGNED; an untouched cell showing `false` is not. Deriving
+    presence from "the value differs from the default" would collapse them."""
+    dump = FakeDump(["mod:asserted", "mod:pristine"])
+    tags.define(REG, "remove", "bool", default=False)
+    tags.assign(REG, "mod:asserted", "remove", False)
+
+    found = [r.values["id"] for r in evaluate(
+        Query(scope=Registry(REG), select=[Id], filter=Has(Tag("remove"))),
+        packdump=dump, tag_store=tags).rows]
+    assert found == ["mod:asserted"]
+
+
+def test_a_write_between_evaluations_is_seen(tags):
+    """The column is snapshotted per evaluation. That is safe only because a catalog lives
+    for exactly one — a map cached longer would show the table its own stale past."""
+    dump = FakeDump(["mod:a"])
+    tags.define(REG, "tier", "string")
+    query = Query(scope=Registry(REG), select=[Id, Tag("tier")])
+
+    before = evaluate(query, packdump=dump, tag_store=tags).rows[0].values["tier"]
+    tags.assign(REG, "mod:a", "tier", "gold")
+    after = evaluate(query, packdump=dump, tag_store=tags).rows[0].values["tier"]
+
+    assert (before, after) == (None, "gold")
+
+
+def test_one_tag_named_twice_is_loaded_once(tags):
+    """Selected *and* filtered on is the common shape of a real view. Memoised per
+    catalog, so the second reference is free rather than a second full column read."""
+    dump = FakeDump(["mod:a", "mod:b"])
+    tags.define(REG, "tier", "string")
+    tags.assign(REG, "mod:a", "tier", "gold")
+
+    calls = []
+    real = tags.column
+    tags.column = lambda reg, name: (calls.append(name), real(reg, name))[1]
+
+    result = evaluate(Query(scope=Registry(REG), select=[Id, Tag("tier")],
+                            filter=Cmp(Tag("tier"), "eq", "gold")),
+                      packdump=dump, tag_store=tags)
+    assert [r.values["id"] for r in result.rows] == ["mod:a"]
+    assert calls == ["tier"], f"loaded the column {len(calls)} times"
