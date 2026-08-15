@@ -83,6 +83,7 @@ from packsmith.gui.editor.sources import (
     InstanceFileSource, JarMemberSource, PackageFileSource, is_overridable, member_path,
     split_member)
 from packsmith.gui.shell.panels.actions_panel import ActionsPanel
+from packsmith.gui.shell.panels.packages_panel import PackagesPanel
 from packsmith.gui.shell.panels.automation_panel import AutomationPanel
 from packsmith.gui.shell.panels.blueprints_panel import BlueprintsPanel
 from packsmith.gui.query_bar import QueryBar, combine
@@ -90,7 +91,7 @@ from packsmith.core.query.ast import Blueprint as QueryBlueprint, QueryError
 from packsmith.core.query.language import QuerySyntaxError
 from packsmith.gui.blueprint_editor import BlueprintEditorTab, NewBlueprintDialog
 from packsmith.gui.action_editor import (
-    NewActionDialog, NewFileDialog, NewFolderDialog, RenameFileDialog,
+    NewActionDialog, NewFileDialog, NewFolderDialog, NewPackageDialog, RenameFileDialog,
 )
 from packsmith.gui.image_viewer import ImageViewerTab
 from packsmith.gui.override_dialog import OverrideTargetDialog
@@ -382,17 +383,30 @@ class MainWindow(QMainWindow):
         self._actions_panel.action_activated.connect(self._open_action)
         self._actions_panel.document_activated.connect(self._open_package_document)
         self._actions_panel.new_action_requested.connect(self._new_action)
-        self._actions_panel.new_file_requested.connect(self._new_package_file)
-        self._actions_panel.new_folder_requested.connect(self._new_package_folder)
         self._actions_panel.remove_action_requested.connect(self._remove_action)
-        self._actions_panel.rename_file_requested.connect(self._rename_package_file)
-        self._actions_panel.delete_file_requested.connect(self._delete_package_file)
-        self._actions_panel.rename_folder_requested.connect(self._rename_package_folder)
-        self._actions_panel.delete_folder_requested.connect(self._delete_package_folder)
 
-        # Jobs and Actions share one slot (§4.1). Both panels are built exactly as before —
-        # every signal above is untouched — and the wrapper only decides where they sit.
-        self._automation_panel = AutomationPanel(self._jobs_panel, self._actions_panel)
+        # The same operations as the Actions panel offers, scoped to one package. They
+        # share handlers deliberately: two surfaces onto the same acts, one implementation.
+        self._packages_panel = PackagesPanel(self._packages)
+        self._packages_panel.action_activated.connect(self._open_action)
+        self._packages_panel.document_activated.connect(self._open_package_document)
+        self._packages_panel.new_package_requested.connect(self._new_package)
+        self._packages_panel.new_action_requested.connect(
+            lambda name: self._new_action(name, fixed=True))
+        self._packages_panel.new_file_requested.connect(
+            lambda name, folder: self._new_package_file(name, folder, fixed=True))
+        self._packages_panel.new_folder_requested.connect(
+            lambda name, folder: self._new_package_folder(name, folder, fixed=True))
+        self._packages_panel.rename_file_requested.connect(self._rename_package_file)
+        self._packages_panel.delete_file_requested.connect(self._delete_package_file)
+        self._packages_panel.rename_folder_requested.connect(self._rename_package_folder)
+        self._packages_panel.delete_folder_requested.connect(self._delete_package_folder)
+
+        # Jobs, Actions and Packages share one slot (§4.1). Every panel is built exactly as
+        # before — the signals above are untouched — and the wrapper only decides where
+        # they sit.
+        self._automation_panel = AutomationPanel(
+            self._jobs_panel, self._actions_panel, self._packages_panel)
         self._automation_panel.show_tab(
             load_ui_state(self._profile.name if self._profile else "")
             .get("automation_tab", "jobs"))
@@ -2011,16 +2025,43 @@ class MainWindow(QMainWindow):
                                   author=self._profile.name)
         return self._packages.package(dlg.result_package)
 
-    def _after_package_change(self, status):
+    def _after_package_change(self, status, select=None):
         # Manifests are only parsed on scan, so any structural change needs a reload
         # before anything can bind, run, or even list it.
         self._packages.reload()
         self._actions_panel.refresh()
+        # `reload` rather than `refresh`: a create may have added a package, and the picker
+        # is the only thing that knows the list.
+        self._packages_panel.reload()
+        if select:
+            self._packages_panel.select(select)
         self._set_status(status)
 
-    def _new_action(self, package_name=""):
+    def _new_package(self):
+        """Create an authored package and select it (§3.3.1).
+
+        Nothing about an authored package is special — it is exactly what a downloaded one
+        is, which is what lets something you wrote be published later without restructuring
+        it. Selecting it afterwards is the point of creating it.
+        """
+        dlg = NewPackageDialog(self._packages, parent=self)
+        if not dlg.exec():
+            return
+        try:
+            package = create_package(self._packages.directory, dlg.result_name,
+                                     author=self._profile.name,
+                                     version=dlg.result_version)
+        except ValueError as e:
+            QMessageBox.warning(self, "Can't create package", str(e))
+            return
+        self._after_package_change(f"Created package '{package.name}'",
+                                   select=package.name)
+        self._automation_panel.show_tab("packages")
+
+    def _new_action(self, package_name="", fixed=False):
         """Declare an action, creating its package and/or file first if needed (§3.3.1)."""
-        dlg = NewActionDialog(self._packages, package=package_name or None, parent=self)
+        dlg = NewActionDialog(self._packages, package=package_name or None, parent=self,
+                              fixed=fixed and bool(package_name))
         if not dlg.exec():
             return
         try:
@@ -2034,10 +2075,10 @@ class MainWindow(QMainWindow):
         self._after_package_change(f"Declared {package.name}:{dlg.result_action_id}")
         self._open_package_document(f"{package.name}/{source.name}")
 
-    def _new_package_file(self, package_name="", folder=""):
-        """Add a source file with no declaration — a helper, a library, a scratch file."""
+    def _new_package_file(self, package_name="", folder="", fixed=False):
+        """Add a file with no declaration — a helper, a library, a fixture, a README."""
         dlg = NewFileDialog(self._packages, package=package_name or None, folder=folder,
-                            parent=self)
+                            parent=self, fixed=fixed and bool(package_name))
         if not dlg.exec():
             return
         try:
@@ -2049,11 +2090,11 @@ class MainWindow(QMainWindow):
         self._after_package_change(f"Created {package.name}/{dlg.result_file}")
         self._open_package_document(f"{package.name}/{dlg.result_file}")
 
-    def _new_package_folder(self, package_name="", folder=""):
+    def _new_package_folder(self, package_name="", folder="", fixed=False):
         """Folders are organisation and nothing else: an action's file is a relative path,
         so the shape of the tree never changes what a package means."""
         dlg = NewFolderDialog(self._packages, package=package_name or None, folder=folder,
-                              parent=self)
+                              parent=self, fixed=fixed and bool(package_name))
         if not dlg.exec():
             return
         try:

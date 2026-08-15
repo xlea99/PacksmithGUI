@@ -33,9 +33,10 @@ from packsmith.gui.shell.panels.base import Panel, StubPanel
 # divider off the end, where there is nothing to separate from.
 _TABS_QSS = f"""
     QTabWidget::pane {{ border: none; border-top: 1px solid {style.BORDER}; }}
+    QTabBar {{ qproperty-drawBase: 0; }}
     QTabBar::tab {{
         background: {style.BG_PANEL}; color: {style.TEXT_MUTED};
-        padding: 4px 10px; font-size: 11px; border: none;
+        padding: 4px 6px; font-size: 11px; border: none;
         border-right: 1px solid {style.BORDER};
         border-bottom: 2px solid transparent;
     }}
@@ -75,6 +76,13 @@ class AutomationPanel(Panel):
         self._tabs = QTabWidget()
         self._tabs.setStyleSheet(_TABS_QSS)
         self._tabs.setDocumentMode(True)
+        # Share the width between them, and set it AFTER `setDocumentMode`, which turns
+        # expanding off on the way past. Without this the three tabs are sized to their own
+        # labels: they used two-thirds of a 230px sidebar and left the rest bare, and the
+        # third tab tipped the total past the panel width into scroll arrows — an overflow
+        # control for three words.
+        self._tabs.tabBar().setExpanding(True)
+        self._tabs.tabBar().setDrawBase(False)
         for key in _ORDER:
             child = self._children[key]
             child.hide_header()          # the tab already carries the name

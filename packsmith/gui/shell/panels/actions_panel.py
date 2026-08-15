@@ -26,7 +26,7 @@ from PySide6.QtWidgets import (
     QTreeWidget, QTreeWidgetItem, QAbstractItemView, QHeaderView, QMenu,
 )
 
-from packsmith.core.packages import MANIFEST_NAME, folders, source_files
+from packsmith.core.packages import MANIFEST_NAME
 from packsmith.gui.shell import icons, style
 from packsmith.gui.shell.tree import PanelTree
 from packsmith.gui.shell.panels.base import Panel, note_row
@@ -34,13 +34,6 @@ from packsmith.gui.shell.panels.base import Panel, note_row
 _ROLE_DOC = Qt.UserRole        # "<package>/<file>" for an openable source file
 _ROLE_REF = Qt.UserRole + 1    # action ref, for action rows
 _ROLE_PACKAGE = Qt.UserRole + 2
-_ROLE_FILE = Qt.UserRole + 3   # package-relative file path, for file rows
-_ROLE_FOLDER = Qt.UserRole + 4  # package-relative folder path ("" = the package root)
-
-
-def _parent_of(path: str) -> str:
-    """The containing folder of a package-relative path; "" for the package root."""
-    return path.rsplit("/", 1)[0] if "/" in path else ""
 
 
 class ActionsPanel(Panel):
@@ -48,13 +41,7 @@ class ActionsPanel(Panel):
     action_activated = Signal(str)        # action ref — opens its reference page
     document_activated = Signal(str)      # "<package>/<file>" within the packages dir
     new_action_requested = Signal(str)    # package name, or "" to choose in the dialog
-    new_file_requested = Signal(str, str)          # package (or ""), destination folder
-    new_folder_requested = Signal(str, str)        # package (or ""), parent folder
     remove_action_requested = Signal(str)          # action ref
-    rename_file_requested = Signal(str, str)       # package, file
-    delete_file_requested = Signal(str, str)       # package, file
-    rename_folder_requested = Signal(str, str)     # package, folder
-    delete_folder_requested = Signal(str, str)     # package, folder
 
     def __init__(self, package_index, parent=None):
         super().__init__("Actions", parent)
@@ -139,90 +126,9 @@ class ActionsPanel(Panel):
             child.setToolTip(0, tip)
             root.addChild(child)
 
-    # ------------------------------------------------------------------ the file layer
-    #
-    # NOT CALLED from this panel any more — kept as the seed for the Packages tab, which is
-    # where a package's files are going. Left standing rather than deleted because the
-    # thinking in it is the part worth keeping: folders read from disk so an empty one still
-    # shows, child counts rolled up every ancestor so a collapsed folder says what it hides,
-    # and a file annotated with how many actions point at it. Re-deriving that from scratch
-    # for the new layout would be work already done.
-
-    def _build_files(self, root, package):
-        files = source_files(package)
-        group = QTreeWidgetItem(["Files", str(len(files) or "")])
-        group.setForeground(0, Qt.darkGray)
-        group.setForeground(1, Qt.darkGray)
-        group.setTextAlignment(1, Qt.AlignRight | Qt.AlignVCenter)
-        group.setToolTip(0, "What's actually on disk. A file with no declaration is an "
-                            "ordinary source file, not a mistake.")
-        group.setData(0, _ROLE_PACKAGE, package.name)
-        group.setData(0, _ROLE_FOLDER, "")     # the package root, as a drop target
-        root.addChild(group)
-
-        # Folders come from disk, not from the file paths, so an empty one still shows.
-        # Sorted parents-before-children, which is what makes this single pass work.
-        nodes = {"": group}
-        for path in folders(package):
-            parent = nodes.get(_parent_of(path), group)
-            item = QTreeWidgetItem([f"{path.rsplit('/', 1)[-1]}/", ""])
-            item.setForeground(0, Qt.gray)
-            item.setForeground(1, Qt.darkGray)
-            item.setTextAlignment(1, Qt.AlignRight | Qt.AlignVCenter)
-            item.setData(0, _ROLE_PACKAGE, package.name)
-            item.setData(0, _ROLE_FOLDER, path)
-            item.setToolTip(0, f"{package.name}/{path}/\n\nOrganisation only — an action's "
-                               f"file is just a relative path.")
-            parent.addChild(item)
-            nodes[path] = item
-
-        if not files:
-            self._placeholder(group, "empty")
-
-        counts = {}
-        for name in files:
-            users = [a.action_id for a in package.actions if a.file == name]
-            if name == MANIFEST_NAME:
-                note = "manifest"
-            elif users:
-                note = f"{len(users)} action{'s' if len(users) > 1 else ''}"
-            else:
-                note = "—"
-            child = QTreeWidgetItem([name.rsplit("/", 1)[-1], note])
-            child.setForeground(1, Qt.darkGray)
-            child.setTextAlignment(1, Qt.AlignRight | Qt.AlignVCenter)
-            child.setData(0, _ROLE_DOC, f"{package.name}/{name}")
-            child.setData(0, _ROLE_PACKAGE, package.name)
-            child.setData(0, _ROLE_FILE, name)
-            tip = f"{package.name}/{name}"
-            if users:
-                tip += "\n\nimplements " + ", ".join(sorted(users))
-            elif name != MANIFEST_NAME:
-                tip += "\n\nno action points at this file"
-            child.setToolTip(0, tip)
-            nodes.get(_parent_of(name), group).addChild(child)
-            # Roll the count up every ancestor, so a collapsed folder still says how much
-            # it's hiding.
-            folder = _parent_of(name)
-            while folder:
-                counts[folder] = counts.get(folder, 0) + 1
-                folder = _parent_of(folder)
-
-        for path, item in nodes.items():
-            if path:
-                item.setText(1, str(counts[path]) if path in counts else "")
-
-        # Empty folders would otherwise look like leaves you could open.
-        for path, item in nodes.items():
-            if path and item.childCount() == 0:
-                self._placeholder(item, "empty")
-
     @staticmethod
     def _placeholder(group, text):
-        item = QTreeWidgetItem([text, ""])
-        item.setForeground(0, Qt.darkGray)
-        item.setFlags(Qt.ItemIsEnabled)
-        group.addChild(item)
+        group.addChild(note_row(text))
 
     # -------------------------------------------------- expansion state, across refreshes
 
@@ -295,16 +201,12 @@ class ActionsPanel(Panel):
                            lambda: self.document_activated.emit(document))
 
         if editable:
-            # Every create lands at the package root now. Creating *into* a folder needed a
-            # folder row to click, and those live on the Packages tab — so the choice moves
-            # there with them rather than being guessed at from an action row.
+            # Declaring an action is the one create this panel still offers, because an
+            # action is what this panel is *about*. Files and folders moved to the Packages
+            # tab along with the tree you would click to say where they go.
             menu.addSeparator()
             menu.addAction("New action…",
                            lambda: self.new_action_requested.emit(package_name))
-            menu.addAction("New file…",
-                           lambda: self.new_file_requested.emit(package_name, ""))
-            menu.addAction("New folder…",
-                           lambda: self.new_folder_requested.emit(package_name, ""))
 
         if not menu.isEmpty():
             menu.exec(self._tree.mapToGlobal(pos))

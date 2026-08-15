@@ -326,11 +326,70 @@ def test_create_file_declares_nothing(tmp_path):
 
 
 def test_create_file_rejects_bad_names(tmp_path):
+    """What is still refused: nothing, and anything that tries to leave the package.
+
+    The extension rule used to be `.star` or bust, which made a `.json` fixture or a README
+    impossible to add through the app even though a package is just a folder. The traversal
+    cases stay refused, and they are refused by the *folder* rule — no segment naming a
+    parent can pass it.
+    """
     from packsmith.core.packages import create_package, create_file
     pkg = create_package(tmp_path, "mine")
-    for bad in ("Helpers.star", "helpers", "../escape.star", "helpers.py", ""):
+    for bad in ("", "   ", "../escape.star", "..\\escape.star", "lib/../../out.star",
+                "manifest.toml"):
         with pytest.raises(ValueError):
             create_file(pkg, bad)
+
+
+def test_a_package_may_hold_files_that_are_not_starlark(tmp_path):
+    """A package is a folder on disk, and an author needs things beside their code."""
+    from packsmith.core.packages import create_package, create_file, source_files
+    pkg = create_package(tmp_path, "mine")
+    for name in ("ids.json", "README.md", "data/table.csv", "Notes.txt"):
+        create_file(pkg, name)
+    assert set(source_files(load_package(pkg.root))) == {
+        "manifest.toml", "ids.json", "README.md", "data/table.csv", "Notes.txt"}
+
+
+def test_only_starlark_files_get_the_starlark_stub(tmp_path):
+    """The boilerplate explains `load()` and the `pack` argument — right for Starlark, and
+    gibberish inside a JSON fixture (invalid JSON, at that)."""
+    from packsmith.core.packages import create_package, create_file
+    pkg = create_package(tmp_path, "mine")
+    assert create_file(pkg, "helpers.star").read_text(encoding="utf-8").strip()
+    assert create_file(pkg, "ids.json").read_text(encoding="utf-8") == ""
+
+
+def test_a_file_with_no_extension_becomes_starlark(tmp_path):
+    from packsmith.core.packages import create_package, create_file
+    pkg = create_package(tmp_path, "mine")
+    assert create_file(pkg, "helpers").name == "helpers.star"
+
+
+def test_an_actions_entry_point_must_still_be_starlark(tmp_path):
+    """The runner reads it as Starlark and `load()` addresses it, so the loose rule for
+    plain files must not reach the one file that has to be code."""
+    from packsmith.core.packages import create_package, add_action
+    pkg = create_package(tmp_path, "mine")
+    with pytest.raises(ValueError, match="invalid for an action"):
+        add_action(pkg, "thing", file="thing.json")
+
+
+def test_a_declared_file_cannot_be_renamed_out_of_starlark(tmp_path):
+    """Otherwise the manifest points at an entry point the runner cannot read — loadable
+    now, broken the moment a job runs it, far from the rename that caused it."""
+    from packsmith.core.packages import create_package, add_action, rename_file
+    pkg = create_package(tmp_path, "mine")
+    add_action(pkg, "thing", file="thing.star")
+    with pytest.raises(ValueError, match="invalid for an action"):
+        rename_file(load_package(pkg.root), "thing.star", "thing.json")
+
+
+def test_an_undeclared_file_may_be_renamed_to_anything(tmp_path):
+    from packsmith.core.packages import create_package, create_file, rename_file
+    pkg = create_package(tmp_path, "mine")
+    create_file(pkg, "notes.star")
+    assert rename_file(load_package(pkg.root), "notes.star", "notes.md").name == "notes.md"
 
 
 def test_remove_action_undeclares_but_keeps_the_file(tmp_path):

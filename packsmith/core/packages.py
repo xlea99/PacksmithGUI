@@ -245,7 +245,15 @@ SOURCE_SUFFIX = ".star"
 # Package and action names become part of a public identifier (`package:action_id`) and a
 # folder name, so keep them boring: lowercase, no spaces, no path separators.
 _NAME_RE = re.compile(r"^[a-z][a-z0-9_]*$")
-_FILE_RE = re.compile(r"^[a-z][a-z0-9_]*\.star$")
+# An action ENTRY POINT is Starlark by definition — the runner reads it as Starlark and
+# `load()` addresses it — so a file that declares one stays under the strict rule.
+_SOURCE_FILE_RE = re.compile(r"^[a-z][a-z0-9_]*\.star$")
+# Any other file a package holds. Packages are folders on disk and hold whatever an author
+# needs beside their code — a `.json` fixture, a `README.md`, a `.csv` of ids — and the
+# strict rule made every one of those impossible to create through the app. Leading
+# character must be alphanumeric, which is also what keeps `..` out; no separators survive
+# `_segments`.
+_ANY_FILE_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.\-]*$")
 
 _STUB_ACTION = '''"""{summary}
 
@@ -311,18 +319,37 @@ def _check_folder_path(path) -> str:
     return "/".join(parts)
 
 
-def _check_file_path(path) -> str:
-    """Validate a package-relative file path, returning it normalised to posix."""
+def check_file_path(path, *, entry_point: bool = False) -> str:
+    """Validate a package-relative file path, returning it normalised to posix.
+
+    A name with no extension gains ``.star``, because that is what a package is mostly
+    made of and typing `helpers` and getting `helpers` — a file no editor knows how to
+    open — is never what anyone meant.
+
+    ``entry_point=True`` applies the stricter rule an action's ``file`` must satisfy: the
+    runner reads it as Starlark, so it has to actually be one.
+    """
     parts = _segments(path)
     if not parts:
         raise ValueError("A file needs a name")
     if len(parts) > 1:
         _check_folder_path("/".join(parts[:-1]))
-    if not _FILE_RE.match(parts[-1]):
+    name = parts[-1]
+    if "." not in name:
+        name += SOURCE_SUFFIX
+    if entry_point:
+        if not _SOURCE_FILE_RE.match(name):
+            raise ValueError(
+                f"File name '{name}' is invalid for an action — use lowercase letters, "
+                f"digits and underscores, starting with a letter, ending in "
+                f"{SOURCE_SUFFIX}")
+    elif not _ANY_FILE_RE.match(name) or name == MANIFEST_NAME:
         raise ValueError(
-            f"File name '{parts[-1]}' is invalid — use lowercase letters, digits and "
-            f"underscores, starting with a letter, ending in {SOURCE_SUFFIX}")
-    return "/".join(parts)
+            f"File name '{name}' is invalid — start with a letter, digit or underscore, "
+            f"and use no path separators"
+            if name != MANIFEST_NAME else
+            "manifest.toml is the package definition and can't be created by hand")
+    return "/".join(parts[:-1] + [name])
 
 
 def _require_authored(package: Package):
@@ -375,7 +402,7 @@ def add_action(package: Package, action_id: str, *, file: str = None, name: str 
     if any(a.action_id == action_id for a in package.actions):
         raise ValueError(f"'{package.name}' already declares an action '{action_id}'")
 
-    file_name = _check_file_path(file or f"{action_id}{SOURCE_SUFFIX}")
+    file_name = check_file_path(file or f"{action_id}{SOURCE_SUFFIX}", entry_point=True)
     clash = next((a for a in package.actions
                   if a.file == file_name and a.function == function), None)
     if clash is not None:
@@ -449,20 +476,25 @@ def folders(package: Package) -> list[str]:
 
 
 def create_file(package: Package, file_name: str, *, description: str = "") -> Path:
-    """Add a source file to a package without declaring anything.
+    """Add a file to a package without declaring anything.
 
     This is the operation that was previously impossible: the only way to get a file was to
     declare an action and then hand-edit the declaration back out.
+
+    **Only a ``.star`` file gets a stub.** The boilerplate explains `load()` and the `pack`
+    argument, which is exactly right for Starlark and gibberish inside a `.json` fixture or
+    a `README.md` — so anything else is created empty and left to the author.
     """
     _require_authored(package)
-    file_name = _check_file_path(file_name)
+    file_name = check_file_path(file_name)
     target = package.root / file_name
     if target.exists():
         raise ValueError(f"{file_name} already exists in '{package.name}'")
     target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(_STUB_SOURCE.format(
+    body = _STUB_SOURCE.format(
         summary=description or f"Helpers for {package.name}.",
-        manifest=MANIFEST_NAME, path=file_name), encoding="utf-8")
+        manifest=MANIFEST_NAME, path=file_name) if file_name.endswith(SOURCE_SUFFIX) else ""
+    target.write_text(body, encoding="utf-8")
     return target
 
 
@@ -523,7 +555,11 @@ def rename_file(package: Package, file_name: str, new_name: str) -> Path:
     file_name = _normalise(file_name)
     if file_name == MANIFEST_NAME:
         raise ValueError("The manifest can't be renamed.")
-    new_name = _check_file_path(new_name)
+    # A declared file must stay a Starlark file. Renaming `nuke.star` to `nuke.json` would
+    # leave a manifest pointing at an entry point the runner cannot read — loadable now,
+    # broken at the moment a job runs it, which is the failure this rule exists to prevent.
+    declared = _declared_under(package, file_name, exact=True)
+    new_name = check_file_path(new_name, entry_point=bool(declared))
     source = package.root / file_name
     target = package.root / new_name
     if not source.is_file():

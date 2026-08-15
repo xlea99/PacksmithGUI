@@ -23,7 +23,8 @@ from PySide6.QtWidgets import (
     QMessageBox,
 )
 
-from packsmith.core.packages import MANIFEST_NAME, SOURCE_SUFFIX, folders, source_files
+from packsmith.core.packages import (
+    MANIFEST_NAME, SOURCE_SUFFIX, check_file_path, folders, source_files)
 from packsmith.gui.shell import style
 
 _NEW_PACKAGE = "New package…"
@@ -38,22 +39,92 @@ def _hint(text):
     return label
 
 
-class _PackageChooser(QDialog):
-    """Shared base: pick an authored package, or create one inline."""
+class NewPackageDialog(QDialog):
+    """Create an authored package. A name, and optionally a version.
 
-    def __init__(self, package_index, title, package=None, parent=None):
+    Nothing more, because nothing more is load-bearing: §3.3.1 makes authored and
+    downloaded packages structurally identical, so everything else in a manifest — author,
+    description, the actions themselves — is filled in later by the surfaces that own it.
+    A wizard demanding all of it up front would be asking for decisions before there is
+    anything to decide about.
+    """
+
+    def __init__(self, package_index, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("New Package")
+        self.setMinimumWidth(420)
+        self._index = package_index
+        self.result_name = ""
+        self.result_version = ""
+
+        root = QVBoxLayout(self)
+        root.setSpacing(8)
+        form = QFormLayout()
+        form.setSpacing(6)
+
+        self._name = QLineEdit()
+        self._name.setPlaceholderText("my_pack")
+        form.addRow("Name", self._name)
+
+        self._version = QLineEdit()
+        self._version.setPlaceholderText("0.1.0")
+        form.addRow("Version", self._version)
+
+        root.addLayout(form)
+        root.addWidget(_hint(
+            "Lowercase letters, digits and underscores — the name becomes a folder and the "
+            "first half of every action ref this package declares (my_pack:do_thing), so it "
+            "is awkward to change later. Version is optional and only matters when you "
+            "share it."))
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        root.addWidget(buttons)
+
+    def accept(self):
+        name = self._name.text().strip()
+        if not name:
+            QMessageBox.warning(self, "Name required", "The package needs a name.")
+            self._name.setFocus()
+            return
+        if name in self._index.packages:
+            QMessageBox.warning(self, "Name taken",
+                                f"A package named '{name}' already exists.")
+            self._name.setFocus()
+            self._name.selectAll()
+            return
+        self.result_name = name
+        self.result_version = self._version.text().strip() or "0.1.0"
+        QDialog.accept(self)
+
+
+class _PackageChooser(QDialog):
+    """Shared base: pick an authored package, or create one inline.
+
+    ``fixed=True`` drops the package half entirely, for a surface that already knows which
+    package it is working in. That is not a cosmetic saving — a dropdown offering a choice
+    the surrounding panel has already made is a second answer to the same question, and the
+    two can disagree.
+    """
+
+    def __init__(self, package_index, title, package=None, parent=None, fixed=False):
         super().__init__(parent)
         self.setWindowTitle(title)
         self.setMinimumWidth(460)
         self._index = package_index
+        self._fixed = fixed
 
-        self.result_package = None       # existing package name, or None if creating
+        self.result_package = package if fixed else None
         self.result_new_package = None   # name to create, or None
 
         self._root = QVBoxLayout(self)
         self._root.setSpacing(8)
         self._form = QFormLayout()
         self._form.setSpacing(6)
+
+        if fixed:
+            self._package = None
+            return
 
         # Only authored packages can gain anything — you may extend what you wrote, not
         # what you installed.
@@ -83,18 +154,23 @@ class _PackageChooser(QDialog):
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
         self._root.addWidget(buttons)
-        self._package.currentTextChanged.connect(self._on_package_changed)
+        if self._package is not None:
+            self._package.currentTextChanged.connect(self._on_package_changed)
         self._on_package_changed()
 
     def _creating_package(self) -> bool:
-        return self._package.currentText() == _NEW_PACKAGE
+        return not self._fixed and self._package.currentText() == _NEW_PACKAGE
 
     def _current_package(self):
+        if self._fixed:
+            return self._index.package(self.result_package)
         if self._creating_package():
             return None
         return self._index.package(self._package.currentText())
 
     def _on_package_changed(self):
+        if self._fixed:
+            return
         creating = self._creating_package()
         self._new_package.setVisible(creating)
         self._new_package_label.setVisible(creating)
@@ -102,6 +178,8 @@ class _PackageChooser(QDialog):
 
     def _resolve_package(self) -> bool:
         """Validate the package half. Returns False when it should keep the dialog open."""
+        if self._fixed:
+            return True
         if self._creating_package():
             name = self._new_package.text().strip()
             if not name:
@@ -125,8 +203,8 @@ class NewActionDialog(_PackageChooser):
     On accept the ``result_*`` attributes describe what to build; the caller does the
     writing."""
 
-    def __init__(self, package_index, package=None, parent=None):
-        super().__init__(package_index, "New Action", package, parent)
+    def __init__(self, package_index, package=None, parent=None, fixed=False):
+        super().__init__(package_index, "New Action", package, parent, fixed=fixed)
 
         self.result_action_id = ""
         self.result_file = None          # existing file to declare into, or None
@@ -182,8 +260,12 @@ class NewActionDialog(_PackageChooser):
     def _on_package_changed(self):
         super()._on_package_changed()
         package = self._current_package()
+        # Only Starlark files can hold an entry point, so only those are offered. A package
+        # may now hold a `ids.json` beside its code, and listing it here would let you
+        # declare an action against a file the runner cannot read.
         names = [] if package is None else [
-            n for n in source_files(package) if n != MANIFEST_NAME]
+            n for n in source_files(package)
+            if n != MANIFEST_NAME and n.endswith(SOURCE_SUFFIX)]
         self._file.blockSignals(True)
         self._file.clear()
         self._file.addItems(names)
@@ -298,8 +380,9 @@ class _DestinationChooser(_PackageChooser):
     an action's ``file`` is just a relative path — so this is a plain prefix, not a
     namespace."""
 
-    def __init__(self, package_index, title, package=None, folder="", parent=None):
-        super().__init__(package_index, title, package, parent)
+    def __init__(self, package_index, title, package=None, folder="", parent=None,
+                 fixed=False):
+        super().__init__(package_index, title, package, parent, fixed=fixed)
         self._preferred_folder = folder
         self._folder = QComboBox()
         self._folder.setToolTip("Where in the package to put it. Purely organisational.")
@@ -337,8 +420,8 @@ class NewFileDialog(_DestinationChooser):
     had to be smuggled in as an action and then hand-undeclared.
     """
 
-    def __init__(self, package_index, package=None, folder="", parent=None):
-        super().__init__(package_index, "New File", package, folder, parent)
+    def __init__(self, package_index, package=None, folder="", parent=None, fixed=False):
+        super().__init__(package_index, "New File", package, folder, parent, fixed=fixed)
 
         self.result_file = ""
 
@@ -347,9 +430,10 @@ class NewFileDialog(_DestinationChooser):
         self._form.addRow("File name", self._file)
 
         self._finish(
-            f"A plain {SOURCE_SUFFIX} file with no manifest entry. Nothing in it runs "
-            f"until an action points at one of its functions — declare one whenever "
-            f"you're ready, or leave it as shared code.")
+            f"Dumb file creation — no manifest entry, no declaration. Give it whatever "
+            f"extension you need ({SOURCE_SUFFIX} if you leave it off); a package is a "
+            f"folder and can hold a fixture or a README beside its code. A new "
+            f"{SOURCE_SUFFIX} file gets a starter stub, anything else is created empty.")
 
     def accept(self):
         file_name = self._file.text().strip()
@@ -357,13 +441,24 @@ class NewFileDialog(_DestinationChooser):
             QMessageBox.warning(self, "Name required", "The file needs a name.")
             self._file.setFocus()
             return
-        if not file_name.endswith(SOURCE_SUFFIX):
-            file_name += SOURCE_SUFFIX
+        # No extension appended here. `_check_file_path` defaults it to .star, and doing it
+        # in two places is how the dialog and the store end up disagreeing about what got
+        # created.
 
         if not self._resolve_package():
             return
 
-        path = self._qualified(file_name)
+        # Normalised by the STORE's own rule, so the name checked for a clash below is the
+        # name that will actually be created — `helpers` and `helpers.star` are the same
+        # file, and a check on the raw text would miss that.
+        try:
+            path = check_file_path(self._qualified(file_name))
+        except ValueError as e:
+            QMessageBox.warning(self, "Invalid name", str(e))
+            self._file.setFocus()
+            self._file.selectAll()
+            return
+
         package = self._current_package()
         if package is not None and path in source_files(package):
             QMessageBox.warning(self, "File exists",
@@ -379,8 +474,8 @@ class NewFileDialog(_DestinationChooser):
 class NewFolderDialog(_DestinationChooser):
     """Create an empty folder inside a package, for organisation only."""
 
-    def __init__(self, package_index, package=None, folder="", parent=None):
-        super().__init__(package_index, "New Folder", package, folder, parent)
+    def __init__(self, package_index, package=None, folder="", parent=None, fixed=False):
+        super().__init__(package_index, "New Folder", package, folder, parent, fixed=fixed)
 
         self.result_folder = ""
 
@@ -450,7 +545,14 @@ class RenameFileDialog(QDialog):
         if not name:
             QMessageBox.warning(self, "Name required", "It needs a name.")
             return
-        if not self._is_folder and not name.endswith(SOURCE_SUFFIX):
-            name += SOURCE_SUFFIX
+        if not self._is_folder:
+            # Only when there is no extension AT ALL. Appending whenever the name doesn't
+            # end in `.star` turned `ids.json` into `ids.json.star`, which was harmless
+            # while every file had to be Starlark and is now just wrong.
+            try:
+                name = check_file_path(name)
+            except ValueError as e:
+                QMessageBox.warning(self, "Invalid name", str(e))
+                return
         self.result_name = name
         QDialog.accept(self)
