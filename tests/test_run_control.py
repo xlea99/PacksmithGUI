@@ -231,7 +231,10 @@ def test_both_panels_share_the_slot(automation):
     panel, jobs, actions = automation
     assert panel.panel("jobs") is jobs
     assert panel.panel("actions") is actions
-    assert panel._tabs.count() == 2
+    # Three: Packages joined them, and it builds its own placeholder rather than being
+    # passed in — there is nothing to wire to a stub.
+    assert panel._tabs.count() == 3
+    assert panel.panel("packages") is not None
 
 
 def test_jobs_is_the_default_tab(automation):

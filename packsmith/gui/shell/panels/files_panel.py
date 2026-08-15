@@ -112,6 +112,7 @@ class FilesPanel(Panel):
         self.body().addWidget(legend)
 
         self._tree = PanelTree()
+        icons.follow_expansion(self._tree)
         self._tree.setHeaderHidden(True)
         self._tree.setSelectionMode(QAbstractItemView.SingleSelection)
         self._tree.setStyleSheet(style.LIST_QSS)
@@ -251,7 +252,7 @@ class FilesPanel(Panel):
             item.setData(0, _ROLE_IS_DIR, entry.is_dir())
             if entry.is_dir():
                 item.setData(0, _ROLE_LOADED, False)
-                item.setIcon(0, icons.file_icon(entry.name, True, colour=style.TEXT))
+                icons.set_folder_icon(item, colour=style.TEXT)
                 item.addChild(QTreeWidgetItem(["…"]))   # placeholder so it shows an arrow
             else:
                 self._style_file(item, rel)

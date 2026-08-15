@@ -278,3 +278,65 @@ def test_the_nudge_and_the_fill_are_still_compatible(qapp):
     headroom = height - ink
     assert headroom / 2 > icons.GLYPH_NUDGE * height, \
         "the nudge is larger than the room the fill leaves for it"
+
+
+# --- folders that open with their row ------------------------------------------------
+
+def test_a_folder_row_swaps_its_icon_on_expansion(qapp):
+    """Files, jar contents and View groups all use this. A shut folder sitting directly
+    above its own visible contents is a small lie the eye catches before the mind does."""
+    from PySide6.QtWidgets import QTreeWidget, QTreeWidgetItem
+    from packsmith.gui.shell import style
+
+    tree = QTreeWidget()
+    icons.follow_expansion(tree)
+    folder = QTreeWidgetItem(["stuff"])
+    tree.addTopLevelItem(folder)
+    folder.addChild(QTreeWidgetItem(["inside"]))
+    icons.set_folder_icon(folder, colour=style.TEXT)
+
+    shut = folder.icon(0).cacheKey()
+    folder.setExpanded(True)
+    assert folder.icon(0).cacheKey() != shut, "the folder stayed shut while open"
+    folder.setExpanded(False)
+    assert folder.icon(0).cacheKey() == shut
+    tree.deleteLater()
+
+
+def test_rows_without_the_pair_are_left_alone(qapp):
+    """The handler runs for every expansion in the tree, and a tree mixes folders with
+    everything else — a plain row must not lose its icon to it."""
+    from PySide6.QtWidgets import QTreeWidget, QTreeWidgetItem
+    from packsmith.gui.shell import style
+
+    tree = QTreeWidget()
+    icons.follow_expansion(tree)
+    plain = QTreeWidgetItem(["not a folder"])
+    tree.addTopLevelItem(plain)
+    plain.addChild(QTreeWidgetItem(["child"]))
+    plain.setIcon(0, icons.file_icon("thing.json", colour=style.TEXT))
+
+    before = plain.icon(0).cacheKey()
+    plain.setExpanded(True)
+    assert plain.icon(0).cacheKey() == before
+    tree.deleteLater()
+
+
+def test_the_pair_can_be_any_two_glyphs(qapp):
+    """Views groups use folder-simple rather than the Files panel's notched folder — the
+    tree-level handler knows nothing about which, because the pair lives on the item."""
+    from PySide6.QtWidgets import QTreeWidget, QTreeWidgetItem
+    from packsmith.gui.shell import style
+
+    tree = QTreeWidget()
+    icons.follow_expansion(tree)
+    item = QTreeWidgetItem(["group"])
+    tree.addTopLevelItem(item)
+    item.addChild(QTreeWidgetItem(["child"]))
+    icons.set_expanding_icon(item, icons.ui("group"), icons.ui("group_open"),
+                             colour=style.TEXT_MUTED)
+
+    shut = item.icon(0).cacheKey()
+    item.setExpanded(True)
+    assert item.icon(0).cacheKey() != shut
+    tree.deleteLater()

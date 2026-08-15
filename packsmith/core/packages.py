@@ -581,6 +581,35 @@ def _defines(source: str, function: str) -> bool:
     return re.search(rf"^def\s+{re.escape(function)}\s*\(", source, re.M) is not None
 
 
+def function_source(package: Package, file_name: str, function: str) -> str | None:
+    """The text of one top-level function, or None if it isn't there.
+
+    Cut by **indentation**, which is the whole of Starlark's block structure: from the
+    ``def`` line, keep every following line that is blank or indented, and stop at the first
+    line that starts in column zero. There is no decorator or nesting case to worry about —
+    the language has neither, and an action entry point is top-level by definition.
+
+    Returning None is a real answer worth surfacing rather than an error to swallow: a
+    manifest can name a function its file does not define, and that package loads fine and
+    fails at run time, far from the mistake. Somewhere that says so is the point.
+    """
+    path = Path(package.root) / file_name
+    if not path.is_file():
+        return None
+    lines = path.read_text(encoding="utf-8").splitlines()
+    start = next((i for i, line in enumerate(lines)
+                  if re.match(rf"def\s+{re.escape(function)}\s*\(", line)), None)
+    if start is None:
+        return None
+    end = start + 1
+    while end < len(lines) and (not lines[end].strip() or lines[end][:1].isspace()):
+        end += 1
+    # Trailing blank lines belong to the gap after the function, not to the function.
+    while end > start + 1 and not lines[end - 1].strip():
+        end -= 1
+    return "\n".join(lines[start:end])
+
+
 def _manifest_blocks(text: str) -> list[list[str]]:
     """Split a manifest into chunks, each starting at a table header. Trailing blank lines
     stay with the block above them, which is what makes block removal leave tidy text."""

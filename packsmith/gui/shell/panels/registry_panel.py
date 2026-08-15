@@ -17,6 +17,11 @@ group if a pack somehow has no namespaces at all.
 fresh profile starts with `minecraft:item` and `minecraft:entity_type` pinned, because on
 an empty profile those are what anybody opens first and an empty shortcut list teaches
 nobody that the feature exists.
+
+**Filtering** is the third way in, and the three are not redundant: pins are for the ones
+you always want, groups are for browsing by mod, and the box is for when you know roughly
+what the thing is called. 135 rows behind collapsed namespaces means the answer to "where
+does `worldgen/biome` live" is otherwise a guessing game about which prefix owns it.
 """
 from PySide6.QtCore import QSize, Qt, Signal
 from PySide6.QtGui import QColor
@@ -25,7 +30,7 @@ from PySide6.QtWidgets import (
 
 from packsmith.gui.shell import style
 from packsmith.gui.shell.tree import PanelTree
-from packsmith.gui.shell.panels.base import Panel
+from packsmith.gui.shell.panels.base import Panel, SearchBox, note_row
 
 SEPARATOR_ROLE = Qt.UserRole + 1
 
@@ -84,6 +89,14 @@ class RegistryPanel(Panel):
         # Which groups are open, remembered across refreshes. Pinned starts open: a
         # shortcut list you have to expand to see is not a shortcut.
         self._opened = {self.PINNED_LABEL}
+        # Whether what is currently ON SCREEN was filtered. Load-bearing, not bookkeeping:
+        # a filtered tree is force-expanded, so harvesting `_opened` from it would record
+        # every namespace as open and quietly destroy the arrangement the moment you typed.
+        self._filtered = False
+
+        self._search = SearchBox("registries")
+        self._search.textChanged.connect(self.refresh)
+        self.body().addWidget(self._search)
 
         self._tree = _RegistryTree()
         self._tree.setColumnCount(2)
@@ -115,17 +128,20 @@ class RegistryPanel(Panel):
         self._packdump = packdump
         self.refresh()
 
-    def refresh(self):
+    def refresh(self, *_):
+        needle = self._search.needle()
         # Which groups were open is remembered across a refresh: this runs on packdump
         # adopt, and collapsing everything you had open is a strange thing for an import
         # to do to you. Only re-read it from a tree that has rows — on the first build
-        # there is nothing to read, and the constructor's default would be wiped.
-        if self._tree.topLevelItemCount():
+        # there is nothing to read, and the constructor's default would be wiped — and
+        # never from a filtered one, which is force-expanded and would report everything.
+        if self._tree.topLevelItemCount() and not self._filtered:
             self._opened = self._opened_namespaces()
+        self._filtered = bool(needle)
         self._tree.clear()
         registries = self._packdump.registry or {}
 
-        pinned = self._add_pinned(registries)
+        pinned = self._add_pinned(registries, needle)
 
         groups = {}
         for reg_type in sorted(registries):
@@ -135,7 +151,21 @@ class RegistryPanel(Panel):
             groups.setdefault(namespace, []).append((reg_type, short))
 
         for namespace in sorted(groups):
+            # Matched against the FULL id, not the short name. `minecraft:item` is what the
+            # thing is called, and the split into group and row is this panel's idea rather
+            # than the registry's — so typing `minecraft:i` has to work even though no row
+            # on screen carries that text. A namespace match keeps all of its registries.
             rows = groups[namespace]
+            if needle and needle not in namespace.lower():
+                rows = [(t, s) for t, s in rows if needle in t.lower()]
+                if not rows:
+                    continue
+            # Summed over the rows SHOWN, unlike the Blueprints panel's count, which keeps
+            # reporting the whole schema while filtered. The difference is what the number
+            # describes: a blueprint is an artifact and "5 × 10" is a fact about it, where
+            # a namespace is a grouping this panel invented and its number is just the sum
+            # of what sits under it. Showing 23,058 above a single visible 120 would be
+            # arithmetic that does not add up on screen.
             total = sum(len(registries[t].get("values", [])) for t, _ in rows)
             parent = self._row(namespace, total)
             kinds = "registry" if len(rows) == 1 else "registries"
@@ -153,9 +183,14 @@ class RegistryPanel(Panel):
                 self._make_ruled(parent)
                 pinned = False                            # only the first one gets it
             self._tree.addTopLevelItem(parent)
-            parent.setExpanded(namespace in self._opened)
+            # Force-open while filtering: a match hidden inside a collapsed namespace is a
+            # search that answers "somewhere in `quark`", which is the question you asked.
+            parent.setExpanded(True if needle else namespace in self._opened)
 
-    def _add_pinned(self, registries) -> bool:
+        if needle and not self._tree.topLevelItemCount():
+            self._tree.addTopLevelItem(note_row("No registry matches that"))
+
+    def _add_pinned(self, registries, needle="") -> bool:
         """The shortcut section, above the alphabet. True if one was drawn.
 
         Pinned entries are shown *as well as* in their namespace rather than moved out of
@@ -166,8 +201,14 @@ class RegistryPanel(Panel):
         A pin whose registry the pack no longer has is skipped, not dropped. Mods come and
         go across packdump imports, and silently forgetting the pin would mean reinstalling
         a mod doesn't bring its shortcut back.
+
+        The section is filtered like everything else. A shortcut list that ignored your
+        search would leave `minecraft:item` sitting at the top while you looked for
+        `biome` — the one row on screen that is not an answer, in the position the eye goes
+        to first.
         """
-        present = [t for t in self._pins if t in registries]
+        present = [t for t in self._pins if t in registries
+                   and (not needle or needle in t.lower())]
         if not present:
             return False
         total = sum(len(registries[t].get("values", [])) for t in present)
@@ -178,7 +219,7 @@ class RegistryPanel(Panel):
             child.setToolTip(0, f"{reg_type} — pinned")
             section.addChild(child)
         self._tree.addTopLevelItem(section)
-        section.setExpanded(self.PINNED_LABEL in self._opened)
+        section.setExpanded(bool(needle) or self.PINNED_LABEL in self._opened)
         return True
 
     # --- pinning ---------------------------------------------------------------------------

@@ -6,9 +6,49 @@ states plainly that it isn't built and describes what will live there. That hone
 deliberate: a skeleton that looks finished lies to you about progress.
 """
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QWidget, QVBoxLayout, QLabel
+from PySide6.QtWidgets import QWidget, QVBoxLayout, QLabel, QLineEdit, QTreeWidgetItem
 
 from packsmith.gui.shell import style
+
+
+def note_row(text: str, columns: int = 2) -> QTreeWidgetItem:
+    """A row that explains why a tree is empty rather than leaving you to guess.
+
+    Enabled but **not selectable**: it is a sentence, not a thing you can act on, and a
+    message you can highlight invites a double-click that does nothing.
+    """
+    item = QTreeWidgetItem([text] + [""] * (columns - 1))
+    item.setForeground(0, style.qt_colour(style.TEXT_FAINT))
+    item.setFlags(Qt.ItemIsEnabled)
+    return item
+
+
+class SearchBox(QLineEdit):
+    """The one-line filter a panel grows once its list stops fitting on screen.
+
+    Shared rather than copied because it is the same gesture in every panel, and a filter
+    box that looks or behaves subtly differently from panel to panel is worse than no
+    filter at all — the sidebar is one surface you switch between, not five.
+
+    Deliberately **not** the query bar (§3.2.3). That one parses a language, reports errors
+    and can be folded into a View; this is a substring, and pretending otherwise would put
+    two things that look alike and behave differently in the same app.
+    """
+
+    def __init__(self, noun: str, parent=None):
+        super().__init__(parent)
+        self.setPlaceholderText(f"Search {noun}…")
+        self.setStyleSheet(f"""
+            QLineEdit {{
+                background: {style.BG_DEEP}; color: {style.TEXT};
+                border: 1px solid {style.BORDER}; margin: 0 6px 4px 6px;
+                padding: 3px 6px; font-size: 11px;
+            }}
+        """)
+
+    def needle(self) -> str:
+        """What to match against — trimmed and folded, or "" for no filter."""
+        return self.text().strip().lower()
 
 
 class PanelHeader(QLabel):

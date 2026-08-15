@@ -2,7 +2,9 @@ from PySide6.QtWidgets import QStyledItemDelegate, QLineEdit, QStyle, QApplicati
 from PySide6.QtCore import Qt, QModelIndex, QRegularExpression
 from PySide6.QtGui import QPainter, QPalette, QColor, QRegularExpressionValidator
 
-from packsmith.gui.table.cells.ownership import paint_ownership_bar
+from packsmith.gui.table.cells.ownership import (
+    paint_ownership_bar, paint_row_rule, paint_column_rule,
+    EMPTY, EMPTY_ALIGN, EMPTY_COLOR, INSET)
 
 
 class NumCellDelegate(QStyledItemDelegate):
@@ -18,18 +20,20 @@ class NumCellDelegate(QStyledItemDelegate):
         style = QApplication.style()
         style.drawPrimitive(QStyle.PE_PanelItemViewItem, option, painter)
         paint_ownership_bar(painter, option, index)
+        paint_row_rule(painter, option)
+        paint_column_rule(painter, option)
 
         value = index.data(Qt.DisplayRole) or ""
 
         painter.save()
 
-        text_rect = option.rect.adjusted(6, 0, -6, 0)
+        text_rect = option.rect.adjusted(INSET, 0, -INSET, 0)
         if value:
             painter.setPen(option.palette.color(QPalette.Text))
             painter.drawText(text_rect, Qt.AlignRight | Qt.AlignVCenter, value)
         else:
-            painter.setPen(QColor("#555555"))
-            painter.drawText(text_rect, Qt.AlignRight | Qt.AlignVCenter, "----")
+            painter.setPen(EMPTY_COLOR)
+            painter.drawText(option.rect, EMPTY_ALIGN, EMPTY)
 
         painter.restore()
 

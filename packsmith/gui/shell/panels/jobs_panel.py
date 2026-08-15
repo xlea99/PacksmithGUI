@@ -25,7 +25,7 @@ from PySide6.QtWidgets import (
 
 from packsmith.gui.shell import icons, style
 from packsmith.gui.shell.tree import PanelTree
-from packsmith.gui.shell.panels.base import Panel
+from packsmith.gui.shell.panels.base import Panel, SearchBox
 
 _ROLE_JOB = Qt.UserRole
 
@@ -65,15 +65,7 @@ class JobsPanel(Panel):
         bar_lay.addStretch()
         self.body().addWidget(bar)
 
-        self._search = QLineEdit()
-        self._search.setPlaceholderText("Search jobs…")
-        self._search.setStyleSheet(f"""
-            QLineEdit {{
-                background: {style.BG_DEEP}; color: {style.TEXT};
-                border: 1px solid {style.BORDER}; margin: 0 6px 4px 6px;
-                padding: 3px 6px; font-size: 11px;
-            }}
-        """)
+        self._search = SearchBox("jobs")
         self._search.textChanged.connect(self.refresh)
         self.body().addWidget(self._search)
 

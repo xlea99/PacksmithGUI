@@ -39,6 +39,7 @@ class QueryBar(QWidget):
 
     filter_changed = Signal(object)     # a filter AST node, or None for "no refinement"
     keep_requested = Signal(object)     # fold this refinement into the view's own query
+    help_requested = Signal()           # the label was clicked — open the guide
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -48,6 +49,23 @@ class QueryBar(QWidget):
         lay = QHBoxLayout(self)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(6)
+
+        # A label that is also the way in to the guide.
+        #
+        # It earns its place twice over: the box needs *naming* — an unlabelled text field
+        # beside a table could be a search, a path, or a name — and the language behind it
+        # has more in it than anyone will guess from a placeholder. The question cursor is
+        # the whole affordance; a separate ? button would be another piece of chrome
+        # competing with the Keep button for the same strip.
+        self._label = QLabel("Filter")
+        self._label.setCursor(Qt.WhatsThisCursor)
+        self._label.setToolTip("How to write a filter")
+        self._label.setStyleSheet(f"""
+            QLabel {{ color: {style.TEXT_MUTED}; font-size: 11px; padding: 0 2px; }}
+            QLabel:hover {{ color: {style.ACCENT_EDGE}; }}
+        """)
+        self._label.mousePressEvent = self._on_label_clicked
+        lay.addWidget(self._label)
 
         self._input = QLineEdit()
         self._input.setPlaceholderText(_PLACEHOLDER)
@@ -89,6 +107,10 @@ class QueryBar(QWidget):
         self._timer.timeout.connect(self._apply)
 
     # --- typing ------------------------------------------------------------
+
+    def _on_label_clicked(self, event):
+        if event.button() == Qt.LeftButton:
+            self.help_requested.emit()
 
     def _on_typed(self, _text):
         # Parse on every keystroke (cheap, and it's what turns the error red immediately);
@@ -158,6 +180,18 @@ class QueryBar(QWidget):
         """Show an AST as text — the printer half of the round trip, used when something
         other than typing changes the refinement."""
         self._input.setText(format(node))
+        self._apply()
+
+    def set_text(self, text: str):
+        """Put text in the bar and apply it now, without waiting for the debounce.
+
+        Signals are blocked while setting so the timer never starts: this is restoring a
+        refinement the user already made, not typing, and letting it fall through the
+        debounce would apply the same filter twice.
+        """
+        self._input.blockSignals(True)
+        self._input.setText(text or "")
+        self._input.blockSignals(False)
         self._apply()
 
     def clear(self):

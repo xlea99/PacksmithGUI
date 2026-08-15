@@ -1,6 +1,6 @@
 import dataclasses
 
-from PySide6.QtCore import Qt, QAbstractTableModel
+from PySide6.QtCore import Qt, QAbstractTableModel, Signal
 from PySide6.QtGui import QColor
 
 from packsmith.gui.table.edit_commands import EditStack, TagEditCommand
@@ -13,6 +13,12 @@ from packsmith.gui.shell import style
 # pristine-with-default apart from an owned value, and to tint user vs. action.
 OwnershipRole = Qt.UserRole + 1
 
+# Every role `data()` can answer. A frozenset so the check is one hash lookup — it runs
+# more often than anything else in the table.
+_HANDLED_ROLES = frozenset({
+    Qt.DisplayRole, Qt.ForegroundRole, Qt.TextAlignmentRole, OwnershipRole,
+})
+
 
 class RegistryTableModel(QAbstractTableModel):
     """A table model driven by a **query** (design 3.2.4): a View *is* a query, rendered.
@@ -24,10 +30,17 @@ class RegistryTableModel(QAbstractTableModel):
     (registry_type, entry_id, tag_name) — the entry_id the engine attached to each row is
     exactly what makes write-back possible.
 
-    Re-evaluation is deliberately NOT done on every in-table edit (that live filter-churn
-    is a later feature). A single edit patches its own cell; ``reevaluate()`` (a full reset)
-    is called after a discrete external change such as an action run.
+    Re-evaluation is deliberately NOT done on every in-table edit: the row you just edited
+    would vanish from under your cursor in a view whose filter it no longer matches. A
+    single edit patches its own cell instead, and ``tags_written`` tells the window that
+    every OTHER open view is now out of date — see `MainWindow._on_tags_written`.
     """
+
+    # An L2 write happened here. Not "this cell changed" — `dataChanged` already says that
+    # — but "the store moved", which is the fact other views need and cannot otherwise
+    # learn: each model caches its rows at evaluate time and would go on showing a value
+    # that is no longer in the database.
+    tags_written = Signal()
 
     def __init__(self, query, packdump, tag_store, confirm_takeover=None):
         super().__init__()
@@ -40,12 +53,14 @@ class RegistryTableModel(QAbstractTableModel):
         self._confirm_takeover = confirm_takeover
         self._registry_type = query.scope.type
         self._edit_stack = EditStack(tag_store)
+        self._ownership = {}      # tag_name -> {entry_id: ownership}; see _ownership_of
         self._result = None
         self._evaluate()
 
     # --- data source -------------------------------------------------------
 
     def _evaluate(self):
+        self._ownership.clear()
         self._result = evaluate(self._query, packdump=self._packdump, tag_store=self._tag_store)
 
     def reevaluate(self):
@@ -209,15 +224,70 @@ class RegistryTableModel(QAbstractTableModel):
         return len(self._result.columns)
 
     def headerData(self, section, orientation, role=Qt.DisplayRole):
+        if role == Qt.TextAlignmentRole and orientation == Qt.Horizontal:
+            # **All headers left**, regardless of what their column's values do.
+            #
+            # Matching each header to its own column's alignment sounds right and looks
+            # restless: a row of labels stepping left, centre, right by type reads as an
+            # accident. Uniform wins, and left beats centre because a header is bound to
+            # its column by *proximity to the content* — which is hardest to maintain on
+            # wide columns, exactly where centring strands the label in open space.
+            #
+            # The cost is a narrow centred column like a bool, where the label sits off to
+            # one side of its checkboxes. At 120px that is a smaller wrongness than
+            # `LOCALIZATION` floating 100px from the names it labels.
+            return Qt.AlignLeft | Qt.AlignVCenter
         if role != Qt.DisplayRole:
             return None
         if orientation == Qt.Horizontal:
             return self._result.columns[section].name
         return str(section + 1)
 
+    def _ownership_of(self, tag_name: str) -> dict:
+        """`{entry_id: ownership}` for one tag, loaded once and held.
+
+        This was a `get_ownership` call — one SQLite query — **per cell, per repaint**.
+        Every delegate paints an ownership bar, so a table redraw asked the database once
+        for each visible cell, and scrolling or dragging a column redraws continuously.
+        That is the sluggishness on a big view: not the row count, but a query rate tied
+        to the frame rate.
+
+        Cached rather than recomputed because paint must be cheap; invalidated wherever the
+        store can have moved underneath it, which is `_evaluate` and `_resync_values`.
+        """
+        cached = self._ownership.get(tag_name)
+        if cached is None:
+            cached = {entry_id: {"kind": a.owner, "action_ref": a.action_ref}
+                      for entry_id, a in self._tag_store.assignments(
+                          self._registry_type, tag_name).items()}
+            self._ownership[tag_name] = cached
+        return cached
+
+    def _alignment_for(self, col: int):
+        """Where a column's content sits — numbers right, bools centred, the rest left.
+        Shared by the cells and their header so the two can never disagree."""
+        kind = self.tag_type_for_column(col)
+        if kind == "number":
+            return Qt.AlignRight
+        if kind == "bool":
+            return Qt.AlignHCenter
+        return Qt.AlignLeft
+
     def data(self, index, role=Qt.DisplayRole):
+        # Answer only for roles we implement, and answer *fast* for the rest.
+        #
+        # `initStyleOption` polls a dozen roles per cell — background, font, decoration,
+        # check state, tooltip, size hint — and every one of them was walking into the
+        # body of this method. Measured while scrolling a real 18,638-row view: **23,970
+        # `data()` calls for 30 scroll steps**, about nine per visible cell per step, and
+        # the single largest Python cost in the frame. Most of those calls could only ever
+        # have returned None.
+        if role not in _HANDLED_ROLES:
+            return None
         if not index.isValid():
             return None
+        if role == Qt.TextAlignmentRole:
+            return self._alignment_for(index.column()) | Qt.AlignVCenter
         col = index.column()
         row = self._result.rows[index.row()]
 
@@ -226,7 +296,7 @@ class RegistryTableModel(QAbstractTableModel):
             name = self.column_tag_name(col)
             if name is None or row.entry_id is None:
                 return None
-            return self._tag_store.get_ownership(self._registry_type, row.entry_id, name)
+            return self._ownership_of(name).get(row.entry_id)
 
         if role == Qt.ForegroundRole:
             # The fallback is real content but not the *entry's own* name, so it reads
@@ -308,11 +378,17 @@ class RegistryTableModel(QAbstractTableModel):
             new_value=value,
         )
         self._edit_stack.execute(command)
+        # The write moved this cell's ownership — a GUI edit lands user-owned, taking it
+        # from an action if one held it. The cached map has to go with it, or the bar keeps
+        # painting the previous owner: the value would update and the colour beside it
+        # would not, which is the one combination worse than either being stale.
+        self._ownership.pop(tag_name, None)
         # Patch the rendered cell from the store (respects defaults + casting); membership
         # is intentionally left alone — no re-eval on edit.
         row.values[self._column_name(col)] = self._tag_store.get_tag(
             self._registry_type, row.entry_id, tag_name)
         self.dataChanged.emit(index, index, [Qt.DisplayRole, OwnershipRole])
+        self.tags_written.emit()
         return True
 
     def confirm_takeover_of(self, cells) -> bool:
@@ -336,6 +412,7 @@ class RegistryTableModel(QAbstractTableModel):
         """Re-sync every tag cell's value from the store (row membership unchanged) and
         signal the view. Used by bulk edits, undo/redo, and action-run refreshes."""
         self._resync_values()
+        self.tags_written.emit()
         if self.rowCount() and self.columnCount():
             self.dataChanged.emit(
                 self.index(0, 0),
@@ -352,6 +429,7 @@ class RegistryTableModel(QAbstractTableModel):
         and redo. Columns outside means one query per tag instead, and the default is
         applied here because the map holds assigned cells only.
         """
+        self._ownership.clear()
         for col, field in enumerate(self._select):
             if not isinstance(field, Tag):
                 continue

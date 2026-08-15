@@ -74,6 +74,7 @@ class JarViewerTab(QWidget):
         root.addWidget(bar)
 
         self._tree = PanelTree()
+        icons.follow_expansion(self._tree)
         self._tree.setColumnCount(3)
         self._tree.setHeaderLabels(["Name", "Size", "Packed"])
         self._tree.setHeaderHidden(False)
@@ -160,7 +161,7 @@ class JarViewerTab(QWidget):
             # jar is whether a file can be copied back out as an override, and a `.class`
             # never can.
             if entry.is_dir:
-                item.setIcon(0, icons.file_icon(entry.name, True, colour=style.TEXT))
+                icons.set_folder_icon(item, colour=style.TEXT)
                 item.setForeground(0, style.qt_colour(style.TEXT))
             elif entry.is_nested_archive:
                 # Marked, not opened. Recursing into a jar-in-a-jar is its own step, and

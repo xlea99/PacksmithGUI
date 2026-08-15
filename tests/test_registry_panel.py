@@ -149,6 +149,30 @@ def test_an_empty_registry_is_an_empty_panel(qapp):
         panel.deleteLater()
 
 
+# --- filtering ---------------------------------------------------------------------------
+
+def test_filtering_does_not_eat_which_namespaces_were_open(panel):
+    """The one failure here that hides.
+
+    A filtered tree is force-expanded, so the "which groups were open" snapshot `refresh`
+    takes must not be read off it — otherwise typing one character and deleting it records
+    *every* namespace as open, and the arrangement is gone with nothing on screen looking
+    wrong. It reads as "the panel just opens everything now", days later, with no cause
+    attached to it.
+
+    The other filter behaviours (what matches, the empty-state row) announce themselves the
+    moment you type; this one cannot.
+    """
+    rows(panel)[2].setExpanded(True)              # minecraft, by hand
+
+    panel._search.setText("bio")
+    assert all(item.isExpanded() for item in rows(panel)), "matches were left hidden"
+    panel._search.setText("")
+
+    reopened = {item.text(0) for item in rows(panel) if item.isExpanded()}
+    assert reopened == {"minecraft"}, f"the filter rearranged the panel: {reopened}"
+
+
 # --- pinning --------------------------------------------------------------------------------
 
 @pytest.fixture

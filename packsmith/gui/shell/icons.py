@@ -23,6 +23,7 @@ Phosphor is MIT licensed; see `gui/vendor/phosphor/LICENSE`.
 """
 from pathlib import Path
 
+from PySide6 import QtCore as _QtCore
 from PySide6.QtGui import QFont, QFontDatabase
 
 from packsmith.common.logging import log
@@ -53,6 +54,7 @@ GLYPHS = {
 # glance in a tree, so a config and a log want different marks even though the same editor
 # opens both.
 FOLDER_GLYPH = ""          # folder
+FOLDER_OPEN_GLYPH = ""     # folder-open
 DEFAULT_FILE_GLYPH = ""    # file
 
 FILE_GLYPHS = {
@@ -227,6 +229,22 @@ def glyph(key: str) -> str:
     return GLYPHS.get(key, "")
 
 
+def concept_icon(key: str, *, colour: str, size: int = 16):
+    """One of the app's concept marks — `views`, `tags`, `blueprints`, `registry` — as an
+    icon, for rows and tabs showing that same kind of thing.
+
+    **The mark is the same at every scale, and that is the whole point.** A tag wears the
+    tag glyph in the sidebar strip, on its row in the Tags panel, and (through the panels
+    that borrow it) anywhere else a tag is the subject. Learning six silhouettes once buys
+    you the whole app rather than one strip of it, and the alternative — a second, nearly
+    identical set drawn for rows — is how an icon vocabulary quietly becomes two.
+
+    Reading `GLYPHS` rather than copying out of it for the same reason: a duplicated
+    codepoint is a drift waiting to happen, and the Views panel had exactly one.
+    """
+    return _render(glyph(key), colour, None, size)
+
+
 # --- UI chrome ---------------------------------------------------------------------------
 #
 # Buttons, row markers, category headers. The line drawn here is deliberate: **Phosphor for
@@ -244,8 +262,26 @@ UI_GLYPHS = {
     "settings": "\ue270",       # gear
     "save": "\ue248",           # floppy-disk
     "hint": "\ue2dc",           # lightbulb
+    # One declared action, on its reference page. Lightning rather than the Automation
+    # panel's play, because this page does not run anything — play would promise a
+    # button that isn't there. An action is the *capability*; a job is the trigger.
+    "action": "\ue2de",         # lightning
     "datapacks": "\ue390",      # package — a datapack IS a pack
     "resourcepacks": "\ue6c8",  # palette — assets rather than data
+    # An ACTION package (design 3.3.1). The same glyph as `datapacks`, under its own
+    # key on purpose: they are one picture of two unrelated things - a folder in the
+    # game instance versus Packsmith's own userdata - and they never appear side by
+    # side. A key called `datapacks` doing duty for a code package is the confusing part.
+    "package": "\ue390",        # package
+    # A blueprint INSTANCE. The schema wears the blueprint mark; the instance wears
+    # the solid thing built from it, because that is exactly their relation — one is
+    # the drawing, the other is the object. Two silhouettes nobody can confuse, which
+    # matters in a tree whose only other cue is one level of indent.
+    "instance": "\ue1da",      # cube
+    # folder-simple rather than the notched folder the Files panel uses - a group of
+    # views is not a directory, and borrowing that silhouette would imply it was.
+    "group": "",          # folder-simple
+    "group_open": "",     # folder-open
 }
 
 
@@ -273,3 +309,45 @@ def mark(widget, key: str, *, size: int = 13, text: str = None):
 def ui_icon(key: str, *, colour: str, size: int = 16):
     """A chrome glyph as a QIcon, for tree rows and anywhere `setIcon` is wanted."""
     return _render(ui(key), colour, None, size)
+
+
+# --- icons that follow a row's expansion ---------------------------------------------------
+
+_EXPANDING_ROLE = _QtCore.Qt.UserRole + 900   # high, to stay clear of panel-local roles
+
+
+def set_expanding_icon(item, shut: str, opened: str, *, colour: str, column: int = 0):
+    """Give a tree row two icons: one for shut, one for open.
+
+    The pair is stored **on the item**, so the tree-level handler needs to know nothing
+    about what kind of row it is looking at — a Views group and a Files folder use
+    different glyphs and the same machinery.
+    """
+    item.setData(column, _EXPANDING_ROLE, (shut, opened, colour, column))
+    item.setIcon(column, _render(shut, colour, None, 16))
+
+
+def set_folder_icon(item, *, colour: str, column: int = 0):
+    """A folder that opens when its row does."""
+    set_expanding_icon(item, FOLDER_GLYPH, FOLDER_OPEN_GLYPH, colour=colour, column=column)
+
+
+def follow_expansion(tree):
+    """Wire a tree so rows given `set_expanding_icon` swap as they open and shut.
+
+    Connect once per tree. Rows without the pair are ignored, so this is safe on a tree
+    that mixes folders with everything else.
+
+    A shut folder sitting directly above its own visible contents is a small lie the eye
+    catches before the mind does — which is the whole reason this exists.
+    """
+    def swap(item):
+        packed = item.data(0, _EXPANDING_ROLE)
+        if not packed:
+            return
+        shut, opened, colour, column = packed
+        item.setIcon(column, _render(opened if item.isExpanded() else shut,
+                                     colour, None, 16))
+
+    tree.itemExpanded.connect(swap)
+    tree.itemCollapsed.connect(swap)

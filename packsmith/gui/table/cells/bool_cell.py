@@ -1,8 +1,9 @@
-from PySide6.QtWidgets import QStyledItemDelegate, QStyle, QStyleOptionButton, QApplication
-from PySide6.QtCore import Qt, QRect, QModelIndex, QEvent
-from PySide6.QtGui import QPainter
+from PySide6.QtWidgets import QStyledItemDelegate, QStyle, QApplication
+from PySide6.QtCore import Qt, QRect, QPointF, QModelIndex, QEvent
+from PySide6.QtGui import QPainter, QColor, QPen, QPolygonF
 
-from packsmith.gui.table.cells.ownership import paint_ownership_bar
+from packsmith.gui.shell import style
+from packsmith.gui.table.cells.ownership import paint_ownership_bar, paint_row_rule, paint_column_rule
 
 
 class BoolCellDelegate(QStyledItemDelegate):
@@ -24,38 +25,57 @@ class BoolCellDelegate(QStyledItemDelegate):
 
     def _checkbox_rect(self, option) -> QRect:
         """Center a checkbox-sized rect within the cell."""
-        check_size = QApplication.style().pixelMetric(QStyle.PM_IndicatorWidth)
+        check_size = 15
         x = option.rect.x() + (option.rect.width() - check_size) // 2
         y = option.rect.y() + (option.rect.height() - check_size) // 2
         return QRect(x, y, check_size, check_size)
 
     def paint(self, painter: QPainter, option, index: QModelIndex):
-        self.initStyleOption(option, index)
-        style = QApplication.style()
+        """Painted rather than handed to the platform style.
 
-        # Draw cell background (selection, alternating rows)
-        style.drawPrimitive(QStyle.PE_PanelItemViewItem, option, painter)
+        The native indicator at this size renders as a pale rounded pill on a dark ground —
+        it reads as a disabled text field, not as a checkbox, and it was the last thing in
+        the table that looked borrowed. Three states, three deliberate weights:
+
+        * **unset** — a faint hollow square. Nobody has decided; it should be quiet enough
+          that a column of them looks empty rather than full of unticked boxes.
+        * **false** — a decided no. A real border, so it is visibly *stated* rather than
+          merely absent, which is the pristine-versus-explicit distinction (§3.2.1) showing
+          up in the one place a user can see it.
+        * **true** — filled and checked, the only thing in the column that should catch
+          the eye when you are scanning for what is flagged.
+        """
+        self.initStyleOption(option, index)
+        QApplication.style().drawPrimitive(QStyle.PE_PanelItemViewItem, option, painter)
         paint_ownership_bar(painter, option, index)
+        paint_row_rule(painter, option)
+        paint_column_rule(painter, option)
 
         value = self._get_value(index)
+        box = self._checkbox_rect(option)
 
-        checkbox_opt = QStyleOptionButton()
-        checkbox_opt.rect = self._checkbox_rect(option)
+        painter.save()
+        painter.setRenderHint(QPainter.Antialiasing)
 
-        # An unset cell stays faint — that is the tri-state showing "nobody has said",
-        # which is a fact about the cell rather than about whether a column was armed.
-        if value is None:
-            checkbox_opt.state = QStyle.State_Enabled | QStyle.State_NoChange
-            painter.setOpacity(0.2)
-        elif value:
-            checkbox_opt.state = QStyle.State_Enabled | QStyle.State_On
-            painter.setOpacity(1.0)
+        if value:
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor(style.ACCENT_EDGE))
+            painter.drawRoundedRect(box, 3, 3)
+            tick = QPen(QColor("#ffffff"), 1.8)
+            tick.setCapStyle(Qt.RoundCap)
+            tick.setJoinStyle(Qt.RoundJoin)
+            painter.setPen(tick)
+            painter.drawPolyline(QPolygonF([
+                QPointF(box.left() + box.width() * 0.26, box.top() + box.height() * 0.52),
+                QPointF(box.left() + box.width() * 0.44, box.top() + box.height() * 0.70),
+                QPointF(box.left() + box.width() * 0.75, box.top() + box.height() * 0.31),
+            ]))
         else:
-            checkbox_opt.state = QStyle.State_Enabled | QStyle.State_Off
-            painter.setOpacity(1.0)
+            painter.setBrush(Qt.NoBrush)
+            painter.setPen(QPen(QColor("#5a5a5a" if value is False else "#3a3a3a"), 1.2))
+            painter.drawRoundedRect(box.adjusted(0, 0, -1, -1), 3, 3)
 
-        style.drawControl(QStyle.CE_CheckBox, checkbox_opt, painter)
-        painter.setOpacity(1.0)
+        painter.restore()
 
     def editorEvent(self, event, model, option, index: QModelIndex) -> bool:
         # NOTE: with the per-column arming mode gone, a single click on the checkbox now

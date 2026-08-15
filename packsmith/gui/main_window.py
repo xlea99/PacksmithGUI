@@ -16,7 +16,7 @@ from PySide6.QtWidgets import (
     QHeaderView, QSplitter, QInputDialog, QMessageBox, QApplication,
 )
 from PySide6.QtCore import Qt, QEvent, QTimer
-from PySide6.QtGui import QShortcut, QKeySequence
+from PySide6.QtGui import QShortcut, QKeySequence, QFont
 
 from packsmith.common.setup import (
     load_state, load_ui_state, save_state, save_ui_state)
@@ -62,6 +62,9 @@ from packsmith.core.job_runner import run_job
 from packsmith.gui.demo_views import demo_views
 from packsmith.gui.queries import blueprint_query, browse_query, tag_query
 from packsmith.gui.query_constructor import QueryConstructorDialog
+from packsmith.gui.action_page import ActionPageTab
+from packsmith.gui.encyclopedia import EncyclopediaTab
+from packsmith.gui import encyclopedia_pages
 from packsmith.gui.tag_editor import TagCreateDialog, EnumValuesDialog
 from packsmith.gui.shell import icons, style
 from packsmith.gui.shell.sidebar import Sidebar, PanelStack
@@ -99,10 +102,12 @@ from packsmith.gui.settings_dialog import SettingsDialog
 from packsmith.gui.job_editor import JobEditorTab
 from packsmith.gui.table.registry_table_model import RegistryTableModel
 from packsmith.gui.table.registry_table_view import RegistryTableView
+from packsmith.gui.table.table_layout import TableLayout
 from packsmith.gui.table.cells.bool_cell import BoolCellDelegate
 from packsmith.gui.table.cells.enum_cell import EnumCellDelegate
 from packsmith.gui.table.cells.num_cell import NumCellDelegate
 from packsmith.gui.table.cells.str_cell import StrCellDelegate
+from packsmith.gui.table.cells.plain_cell import PlainCellDelegate
 
 _DELEGATES = {
     "bool": BoolCellDelegate,
@@ -126,6 +131,16 @@ class MainWindow(QMainWindow):
         self._tab_views = {}      # tab widget -> the saved View it renders (if any)
         self._open_tabs = {}      # open-key -> tab widget (so we focus, not duplicate)
         self._delegates = []      # keep delegate refs alive
+        # Table arrangements waiting to be written. Coalesced through one timer so a
+        # column drag doesn't rewrite state.json on every pixel.
+        # View tabs whose rows are out of date because a write happened somewhere else.
+        # Reconciled when you look at them — see `_on_tags_written`.
+        self._stale_tabs = set()
+        self._pending_layouts = {}
+        self._layout_timer = QTimer(self)
+        self._layout_timer.setSingleShot(True)
+        self._layout_timer.setInterval(400)
+        self._layout_timer.timeout.connect(self._flush_layouts)
         self._editor_host = None  # survives profile switches; see _switch_profile
         self._shortcuts = []      # ditto — parented to the window, not the central widget
         self._import_result = None
@@ -310,6 +325,8 @@ class MainWindow(QMainWindow):
         self._views_panel = ViewsPanel(self._views.all())
         self._views_panel.view_activated.connect(self._open_view)
         self._views_panel.new_view_requested.connect(self._new_view)
+        self._views_panel.edit_requested.connect(self._edit_view)
+        self._views_panel.layout_changed.connect(self._remember_view_layout)
         self._views_panel.rename_requested.connect(self._rename_view)
         self._views_panel.delete_requested.connect(self._delete_view)
 
@@ -362,6 +379,7 @@ class MainWindow(QMainWindow):
         self._blueprints_panel.rename_instance_requested.connect(self._rename_instance)
 
         self._actions_panel = ActionsPanel(self._packages)
+        self._actions_panel.action_activated.connect(self._open_action)
         self._actions_panel.document_activated.connect(self._open_package_document)
         self._actions_panel.new_action_requested.connect(self._new_action)
         self._actions_panel.new_file_requested.connect(self._new_package_file)
@@ -631,7 +649,12 @@ class MainWindow(QMainWindow):
         tab.changed.connect(self._after_blueprint_change)
         tab.status.connect(self._set_status)
         tab.save_requested.connect(lambda t=tab: self._save_blueprint_view(t))
-        self._workspace.add_tab(tab, title)
+        # The blueprint mark rather than the View one, even when this IS a saved View: what
+        # you are looking at is a blueprint's grid, and that is the more specific true
+        # thing. The Views panel is where a View's *identity* is legible; a tab is where
+        # its *content* is.
+        self._workspace.add_tab(tab, title,
+                                icon=icons.concept_icon("blueprints", colour=style.TEXT))
         self._open_tabs[key] = tab
         return tab
 
@@ -1401,7 +1424,30 @@ class MainWindow(QMainWindow):
         profiles_menu.addAction("Switch Profile…", self._open_profile)
 
         help_menu = bar.addMenu("Help")
+        help_menu.addAction("Encyclopedia Packsmithia",
+                            lambda: self._open_encyclopedia())
+        help_menu.addSeparator()
         help_menu.addAction("About Packsmith").setEnabled(False)
+
+    def _open_encyclopedia(self, page_id=None):
+        """Open the guide, or focus it if it is already open, and go to `page_id`.
+
+        One tab, not one per page: the encyclopedia navigates internally, so opening it
+        twice would give you two of the same thing with different scroll positions. That
+        is also what makes deep-linking cheap — a ? anywhere in the app is one call.
+        """
+        key = ("encyclopedia",)
+        tab = self._open_tabs.get(key)
+        if tab is None:
+            tab = EncyclopediaTab()
+            self._workspace.add_tab(tab, "Encyclopedia",
+                                    icon=icons.ui_icon("hint", colour=style.TEXT))
+            self._open_tabs[key] = tab
+        else:
+            self._workspace.focus_widget(tab)
+        if page_id:
+            tab.show_page(page_id)
+        return tab
 
     # --- view tabs ---------------------------------------------------------
 
@@ -1412,7 +1458,8 @@ class MainWindow(QMainWindow):
         if existing is not None and self._workspace.focus_widget(existing):
             return existing
         tab = self._build_view_tab(query, view=view)
-        self._workspace.add_tab(tab, title)
+        self._workspace.add_tab(tab, title,
+                                icon=icons.concept_icon("views", colour=style.TEXT))
         self._open_tabs[key] = tab
         self._bottom.set_status(f"{title} — {self._tab_models[tab].rowCount():,} rows")
         return tab
@@ -1453,6 +1500,12 @@ class MainWindow(QMainWindow):
         table.setAlternatingRowColors(True)
         table.setSelectionBehavior(RegistryTableView.SelectItems)
         table.setSelectionMode(RegistryTableView.ExtendedSelection)
+        table.setStyleSheet(style.TABLE_QSS)
+        # Horizontal hairlines only — drawn by the delegates, so the vertical lattice goes.
+        table.setShowGrid(False)
+        # Hover state has to reach the delegates for the enum arrow to appear under the
+        # pointer rather than on all 18,638 rows at once.
+        table.setMouseTracking(True)
         # Indicator first, THEN enable: `setSortingEnabled(True)` immediately sorts by the
         # current section, so enabling and then calling sortByColumn sorted the whole table
         # twice on open. The rows already arrive in the query's `order_by`, so this initial
@@ -1461,20 +1514,34 @@ class MainWindow(QMainWindow):
         table.setSortingEnabled(True)
 
         vh = table.verticalHeader()
-        vh.setDefaultSectionSize(24)
+        # 24 was cramped; rows need somewhere to sit. The default is also the FLOOR: a row
+        # dragged shorter than this clips its own content — the checkbox and the ownership
+        # bar are sized to it — so shrinking is a way to break the table rather than a way
+        # to fit more in. Growing stays free, which is the direction anyone actually wants.
+        vh.setDefaultSectionSize(style.ROW_HEIGHT)
+        vh.setMinimumSectionSize(style.ROW_HEIGHT)
         vh.setSectionsClickable(True)
-        vh.setDefaultAlignment(Qt.AlignCenter)
-        vh.setStyleSheet(f"""
-            QHeaderView::section {{
-                background-color: {style.BG_PANEL}; color: {style.TEXT_FAINT};
-                border: 1px solid {style.BORDER}; padding: 0 6px; font-size: 11px;
-            }}
-            QHeaderView::section:checked {{
-                background-color: {style.ACCENT}; color: {style.TEXT};
-            }}
-        """)
+        vh.setDefaultAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        vh.setFixedWidth(46)              # sized for five digits, not for the widest label
+
+        # L1 columns get a delegate of their own rather than Qt's stock one, so text
+        # inset and row rules match the tag columns beside them.
+        plain = PlainCellDelegate(table)
+        table.setItemDelegate(plain)
+        self._delegates.append(plain)
 
         h = table.horizontalHeader()
+        h.setHighlightSections(False)     # the clicked column shouldn't shout
+        h.setFixedHeight(30)
+        # Small caps and a little tracking, applied as a FONT rather than by rewriting the
+        # header text — `headerData` keeps returning the real column name, so Copy and the
+        # query language still see `localization`, not `LOCALIZATION`.
+        header_font = QFont(h.font())
+        header_font.setCapitalization(QFont.AllUppercase)
+        header_font.setLetterSpacing(QFont.PercentageSpacing, 108)
+        header_font.setPointSizeF(max(7.5, header_font.pointSizeF() - 1.5))
+        header_font.setBold(True)
+        h.setFont(header_font)
         for col in range(model.columnCount()):
             h.setSectionResizeMode(col, QHeaderView.Interactive)
             if model.headerData(col, Qt.Horizontal) == "id":
@@ -1488,41 +1555,51 @@ class MainWindow(QMainWindow):
                     self._delegates.append(delegate)
             else:
                 table.setColumnWidth(col, 240)
-        h.setStretchLastSection(True)
+        # The last column keeps the width it was given; leftover viewport stays empty.
+        #
+        # Stretching it to fill was worst exactly where it was least wanted: a bool column
+        # is 120px of checkbox and becomes 600px of mostly nothing, with the checkbox
+        # marooned in the middle. It also made that column the only one you could not
+        # resize, since it snapped back to whatever was left over.
+        #
+        # The empty strip to the right IS the dummy space — no placeholder column needed,
+        # and nothing in the header to explain away.
+        h.setStretchLastSection(False)
+
+        # Widths, per-row heights and the sort, remembered for this View alone. Restored
+        # after the columns exist, so stored widths land on real sections.
+        key = self._layout_key(view, model._registry_type)
+        stored = (load_ui_state(self._profile.name).get("table_layouts", {}).get(key)
+                  if self._profile is not None else None)
+        table_layout = TableLayout(table, model, style.ROW_HEIGHT, stored, parent=table)
+        table_layout.restore()
+        table_layout.changed.connect(
+            lambda k=key, l=table_layout: self._remember_layout(k, l))
+        model.tags_written.connect(lambda t=None: self._on_tags_written())
 
         tab = QWidget()
         layout = QVBoxLayout(tab)
         layout.setContentsMargins(4, 4, 4, 4)
         layout.setSpacing(6)
 
-        control_row = QHBoxLayout()
-
-        # ⚙ — edit this view's query. The query is the view's stable identity, so editing
-        # it is a deliberate act behind the gear, not an always-on filter bar.
-        gear = QPushButton()
-        icons.mark(gear, "settings", size=13)
-        gear.setFixedSize(28, 24)
-        gear.setToolTip("Edit this view's query")
-        gear.setStyleSheet(f"""
-            QPushButton {{
-                background-color: {style.BG_CHROME}; color: #b0b0b0;
-                border: 1px solid {style.BORDER}; font-size: 14px;
-            }}
-            QPushButton:hover {{ background-color: {style.BORDER}; color: {style.TEXT}; }}
-        """)
-        gear.clicked.connect(lambda _=False, t=tab: self._edit_view_query(t))
-        control_row.addWidget(gear)
-
-        control_row.addStretch()
-        layout.addLayout(control_row)
-
-        # The bar refines what you're looking at; the ⚙ above edits what the view IS.
+        # The bar refines what you're looking at; the ⚙ beside it edits what the view IS.
         # Typing here never changes the view — "Keep" is the deliberate act that does.
         bar = QueryBar()
         bar.set_keepable(view is not None)
         bar.filter_changed.connect(
             lambda node, t=tab: self._apply_refinement(t, node))
+        # Remembered for **saved Views only**. A tab you got by clicking a registry or a
+        # tag is a scratch surface — you opened it to look at something, and it should
+        # open clean every time rather than resuming a search you have forgotten making.
+        # A View is a thing you named and came back to, so where you had got to in it is
+        # part of coming back.
+        if view is not None:
+            bar.filter_changed.connect(
+                lambda _node, k=key, b=bar: self._remember_filter(k, b.text()))
         bar.keep_requested.connect(lambda node, t=tab: self._keep_refinement(t, node))
+        bar.help_requested.connect(
+            lambda: self._open_encyclopedia(encyclopedia_pages.FILTER_HELP))
+
         layout.addWidget(bar)
         layout.addWidget(table)
 
@@ -1535,6 +1612,12 @@ class MainWindow(QMainWindow):
         if view is not None:
             self._tab_views[tab] = view
         bar.report(model.rowCount(), model.rowCount())
+
+        # Restore the refinement LAST: applying it re-runs the query and re-reports the
+        # count, both of which need the bookkeeping above to already be in place.
+        remembered = self._stored_filter(key) if view is not None else ""
+        if remembered:
+            bar.set_text(remembered)
         return tab
 
     def _apply_refinement(self, tab, node):
@@ -1581,13 +1664,53 @@ class MainWindow(QMainWindow):
         userdata, not game files."""
         return self._open_document("package", path)
 
+    # --- action reference pages (design 3.3.1) -----------------------------
+
+    def _open_action(self, ref):
+        """One action's reference page, or focus it if already open.
+
+        Keyed by the **ref**, which is the action's identity — so clicking the same action
+        in two places lands on one tab rather than two copies of the same reading matter.
+        """
+        key = ("action", ref)
+        existing = self._open_tabs.get(key)
+        if existing is not None and self._workspace.focus_widget(existing):
+            return existing
+        try:
+            manifest = self._packages.get(ref)
+        except KeyError:
+            # The index is refreshed on every package edit, so this means the manifest lost
+            # the declaration between the panel drawing it and the click landing.
+            self._set_status(f"'{ref}' is no longer declared")
+            self._actions_panel.refresh()
+            return None
+
+        tab = ActionPageTab(manifest, self._packages.package(manifest.package_name),
+                            self._jobs, tag_store=self._tags,
+                            blueprint_store=self._blueprints)
+        tab.status.connect(self._set_status)
+        tab.document_activated.connect(self._open_package_document)
+        tab.job_activated.connect(self._open_job_by_id)
+        self._workspace.add_tab(tab, tab.title(), icon=tab.tab_icon())
+        self._open_tabs[key] = tab
+        self._set_status(f"{ref} — {manifest.file} · {manifest.function}()")
+        return tab
+
+    def _open_job_by_id(self, job_id):
+        """From an action page's Used-by list to the job editor. The page names jobs, so
+        it has to be able to hand you one."""
+        job = self._jobs.get(job_id)
+        if job is not None:
+            self._open_job_editor(job)
+
     def _tab_icon(self, source, path):
         """The file-type icon for a document tab (design 6.2's vocabulary, reused).
 
-        Documents only. A View, a blueprint grid or a job editor is not a file, and giving
-        one a paper-and-lines glyph would say something untrue about what it is — the tab
-        bar is heterogeneous by design (§4.2), so an icon here has to mean "this is a file"
-        rather than just "this is a tab".
+        The tab bar is heterogeneous by design (§4.2), so every icon in it has to say
+        *what kind of thing this tab is* — which means each kind brings its own vocabulary
+        rather than borrowing one. Documents get the file glyphs; a View gets the Views
+        mark and a blueprint grid the blueprint one. What must never happen is a View
+        wearing a paper-and-lines glyph, which would say something untrue about it.
 
         For a jar member the icon comes from the MEMBER's name, not the jar's — the tab is
         showing `recipes/stone.json`, so a zip glyph would describe the container instead of
@@ -2120,6 +2243,47 @@ class MainWindow(QMainWindow):
     def _on_file_claimed(self, rel_path):
         self._set_status(f"You now own {rel_path} — actions are blocked from writing it.")
 
+    def _on_tags_written(self):
+        """An L2 write happened in one view. Every OTHER open view is now out of date.
+
+        Marked rather than refreshed. Only one view tab is visible at a time, so refreshing
+        a hidden one is work nobody sees — and the tab you are *editing in* must not
+        re-evaluate at all: the row you just unchecked would vanish from under the cursor
+        in a view whose filter it no longer matches.
+
+        The tab doing the writing is marked too, and simply never acts on it while it is
+        the one in front. That is what makes "the row leaves the Remove view when you come
+        back to it" fall out of one rule instead of an exemption list.
+        """
+        current = self._workspace.current_widget()
+        for tab in self._tab_models:
+            if tab is not current:
+                self._stale_tabs.add(tab)
+
+    def _reconcile(self, tab) -> bool:
+        """Re-run a stale tab's query, keeping your place in it."""
+        if tab not in self._stale_tabs:
+            return False
+        self._stale_tabs.discard(tab)
+        model = self._tab_models.get(tab)
+        if model is None:
+            return False
+
+        table = tab.findChild(RegistryTableView)
+        # A full reset scrolls to the top. Coming back to a tab and losing your place every
+        # time would be a worse bug than the staleness this fixes.
+        scroll = table.verticalScrollBar().value() if table else 0
+        model.reevaluate()
+        if table:
+            table.verticalScrollBar().setValue(scroll)
+
+        # The bar's "N of M" was measured before the edit; left alone it describes a table
+        # that no longer exists.
+        bar = self._tab_bars.get(tab)
+        if bar is not None:
+            bar.report(model.rowCount(), self._tab_totals.get(tab, model.rowCount()))
+        return True
+
     def _on_tab_activated(self, widget):
         """Hand the shared web view to whichever editor tab is now in front, and re-state
         what the status bar is describing.
@@ -2128,6 +2292,7 @@ class MainWindow(QMainWindow):
         switching tabs — or after an edit changed the row count — the bar described a tab
         that wasn't in front any more. A status bar that is wrong is worse than one that is
         empty, because you have no way to tell which."""
+        self._reconcile(widget)
         if isinstance(widget, EditorTab):
             widget.activate()
             self._set_status(self._status_for(widget))
@@ -2243,6 +2408,9 @@ class MainWindow(QMainWindow):
         Views panel and is untouched."""
         self._tab_models.pop(widget, None)
         self._tab_views.pop(widget, None)
+        # A closed tab is owed nothing, and a deleted widget left in the set would keep it
+        # growing for the life of the session.
+        self._stale_tabs.discard(widget)
         if isinstance(widget, EditorTab):
             # Reclaim the shared view BEFORE the tab is destroyed, or it takes the editor
             # with it as a child.
@@ -2252,22 +2420,37 @@ class MainWindow(QMainWindow):
             if tab is widget:
                 del self._open_tabs[key]
 
-    def _edit_view_query(self, tab):
-        """Edit the query behind a tab. If the tab renders a saved View, the change is
-        persisted — editing the query IS editing the View."""
-        model = self._tab_models.get(tab)
-        if model is None:
-            return
-        dlg = QueryConstructorDialog(self._tags, model._registry_type,
-                                     query=model._query, parent=self)
+    def _edit_view(self, view):
+        """Edit a saved View's query, from the Views panel's context menu.
+
+        Keyed on the **View**, not on an open tab: editing a View is something you do to
+        the View, and it should not require having opened it first. If it happens to be
+        open, the tab is re-run in place so you are not looking at a stale table.
+
+        This replaced a ⚙ beside the open table's filter bar, which was genuinely
+        misleading — the two sat inches apart, both were about queries, and only one of
+        them changed what the saved View *is*.
+        """
+        dlg = QueryConstructorDialog(self._tags, view.query.scope.type,
+                                     query=view.query, parent=self)
         if not dlg.exec():
             return
-        model.set_filter(dlg.result_filter)
-        view = self._tab_views.get(tab)
-        if view is not None:
-            self._views.update_query(view.id, model._query)
-            self._reload_views()
-        self._bottom.set_status(f"{model.rowCount():,} rows")
+        updated = dataclasses.replace(view.query, filter=dlg.result_filter)
+        self._views.update_query(view.id, updated)
+        self._reload_views()
+
+        tab = self._open_tabs.get(("view", view.id))
+        model = self._tab_models.get(tab) if tab is not None else None
+        if model is not None:
+            model.set_filter(dlg.result_filter)
+            self._tab_base_queries[tab] = updated
+            self._tab_totals[tab] = model.rowCount()
+            bar = self._tab_bars.get(tab)
+            if bar is not None:
+                bar.report(model.rowCount(), model.rowCount())
+            self._bottom.set_status(f"{view.name} — {model.rowCount():,} rows")
+        else:
+            self._bottom.set_status(f"Edited '{view.name}'")
 
     def _new_view(self):
         """Author a new View: saved to the database, filed in the Views panel, opened."""
@@ -2320,8 +2503,23 @@ class MainWindow(QMainWindow):
         self._reload_views()
         self._bottom.set_status(f"Deleted view '{view.name}'")
 
+    def _view_layout(self) -> list:
+        if self._profile is None:
+            return []
+        return load_ui_state(self._profile.name).get("view_layout", []) or []
+
+    def _remember_view_layout(self, layout):
+        """Per profile, in UI state — not columns on the views table.
+
+        How a View is filed and where it sits are presentation, and a schema change would
+        mean a SCHEMA_VERSION bump and a migration for furniture. The View is the artifact;
+        its place in the panel is how you like to look at it.
+        """
+        if self._profile is not None:
+            save_ui_state(self._profile.name, view_layout=list(layout))
+
     def _reload_views(self):
-        self._views_panel.set_views(self._views.all())
+        self._views_panel.set_views(self._views.all(), self._view_layout())
         # A view that couldn't be decoded is skipped rather than taking the panel down
         # (Q-1) — but skipped silently is just a view that vanished. Say so.
         broken = self._views.unreadable()
@@ -2392,6 +2590,9 @@ class MainWindow(QMainWindow):
     def _refresh_after_tag_change(self):
         for model in self._tab_models.values():
             model.reevaluate()
+        # Everything was just re-run, so nothing is owed a reconcile — leaving the flags
+        # set would cost a second full pass the next time each tab came forward.
+        self._stale_tabs.clear()
         # A tag is part of a job's contract, not just of a view's columns: deleting or
         # renaming one can make a step unrunnable (design 3.2.1). Both surfaces that say
         # so have to hear about it, or the sidebar greys a job while its open tab still
@@ -2495,7 +2696,7 @@ class MainWindow(QMainWindow):
             return
 
         self._tags_panel.refresh()
-        self._views_panel.set_views(self._views.all())
+        self._views_panel.set_views(self._views.all(), self._view_layout())
         self._refresh_after_tag_change()
         said = f"Renamed '{tag_name}' to '{new_name}'"
         if rewritten:
@@ -2707,6 +2908,57 @@ class MainWindow(QMainWindow):
         panel = getattr(self, "_automation_panel", None)
         if panel is not None and self._profile is not None:
             save_ui_state(self._profile.name, automation_tab=panel.current_key)
+
+    # --- how a View is arranged (design 5.1) -------------------------------
+
+    @staticmethod
+    def _layout_key(view, registry_type: str) -> str:
+        """Where one table's arrangement is filed.
+
+        A saved View is keyed by its **id**, so its arrangement belongs to that one
+        configuration and cannot leak into another view of the same registry. A browse tab
+        is not a View at all, so it gets its own namespace — re-openable and stable, but
+        never sharing a key with anything the user saved.
+        """
+        return f"view:{view.id}" if view is not None else f"browse:{registry_type}"
+
+    def _remember_layout(self, key: str, layout):
+        """Queue a layout for saving. Debounced, because `sectionResized` fires on every
+        pixel of a drag and each save is a read-modify-write of state.json."""
+        self._pending_layouts[key] = layout.as_dict()
+        self._layout_timer.start()
+
+    def _flush_layouts(self):
+        if not self._pending_layouts or self._profile is None:
+            self._pending_layouts.clear()
+            return
+        stored = load_ui_state(self._profile.name).get("table_layouts", {})
+        stored.update(self._pending_layouts)
+        self._pending_layouts.clear()
+        save_ui_state(self._profile.name, table_layouts=stored)
+
+    def _stored_filter(self, key: str) -> str:
+        if self._profile is None:
+            return ""
+        return load_ui_state(self._profile.name).get("view_filters", {}).get(key, "")
+
+    def _remember_filter(self, key: str, text: str):
+        """Where you had got to in a view, kept per view.
+
+        A refinement is still transient in the sense §3.2.3 means — ANDed on top, clearable,
+        never part of what the View *is*. What it stops being is transient across a tab
+        close, which was only ever an accident of where it happened to live. "Keep" is
+        still the deliberate act that folds it into the View itself.
+
+        Stored even when empty: clearing the bar is a decision, and a cleared filter that
+        came back next time you opened the tab would be the same bug as defaults creeping
+        back over an emptied setting.
+        """
+        if self._profile is None:
+            return
+        stored = load_ui_state(self._profile.name).get("view_filters", {})
+        stored[key] = text or ""
+        save_ui_state(self._profile.name, view_filters=stored)
 
     def _remember_registry_pins(self, pins):
         """Per profile, in UI state — a pin is furniture the user moved, like the panel

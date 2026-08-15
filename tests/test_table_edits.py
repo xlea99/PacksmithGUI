@@ -166,3 +166,56 @@ def test_the_count_is_of_assigned_cells_not_selected_ones(view, model):
         sel.select(m.index(row, 1), QItemSelectionModel.Select)
     labels = [a.text() for a in view.menu_for(m.index(0, 1)).actions()]
     assert labels == ["Reset to default", "Copy"], labels
+
+
+# --- the ownership cache ----------------------------------------------------
+#
+# Ownership is read on every paint, so it is cached per tag rather than queried per cell —
+# it was one SQLite query for every visible cell, on every repaint, which is what made a
+# big view sluggish to scroll. A cache that goes stale is worse than the slow version: the
+# value updates and the colour beside it does not.
+
+def _ownership(model, row, col):
+    from packsmith.gui.table.registry_table_model import OwnershipRole
+    return model.data(model.index(row, col), OwnershipRole)
+
+
+def test_ownership_is_visible_for_an_owned_cell(model):
+    m, tags = model
+    tags.assign(REG, "a", "remove", True, owner="action", owner_action_ref="pkg:act")
+    m.reevaluate()
+    assert _ownership(m, 0, 1) == {"kind": "action", "action_ref": "pkg:act"}
+
+
+def test_a_pristine_cell_has_no_ownership(model):
+    m, _ = model
+    assert _ownership(m, 0, 1) is None
+
+
+def test_an_edit_updates_the_ownership_beside_it(model):
+    """A GUI edit takes the cell for the user. If the cached map survives that, the value
+    flips while the bar still paints the action's amber — the value and its owner
+    disagreeing on screen."""
+    from PySide6.QtCore import Qt
+    m, tags = model
+    tags.assign(REG, "a", "remove", False, owner="action", owner_action_ref="pkg:act")
+    m.reevaluate()
+    assert _ownership(m, 0, 1)["kind"] == "action"     # warms the cache
+
+    m._confirm_takeover = lambda cells: True
+    m.setData(m.index(0, 1), True, Qt.EditRole)
+
+    assert _ownership(m, 0, 1) == {"kind": "user", "action_ref": None}
+
+
+def test_undo_restores_the_ownership_too(model):
+    from PySide6.QtCore import Qt
+    m, tags = model
+    tags.assign(REG, "a", "remove", False, owner="action", owner_action_ref="pkg:act")
+    m.reevaluate()
+    m._confirm_takeover = lambda cells: True
+    m.setData(m.index(0, 1), True, Qt.EditRole)
+
+    m.undo()
+
+    assert _ownership(m, 0, 1) == {"kind": "action", "action_ref": "pkg:act"}

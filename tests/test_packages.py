@@ -530,6 +530,71 @@ def test_delete_folder_takes_undeclared_contents(tmp_path):
     assert source_files(load_package(pkg.root)) == ["manifest.toml"]
 
 
+# --- cutting one function out of a file (the action reference page) -----------------------
+#
+# The action page shows the source of the ONE function a manifest points at, so the cut has
+# to be right. Its failures all hide: a wrong boundary renders as a perfectly plausible
+# function that is quietly truncated or quietly running on into the next one, and the reader
+# has no way to tell. That is what earns these a permanent home rather than a look.
+
+_TWO_FUNCTIONS = '''"""Module docstring."""
+
+load("//lib/helpers.star", "each")
+
+def first(pack):
+    """Doc."""
+    count = 0
+    for entry in each(pack):
+        count += 1
+
+    pack.log("info", "done %d" % count)
+
+
+def second(pack):
+    pack.log("info", "not part of first")
+'''
+
+
+@pytest.fixture
+def two_functions(tmp_path):
+    from packsmith.core.packages import create_package
+    pkg = create_package(tmp_path, "cutting")
+    (pkg.root / "mod.star").write_text(_TWO_FUNCTIONS, encoding="utf-8")
+    return pkg
+
+
+def test_a_blank_line_inside_a_function_does_not_end_it(two_functions):
+    """The one that would go unnoticed.
+
+    `first` has a blank line before its last statement, which is ordinary style. Cutting at
+    the first blank line yields a function that looks complete, parses fine to the eye, and
+    is missing its last line — and nothing on the page says so.
+    """
+    from packsmith.core.packages import function_source
+
+    cut = function_source(two_functions, "mod.star", "first")
+    assert cut.startswith("def first(pack):")
+    assert 'pack.log("info", "done %d" % count)' in cut, "truncated at the blank line"
+
+
+def test_the_next_function_is_not_swept_in(two_functions):
+    from packsmith.core.packages import function_source
+
+    cut = function_source(two_functions, "mod.star", "first")
+    assert "def second" not in cut
+    assert not cut.endswith("\n"), "trailing blank lines belong to the gap, not the function"
+
+
+def test_a_function_the_file_does_not_define_reports_itself(two_functions):
+    """A manifest may name a function that isn't there. The package still loads and the job
+    still fails at run time, far from the mistake — so the page has to be able to say so
+    rather than showing an empty box."""
+    from packsmith.core.packages import function_source
+
+    assert function_source(two_functions, "mod.star", "third") is None
+    assert function_source(two_functions, "nowhere.star", "first") is None
+
+
 def test_file_operations_refuse_downloaded_packages(tmp_path):
     from packsmith.core.packages import create_file, delete_file, remove_action
     root = tmp_path / "vendored"; root.mkdir()

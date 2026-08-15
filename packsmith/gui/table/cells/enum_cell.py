@@ -2,7 +2,10 @@ from PySide6.QtWidgets import QStyledItemDelegate, QComboBox, QStyle, QApplicati
 from PySide6.QtCore import Qt, QModelIndex, QPointF, QRect, QEvent, QTimer
 from PySide6.QtGui import QPainter, QPalette, QColor, QPolygonF
 
-from packsmith.gui.table.cells.ownership import paint_ownership_bar
+from packsmith.gui.shell import style
+from packsmith.gui.table.cells.ownership import (
+    paint_ownership_bar, paint_row_rule, paint_column_rule,
+    EMPTY, EMPTY_ALIGN, EMPTY_COLOR, INSET)
 
 
 class EnumCellDelegate(QStyledItemDelegate):
@@ -27,45 +30,45 @@ class EnumCellDelegate(QStyledItemDelegate):
 
     def paint(self, painter: QPainter, option, index: QModelIndex):
         self.initStyleOption(option, index)
-        style = QApplication.style()
-        style.drawPrimitive(QStyle.PE_PanelItemViewItem, option, painter)
+        qstyle = QApplication.style()
+        qstyle.drawPrimitive(QStyle.PE_PanelItemViewItem, option, painter)
         paint_ownership_bar(painter, option, index)
+        paint_row_rule(painter, option)
+        paint_column_rule(painter, option)
 
         value = index.data(Qt.DisplayRole) or ""
 
         painter.save()
 
         # Text
-        text_rect = option.rect.adjusted(6, 0, -22, 0)
+        text_rect = option.rect.adjusted(INSET, 0, -22, 0)
         if value:
             painter.setPen(option.palette.color(QPalette.Text))
-            painter.drawText(text_rect, Qt.AlignLeft | Qt.AlignVCenter, value)
+            painter.drawText(text_rect, Qt.AlignLeft | Qt.AlignVCenter,
+                             painter.fontMetrics().elidedText(
+                                 value, Qt.ElideRight, text_rect.width()))
         else:
-            painter.setPen(QColor("#555555"))
-            painter.drawText(text_rect, Qt.AlignLeft | Qt.AlignVCenter, "----")
+            painter.setPen(EMPTY_COLOR)
+            painter.drawText(option.rect, EMPTY_ALIGN, EMPTY)
 
-        # Arrow button — always drawn now that a column is not armed before it will
-        # accept anything. It doubles as the affordance: an enum cell looks like a
-        # dropdown because it is one.
-        arrow = self._arrow_rect(option)
-        inset = arrow.adjusted(1, 3, -2, -3)
+        # The arrow, only under the pointer. Drawn on every row it became a column of
+        # little boxes competing with the values it was meant to serve — chrome repeated
+        # 18,638 times stops being an affordance and becomes texture. On hover it is
+        # exactly where the hand already is.
+        if option.state & QStyle.State_MouseOver:
+            inset = self._arrow_rect(option).adjusted(1, 5, -2, -5)
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QColor(style.BG_HOVER))
+            painter.drawRoundedRect(inset, 3, 3)
 
-        # Border only, no fill
-        painter.setPen(QColor("#4a4a4a"))
-        painter.setBrush(Qt.NoBrush)
-        painter.drawRect(inset)
-
-        # Triangle
-        cx = inset.center().x()
-        cy = inset.center().y()
-        painter.setPen(Qt.NoPen)
-        painter.setBrush(QColor("#aaaaaa"))
-        painter.setRenderHint(QPainter.Antialiasing)
-        painter.drawPolygon(QPolygonF([
-            QPointF(cx - 3, cy - 2),
-            QPointF(cx + 3, cy - 2),
-            QPointF(cx, cy + 2),
-        ]))
+            cx, cy = inset.center().x(), inset.center().y()
+            painter.setBrush(QColor(style.TEXT))
+            painter.setRenderHint(QPainter.Antialiasing)
+            painter.drawPolygon(QPolygonF([
+                QPointF(cx - 3, cy - 2),
+                QPointF(cx + 3, cy - 2),
+                QPointF(cx, cy + 2.5),
+            ]))
 
         painter.restore()
 

@@ -10,12 +10,13 @@ destructive schema change meant, its gaps aren't a meaningful number.
 """
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
-    QAbstractItemView, QHBoxLayout, QMenu, QPushButton, QTreeWidgetItem, QWidget,
+    QAbstractItemView, QHBoxLayout, QHeaderView, QMenu, QPushButton, QTreeWidgetItem,
+    QWidget,
 )
 
 from packsmith.core.blueprints import BlueprintError
-from packsmith.gui.shell import style
-from packsmith.gui.shell.panels.base import Panel
+from packsmith.gui.shell import icons, style
+from packsmith.gui.shell.panels.base import Panel, SearchBox, note_row
 from packsmith.gui.shell.tree import PanelTree
 
 _ROLE_BLUEPRINT = Qt.UserRole
@@ -61,6 +62,10 @@ class BlueprintsPanel(Panel):
         bar_lay.addStretch()
         self.body().addWidget(bar)
 
+        self._search = SearchBox("blueprints")
+        self._search.textChanged.connect(self.refresh)
+        self.body().addWidget(self._search)
+
         self._tree = PanelTree()
         self._tree.setColumnCount(2)
         self._tree.setHeaderHidden(True)
@@ -68,20 +73,27 @@ class BlueprintsPanel(Panel):
         self._tree.setContextMenuPolicy(Qt.CustomContextMenu)
         self._tree.itemDoubleClicked.connect(self._on_activated)
         self._tree.customContextMenuRequested.connect(self._on_context_menu)
+
+        # The name column takes what is left; the gap count takes what it needs. Sizing to
+        # contents counts the indent and the icon too, so a long blueprint name would push
+        # `4/5` — the number the panel exists to show — off the right edge.
+        header = self._tree.header()
+        header.setStretchLastSection(False)
+        header.setSectionResizeMode(0, QHeaderView.Stretch)
+        header.setSectionResizeMode(1, QHeaderView.ResizeToContents)
         self.body().addWidget(self._tree)
 
         self.refresh()
 
-    def refresh(self):
+    def refresh(self, *_):
+        needle = self._search.needle()
         self._tree.clear()
         try:
             names = self._store.names()
         except Exception:
             names = []
         if not names:
-            empty = QTreeWidgetItem(["No blueprints yet", ""])
-            empty.setForeground(0, Qt.gray)
-            self._tree.addTopLevelItem(empty)
+            self._tree.addTopLevelItem(note_row("No blueprints yet"))
             return
 
         for name in names:
@@ -89,19 +101,37 @@ class BlueprintsPanel(Panel):
             instances = self._store.instances(name)
             orphaned = {o.instance for o in self._store.orphans(name)}
 
+            # A matching schema keeps all its instances — you searched for the blueprint,
+            # so you want the blueprint. Otherwise the instances are matched one by one,
+            # which is how you find `granite` without remembering it lives in `StoneType`.
+            shown = instances
+            if needle and needle not in name.lower():
+                shown = [i for i in instances if needle in i.name.lower()]
+                if not shown:
+                    continue
+
             root = QTreeWidgetItem(
                 [name, f"{len(instances)} × {len(slots)}" if instances else f"{len(slots)} slots"])
+            # `len(instances)`, not `len(shown)`: the count is a fact about the blueprint,
+            # and a filter is a lens rather than an edit. "1 × 10" while you have `granite`
+            # typed would be a lie about the schema that outlives your search term.
             root.setForeground(1, Qt.darkGray)
             root.setTextAlignment(1, Qt.AlignRight | Qt.AlignVCenter)
             root.setData(0, _ROLE_BLUEPRINT, name)
             root.setToolTip(0, f"{len(slots)} slots, {len(instances)} instances\n\n"
                                f"double-click to open the schema")
+            # The icon follows the row's own colour rather than staying neutral: a
+            # blueprint with orphaned instances is one broken thing, and half a red row
+            # reads as a rendering accident rather than as a state.
+            root.setIcon(0, icons.concept_icon(
+                "blueprints",
+                colour=style.ERROR if orphaned else style.TEXT_MUTED))
             if orphaned:
                 root.setForeground(0, style.qt_colour(style.ERROR))
             self._tree.addTopLevelItem(root)
             root.setExpanded(True)
 
-            for instance in instances:
+            for instance in shown:
                 if instance.name in orphaned:
                     note = "orphaned"
                 else:
@@ -109,6 +139,10 @@ class BlueprintsPanel(Panel):
                     note = f"{filled}/{len(slots)}"
                 child = QTreeWidgetItem([instance.name, note])
                 child.setTextAlignment(1, Qt.AlignRight | Qt.AlignVCenter)
+                child.setIcon(0, icons.ui_icon(
+                    "instance",
+                    colour=style.ERROR if instance.name in orphaned
+                    else style.TEXT_MUTED))
                 child.setData(0, _ROLE_BLUEPRINT, name)
                 child.setData(0, _ROLE_INSTANCE, instance.name)
                 if instance.name in orphaned:
@@ -118,7 +152,12 @@ class BlueprintsPanel(Panel):
                 elif note.startswith("0/"):
                     child.setForeground(1, Qt.darkGray)
                 root.addChild(child)
-        self._tree.resizeColumnToContents(0)
+
+        # Only while filtering. "No blueprints yet" above answers a different question, and
+        # showing it here would tell you your profile is empty when it is your search that
+        # is.
+        if needle and not self._tree.topLevelItemCount():
+            self._tree.addTopLevelItem(note_row("No blueprint or instance matches that"))
 
     def _selected(self):
         items = self._tree.selectedItems()
