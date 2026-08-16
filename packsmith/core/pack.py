@@ -132,8 +132,13 @@ class _Tags:
         self._taken = set()          # cells this step took from someone else
 
     def query(self, registry_type, tag_name, value):
-        """Entry IDs whose ``tag_name`` equals ``value`` in the committed store."""
-        return self._store.query(registry_type, **{tag_name: value})
+        """Entry IDs whose ``tag_name`` equals ``value``, including this step's own writes.
+
+        Staged-first like every other read on `pack`. It used to consult only the committed
+        store, which meant an action could write a cell and then fail to find it a line
+        later — the one place read-your-writes did not hold.
+        """
+        return self._staging.query(registry_type, tag_name, value)
 
     def get(self, registry_type, entry_id, tag_name):
         return self._staging.read(registry_type, entry_id, tag_name)

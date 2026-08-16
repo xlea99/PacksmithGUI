@@ -306,7 +306,13 @@ class TagStore:
         sql = (f"SELECT DISTINCT entry_id FROM tag_assignments "
                f"WHERE tag_id IN ({id_placeholders}) AND {' AND '.join(conditions)}")
         rows = self._db.fetch_all(sql, tuple(params))
-        return [row["entry_id"] for row in rows]
+        # Sorted, because the SQL has no ORDER BY and SQLite is therefore free to return
+        # these in whatever order the query plan happens to produce. Every caller here
+        # treats the result as a set — but an *action* iterates it, and an action that
+        # writes numbered output or stops after N entries would then produce different
+        # files on different runs. §7.4 keeps a clock and randomness out of the capability
+        # catalog precisely so a run is reproducible; an unordered query is the same hole.
+        return sorted(row["entry_id"] for row in rows)
 
     # The value a PRISTINE cell reads: the tag's default (cast to its type), or None
     # if the tag has no default (or isn't defined). Note this is purely about VALUE —

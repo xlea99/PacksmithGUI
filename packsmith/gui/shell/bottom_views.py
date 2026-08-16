@@ -60,6 +60,7 @@ class _SummaryView(QWidget):
 
 
 _BAD_STATUSES = {"failed", "partial"}
+_ROLE_JOB_RUN = Qt.UserRole + 1     # job_runs id, on a run's top-level row
 
 
 class JobResultsView(_SummaryView):
@@ -67,6 +68,7 @@ class JobResultsView(_SummaryView):
     beneath; a standalone action run (no job) appears on its own."""
 
     rolled_back = Signal()
+    report_requested = Signal(int)      # job_runs id
 
     def __init__(self, history, job_history=None, tag_store=None, file_store=None,
                  parent=None, blueprint_store=None):
@@ -80,7 +82,13 @@ class JobResultsView(_SummaryView):
         self._tree.setRootIsDecorated(True)
         self._tree.setContextMenuPolicy(Qt.CustomContextMenu)
         self._tree.customContextMenuRequested.connect(self._on_context_menu)
+        self._tree.itemDoubleClicked.connect(self._on_activated)
         self.refresh()
+
+    def _on_activated(self, item, _column=0):
+        run_id = item.data(0, _ROLE_JOB_RUN)
+        if run_id is not None:
+            self.report_requested.emit(int(run_id))
 
     # --- rollback (design 3.3.2: steps are independently rollback-able) -----
 
@@ -151,6 +159,10 @@ class JobResultsView(_SummaryView):
                 f"{len(children)} step(s)" if children else "—",
                 (run.get("finished_at") or "")[:19].replace("T", " "),
             ])
+            # The way through to the full report. This strip is where you learn THAT a run
+            # happened; §4.1 already ruled that reading WHAT it did belongs in a tab.
+            item.setData(0, _ROLE_JOB_RUN, run["id"])
+            item.setToolTip(0, f"{run['job_name']} — double-click to open the report")
             if run["status"] in _BAD_STATUSES:
                 item.setForeground(1, Qt.red)
             for child in children:

@@ -36,11 +36,22 @@ class StepRunStore:
         return cur.lastrowid
 
     def mark_rolled_back(self, run_id: int):
-        """Flag a step as reversed (design 3.3.3's `rolled_back` status). Its rollback
-        data is cleared with it, so the same step can't be rolled back twice."""
+        """Flag a step as reversed (design 3.3.3's `rolled_back` status). Its **inverse** is
+        cleared with it, so the same step can't be rolled back twice.
+
+        The change record survives. History is a record of what happened, and undoing a step
+        does not unhappen it — a report of a rolled-back run still has to be able to say
+        what it did, which is most of why you would open one.
+        """
+        row = self.get(run_id) or {}
+        try:
+            kept = json.loads(row.get("rollback_data") or "{}").get("changes", [])
+        except (TypeError, ValueError):
+            kept = []
         self._db.execute(
             "UPDATE step_runs SET status = 'rolled_back', rollback_data = ? WHERE id = ?",
-            (json.dumps({"l2": [], "files": {}, "blueprints": []}), run_id))
+            (json.dumps({"l2": [], "files": {}, "blueprints": [], "changes": kept}),
+             run_id))
 
     def for_job_run(self, job_run_id: int) -> list[dict]:
         return [dict(r) for r in self._db.fetch_all(

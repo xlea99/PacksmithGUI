@@ -245,6 +245,26 @@ class EditorHost(QObject):
             changed.append(key)
         return changed
 
+    # --- diffs ---------------------------------------------------------------
+
+    def open_diff(self, key: str, original: str, modified: str, path: str):
+        """Show two versions of one file side by side, read-only.
+
+        Uses the SAME web view — §4.2's "one Chromium process however many tabs" holds for
+        diffs too. Inside the page they are a second Monaco editor on a second div, because
+        a diff editor is a different object from a normal one and cannot share its node;
+        only one of the two is ever visible.
+        """
+        self._js(f"openDiff({self._quote(key)}, {self._quote(original or '')}, "
+                 f"{self._quote(modified or '')}, {self._quote(language_for(path))})")
+        return key
+
+    def show_diff(self, key: str):
+        self._js(f"showDiff({self._quote(key)})")
+
+    def close_diff(self, key: str):
+        self._js(f"closeDiff({self._quote(key)})")
+
     def request_save(self, key: str):
         """Ask Monaco for the buffer, which comes back through the save signal."""
         self.view.page().runJavaScript(
@@ -397,6 +417,65 @@ class EditorTab(QWidget):
     @property
     def is_dirty(self) -> bool:
         return "unsaved" in self._status.text()
+
+
+class DiffTab(QWidget):
+    """Two versions of one file, side by side (design 3.3's run report).
+
+    Shaped like :class:`EditorTab` on purpose — a placeholder the shared view moves into,
+    plus a strip saying what is being compared — so the workspace needs no idea that this
+    is a different kind of thing.
+
+    Read-only throughout. This shows what a step *did*; changing it back is rollback, which
+    is a different act with a different button.
+    """
+
+    def __init__(self, host: EditorHost, key: str, path: str, *, left: str, right: str,
+                 original: str, modified: str, note: str = "", parent=None):
+        super().__init__(parent)
+        self.key = key
+        self.path = path
+        self._host = host
+
+        self.setAutoFillBackground(True)
+        self.setStyleSheet(f"background: {style.BG_DEEP};")
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        strip = QWidget()
+        row = QHBoxLayout(strip)
+        row.setContentsMargins(8, 3, 8, 3)
+        caption = QLabel(f"{left}   →   {right}")
+        caption.setStyleSheet(f"color: {style.TEXT_MUTED}; font-size: 11px;")
+        row.addWidget(caption)
+        row.addStretch()
+        if note:
+            # The one thing a stored diff can be wrong about: the file has moved on since
+            # the run. The hash recorded at commit time is what lets this be said rather
+            # than guessed.
+            warning = QLabel(note)
+            warning.setStyleSheet(f"color: {style.WARNING}; font-size: 11px;")
+            row.addWidget(warning)
+        strip.setStyleSheet(
+            f"background: {style.BG_PANEL}; border-bottom: 1px solid {style.BORDER};")
+        layout.addWidget(strip)
+
+        self.slot = QWidget()
+        self.slot.setAutoFillBackground(True)
+        self.slot.setStyleSheet(f"background: {style.BG_DEEP};")
+        QVBoxLayout(self.slot).setContentsMargins(0, 0, 0, 0)
+        layout.addWidget(self.slot, 1)
+
+        host.open_diff(key, original, modified, path)
+
+    def activate(self):
+        self._host.attach_to(self.slot)
+        self._host.show_diff(self.key)
+
+    def detach(self):
+        self._host.release_from(self.slot)
+        self._host.close_diff(self.key)
 
 
 class UnsupportedFileTab(QWidget):

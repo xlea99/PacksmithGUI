@@ -516,6 +516,7 @@ class JobEditorTab(QWidget):
 
     changed = Signal()             # the job was modified; panels should refresh
     run_requested = Signal(object)  # Job
+    dry_run_requested = Signal(object)  # Job — walk it, promote nothing
 
     def __init__(self, job, *, job_store, package_index, tag_store, parent=None,
                  blueprint_store=None, packdump=None, pack_targets=None):
@@ -544,6 +545,21 @@ class JobEditorTab(QWidget):
         self._default_policy.currentIndexChanged.connect(self._on_policy_changed)
         header.addWidget(self._default_policy)
         header.addStretch()
+        dry = QPushButton()
+        icons.mark(dry, "dry_run", text="Dry run")
+        dry.setToolTip("Walk every step and change nothing")
+        dry.setStyleSheet(f"""
+            QPushButton {{
+                background: {style.BG_CHROME}; color: {style.TEXT_MUTED};
+                border: 1px solid {style.BORDER};
+                padding: 3px 14px; font-size: 12px;
+            }}
+            QPushButton:hover {{ color: {style.TEXT};
+                                 border-color: {style.ACCENT_EDGE}; }}
+        """)
+        dry.clicked.connect(lambda: self.dry_run_requested.emit(self.job()))
+        header.addWidget(dry)
+
         run = QPushButton()
         icons.mark(run, "play", text="Run job")
         run.setStyleSheet(f"""

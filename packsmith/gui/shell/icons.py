@@ -266,6 +266,9 @@ UI_GLYPHS = {
     # panel's play, because this page does not run anything — play would promise a
     # button that isn't there. An action is the *capability*; a job is the trigger.
     "action": "\ue2de",         # lightning
+    # A DRY run. An eye rather than a second play button: the gesture is looking, not
+    # running, and two triangles side by side would say the opposite.
+    "dry_run": "\ue220",        # eye
     "datapacks": "\ue390",      # package — a datapack IS a pack
     "resourcepacks": "\ue6c8",  # palette — assets rather than data
     # An ACTION package (design 3.3.1). The same glyph as `datapacks`, under its own

@@ -10,8 +10,11 @@ MVP scope: whole-file ownership only. Per-key ownership, comment-preserving
 round-trip parsers, and the content-addressed blob store are all deferred. Reads and
 writes are plain UTF-8 text within the instance root; paths are stored relative to it.
 """
+import hashlib
 import os
 from pathlib import Path
+
+from packsmith.core.staging import _side, classify
 
 
 class FileOwnershipError(Exception):
@@ -31,6 +34,23 @@ def _like_prefix(key: str) -> str:
     otherwise match ``someXmod`` and take an unrelated file's ownership record with it.
     """
     return key.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def content_hash(content: str) -> str:
+    """A file's identity for reporting. Hashed from the exact bytes that get written, which
+    is only a stable answer because writes no longer translate line endings."""
+    return hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+
+def _read_text(path) -> str:
+    """Read text with newline translation OFF — see the note on `FileStore`'s reads."""
+    with open(path, "r", encoding="utf-8", newline="") as f:
+        return f.read()
+
+
+def _write_text(path, content: str):
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        f.write(content)
 
 
 class FileStore:
@@ -85,10 +105,25 @@ class FileStore:
         return p
 
     # --- reads ---
+    #
+    # `newline=""` on every text read and write in this class, deliberately. Python's
+    # default (`newline=None`) translates in BOTH directions: `\n` becomes `os.linesep` on
+    # the way out and every ending becomes `\n` on the way back. Two consequences, both bad
+    # here:
+    #
+    # * **It corrupts.** Writing "a\r\nb" puts `a\r\r\nb` on disk, which reads back as
+    #   "a\n\nb" — the file gained a blank line nobody asked for.
+    # * **It rewrites files an action barely touched.** A `.toml` with CRLF endings, read,
+    #   one key changed, written back, comes out entirely LF — every line reported as
+    #   modified. Mod configs are the canonical thing actions edit, and §6.1's whole-file
+    #   ownership means we hand back what we were given plus the change.
+    #
+    # With translation off, a round trip is byte-exact and the file's own line endings
+    # survive. See `tests/test_fidelity.py`.
 
     def read(self, rel_path: str):
         p = self._abs(rel_path)
-        return p.read_text(encoding="utf-8") if p.is_file() else None
+        return _read_text(p) if p.is_file() else None
 
     def exists(self, rel_path: str) -> bool:
         return self._abs(rel_path).is_file()
@@ -153,9 +188,9 @@ class FileStore:
         if file_must_exist and not p.is_file():
             raise FileNotFoundError(f"Expected file to exist: {rel_path}")
 
-        prior = p.read_text(encoding="utf-8") if p.is_file() else None
+        prior = _read_text(p) if p.is_file() else None
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(content, encoding="utf-8")
+        _write_text(p, content)
 
         self._db.execute(
             """INSERT INTO file_ownership (path, owner_kind, owner_action_ref)
@@ -258,7 +293,9 @@ class FileStore:
             return
         p = self._abs(rel_path)
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(prior_content, encoding="utf-8")
+        # Same rule as `write`, and it matters most here: a rollback that re-translated
+        # line endings would restore a file that is not the file it snapshotted.
+        _write_text(p, prior_content)
         if prior_ownership:
             self._db.execute(
                 """INSERT INTO file_ownership (path, owner_kind, owner_action_ref)
@@ -290,6 +327,7 @@ class FileStaging:
         # two rollback snapshots — and the second snapshot captures the FIRST write's
         # content, so rolling back would restore mid-step state rather than the prior file.
         self._pending = {}   # key -> {"path", "content", "owner", "owner_action_ref", …}
+        self._touched = set()   # written by the current step — see `L2Staging._touched`
         self.snapshots = {}  # key -> prior content (or None), populated at commit
 
     def logs_to(self, log):
@@ -329,6 +367,7 @@ class FileStaging:
             "path": rel_path, "content": content, "owner": owner,
             "owner_action_ref": owner_action_ref, "file_must_exist": file_must_exist,
         }
+        self._touched.add(key)
 
     def read(self, rel_path):
         staged = self._pending.get(self._store.key(rel_path))
@@ -350,18 +389,54 @@ class FileStaging:
     def has_pending(self) -> bool:
         return bool(self._pending)
 
-    def pending(self) -> list:
-        """What this buffer WOULD write, as plain data.
+    def begin_step(self):
+        self._touched = set()
+        return dict(self._pending)
 
-        The content is carried, not just the path: for a file the question "what would
-        this action do" is answered by the bytes, and a preview that only listed paths
-        would be a table of contents rather than a preview.
+    def rollback(self, savepoint):
+        self._pending = dict(savepoint)
+        self._touched = set()
+
+    def changes(self, since=None) -> list:
+        """What this buffer would DO, classified, in the shape the other engines use.
+
+        The content is carried on both sides, not just the path: for a file the question
+        "what would this action do" is answered by the bytes, and a preview that only
+        listed paths would be a table of contents rather than a preview. It is also the
+        only way a dry run can be diffed at all — there is nothing on disk to compare to.
+
+        `after` additionally carries a **hash**. A committed run does not persist the new
+        bytes (§1.1 flags the store-by-path snapshot as deliberately quick-and-dirty
+        pending the content-addressed blob store, so doubling it is the wrong direction) —
+        it keeps the hash, which is enough to tell a diff you can trust from one where the
+        file has been edited since. §3.3's crash recovery asks for the same value.
         """
-        return sorted(
-            ({"engine": "file", "path": path, "action": "write",
-              "value": staged["content"], "owner": staged["owner"]}
-             for path, staged in self._pending.items()),
-            key=lambda d: d["path"])
+        described = []
+        keys = self._touched if since is not None else self._pending.keys()
+        for key in list(keys):
+            staged = self._pending.get(key)
+            if staged is None:
+                continue                       # rolled back out from under us
+            path = staged["path"]
+            earlier = since.get(key) if since is not None else None
+            if earlier is not None:
+                # An earlier step staged this file, so ITS bytes are what this step is
+                # editing — the same relation a committed earlier step would have.
+                before = _side(earlier["content"], earlier["owner"],
+                               earlier["owner_action_ref"])
+            elif self._store.exists(path):
+                prior_owner = self._store.ownership(path) or {}
+                before = _side(self._store.read(path), prior_owner.get("kind"),
+                               prior_owner.get("action_ref"))
+            else:
+                before = None
+            after = _side(staged["content"], staged["owner"], staged["owner_action_ref"])
+            after["hash"] = content_hash(staged["content"])
+            described.append({
+                "engine": "file", "path": path, "kind": classify(before, after),
+                "before": before, "after": after,
+            })
+        return sorted(described, key=lambda d: d["path"])
 
     def commit(self):
         # No existence pre-flight here any more, deliberately. §7.3 puts that guard "at the

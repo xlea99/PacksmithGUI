@@ -15,13 +15,18 @@
 <meta charset="utf-8">
 <style>
     html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: #1e1e1e; }
-    #editor { width: 100%; height: 100%; }
+    #editor, #diff { width: 100%; height: 100%; }
+    /* Two editors, one visible at a time. A diff editor is a different Monaco object from
+       a normal one and cannot share its DOM node, so it gets its own — but it is still the
+       same web view, which is the §4.2 promise: one Chromium process however many tabs. */
+    #diff { display: none; }
     #loading { color: #666; font-family: monospace; padding: 20px; }
 </style>
 </head>
 <body>
 <div id="loading">Loading editor…</div>
 <div id="editor"></div>
+<div id="diff"></div>
 
 <script src="qrc:///qtwebchannel/qwebchannel.js"></script>
 <script src="./vendor/monaco/vs/loader.js"></script>
@@ -115,6 +120,9 @@
 
     function showModel(key) {
         if (!editor || !models[key]) return false;
+        // Coming back from a diff: put the normal editor in front again.
+        document.getElementById('diff').style.display = 'none';
+        document.getElementById('editor').style.display = 'block';
         if (current && models[current]) models[current].viewState = editor.saveViewState();
         current = key;
         const entry = models[key];
@@ -131,6 +139,62 @@
         if (current === key) { current = null; editor.setModel(null); }
         entry.model.dispose();
         delete models[key];
+        return true;
+    }
+
+    // --- diffs (design 3.3's run report) ---------------------------------------------
+    //
+    // Created lazily: most sessions never open one, and a second Monaco editor costs
+    // layout work at startup for nothing. Diff models are separate from `models` because
+    // they are read-only pairs with no dirty state, no baseline and nothing to save —
+    // filing them together would mean every save path had to ask which kind it had.
+
+    let diffEditor = null;
+    const diffs = {};          // key -> { original, modified }
+
+    function ensureDiffEditor() {
+        if (!diffEditor) {
+            diffEditor = monaco.editor.createDiffEditor(document.getElementById('diff'), {
+                theme: 'vs-dark', automaticLayout: true, readOnly: true,
+                originalEditable: false, renderSideBySide: true,
+                scrollBeyondLastLine: false, fontSize: 14,
+            });
+        }
+        return diffEditor;
+    }
+
+    function openDiff(key, original, modified, language) {
+        if (!monaco) return false;
+        ensureDiffEditor();
+        if (!diffs[key]) {
+            diffs[key] = {
+                original: monaco.editor.createModel(original, language || 'plaintext'),
+                modified: monaco.editor.createModel(modified, language || 'plaintext'),
+            };
+        }
+        showDiff(key);
+        return true;
+    }
+
+    function showDiff(key) {
+        const entry = diffs[key];
+        if (!entry) return false;
+        // The normal editor keeps its model — switching back is `showModel`, and losing
+        // view state because you glanced at a diff would be its own small betrayal.
+        document.getElementById('editor').style.display = 'none';
+        document.getElementById('diff').style.display = 'block';
+        ensureDiffEditor().setModel({ original: entry.original, modified: entry.modified });
+        diffEditor.layout();
+        return true;
+    }
+
+    function closeDiff(key) {
+        const entry = diffs[key];
+        if (!entry) return false;
+        if (diffEditor) diffEditor.setModel(null);
+        entry.original.dispose();
+        entry.modified.dispose();
+        delete diffs[key];
         return true;
     }
 

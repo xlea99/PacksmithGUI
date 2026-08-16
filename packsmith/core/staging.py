@@ -17,6 +17,59 @@ is a separate concern handled elsewhere.
 _DELETE = object()
 
 
+# --- one record shape, for every engine and both producers ---------------------------------
+#
+# A dry run and a real run must describe themselves identically, or a report cannot serve
+# both — and the whole proposition of the report is that the preview IS the run. So each
+# buffer emits the same thing, and it emits it in the same place either way: `changes()` is
+# read by `preview_step` before discarding, and by `run_action` just before committing.
+#
+#     {engine, <key fields>, kind, before: {...} | None, after: {...} | None}
+#
+# `before` and `after` are **None for absent** — pristine cell, unbound slot, file that did
+# not exist — which is the distinction §3.2.1 turns on and the one a bare value cannot
+# carry. A cell displaying its default is absent; a cell explicitly set to that same default
+# is present. They are different facts and the report has to show them differently.
+
+ADDED, CHANGED, REMOVED, CLAIMED, UNCHANGED, CREATED = (
+    "added", "changed", "removed", "claimed", "unchanged", "created")
+
+
+def classify(before, after) -> str:
+    """What a staged write actually did to a cell.
+
+    **`claimed` is the one worth having.** An action writing `true` over a user-owned
+    `true` changes nothing you can see and everything about what happens next: §3.2.1 makes
+    ownership a property of the assignment's existence, so that cell is now the action's and
+    it will keep rewriting it. A classifier comparing values alone would call it unchanged,
+    which is the report lying at exactly the point ownership matters.
+
+    **`unchanged` is kept rather than dropped.** A re-run of a removal job saying "197
+    already removed, 3 newly removed" is a better answer than one silently listing 3, and
+    keeping every staged write in the output is also what lets a caller check that a run and
+    its preview staged the *same set* of cells, not merely reached the same end state.
+    """
+    if before is None and after is None:
+        return UNCHANGED                       # clearing a cell that was already pristine
+    if before is None:
+        return ADDED
+    if after is None:
+        return REMOVED
+    # Values compare directly because the store round-trips them faithfully — see
+    # `tests/test_fidelity.py`. Without that guarantee a committed `True` read back as `1`
+    # would classify as `changed` against a staged `True`, and every re-run would report
+    # spurious edits.
+    if before["value"] != after["value"]:
+        return CHANGED
+    if (before["owner"], before["action_ref"]) != (after["owner"], after["action_ref"]):
+        return CLAIMED
+    return UNCHANGED
+
+
+def _side(value, owner, action_ref) -> dict:
+    return {"value": value, "owner": owner, "action_ref": action_ref}
+
+
 class L2Staging:
     """Buffers tag-assignment writes for one action step over a TagStore.
 
@@ -28,18 +81,28 @@ class L2Staging:
         self._tags = tag_store
         # (registry_type, entry_id, tag_name) -> {"value", "owner", "owner_action_ref"} | _DELETE
         self._pending = {}
+        # Which keys the CURRENT step has written, reset by `begin_step`. Recorded rather
+        # than inferred: comparing a key's staged entry against the savepoint by identity
+        # looks like it works and silently fails on `_DELETE`, which is one shared
+        # sentinel — so a second step deleting a cell an earlier step already deleted was
+        # reported by a real run and dropped by a dry one.
+        self._touched = set()
         # Populated at commit: each cell's PRIOR state, for rollback.
         self.inverse = []
 
     # --- staging writes (no DB contact) ---
 
     def write(self, registry_type, entry_id, tag_name, value, *, owner, owner_action_ref=None):
-        self._pending[(registry_type, entry_id, tag_name)] = {
+        key = (registry_type, entry_id, tag_name)
+        self._pending[key] = {
             "value": value, "owner": owner, "owner_action_ref": owner_action_ref,
         }
+        self._touched.add(key)
 
     def delete(self, registry_type, entry_id, tag_name):
-        self._pending[(registry_type, entry_id, tag_name)] = _DELETE
+        key = (registry_type, entry_id, tag_name)
+        self._pending[key] = _DELETE
+        self._touched.add(key)
 
     # --- reads (read-your-writes: staged shadows committed) ---
 
@@ -60,26 +123,94 @@ class L2Staging:
             return None  # pristine
         return {"kind": staged["owner"], "action_ref": staged["owner_action_ref"]}
 
+    def query(self, registry_type, tag_name, value) -> list:
+        """Entry ids where ``tag_name == value``, **with this buffer folded in**.
+
+        The one read that used to go straight to the store, which made it the only place
+        an action could not see its own writes: write `remove = true`, then query for
+        `remove == true`, and the entry you just wrote was missing. Every other read here
+        is staged-first, and `blueprints.gaps` explicitly advertises the opposite
+        behaviour — so this was an inconsistency rather than a policy.
+
+        Matching is done the way the STORE does it — `str()` on both sides — because that
+        is what the SQL compares once these writes commit. Reproducing the store's answer
+        is the whole job: a dry run and a real run must agree, and they only can if the
+        overlay computes what the store would have said.
+
+        A staged **delete** is dropped from the result rather than re-tested against the
+        tag's default. After a commit the row is gone, and the store selects FROM
+        assignments — so a pristine cell cannot match, whatever its default displays as.
+        """
+        matched = set(self._tags.query(registry_type, **{tag_name: value}))
+        wanted = str(value)
+        for (staged_registry, entry_id, staged_tag), staged in self._pending.items():
+            if staged_registry != registry_type or staged_tag != tag_name:
+                continue
+            if staged is not _DELETE and str(staged["value"]) == wanted:
+                matched.add(entry_id)
+            else:
+                matched.discard(entry_id)
+        return sorted(matched)
+
     # --- lifecycle ---
 
     @property
     def has_pending(self) -> bool:
         return bool(self._pending)
 
-    def pending(self) -> list:
-        """What this buffer WOULD write, as plain data — design 3.3's dry run, read.
+    # --- step boundaries ---
+    #
+    # A buffer shared across a whole job needs "undo just this step" rather than `discard`,
+    # which would take the earlier steps with it. Entries are always REPLACED, never mutated
+    # in place, so a shallow copy is a complete snapshot of what earlier steps staged.
+
+    def begin_step(self):
+        """Start a step: forget what the last one touched, snapshot what it left behind.
+
+        Called exactly once per step, by the runner. Resetting the touched set here rather
+        than exposing a separate call is deliberate — two things that must happen together
+        should not be two things a caller can forget to pair.
+        """
+        self._touched = set()
+        return dict(self._pending)
+
+    def rollback(self, savepoint):
+        self._pending = dict(savepoint)
+        self._touched = set()
+
+    def changes(self, since=None) -> list:
+        """What this buffer would DO, classified — design 3.3's dry run, read.
+
+        ``since`` is the savepoint from :meth:`begin_step`. Given one, only the keys this
+        step touched are reported, and a cell an **earlier** step staged is this step's
+        ``before`` — exactly as an earlier step's committed writes would be in a real run.
+        That is the whole reason a multi-step dry run can be 1:1 with a real one rather than
+        approximately so.
 
         Sorted and free of internals so two runs of the same action can be compared
         directly; that comparison is the whole point (see `runner.preview_step`).
         """
         described = []
-        for (registry_type, entry_id, tag_name), staged in self._pending.items():
+        keys = self._touched if since is not None else self._pending.keys()
+        for key in list(keys):
+            staged = self._pending.get(key)
+            if staged is None:
+                continue                       # rolled back out from under us
+            registry_type, entry_id, tag_name = key
+            earlier = since.get(key) if since is not None else None
+            if earlier is not None:
+                before = None if earlier is _DELETE else _side(
+                    earlier["value"], earlier["owner"], earlier["owner_action_ref"])
+            else:
+                prior = self._tags.assignment(registry_type, entry_id, tag_name)
+                before = None if prior is None else _side(
+                    prior.value, prior.owner, prior.action_ref)
+            after = None if staged is _DELETE else _side(
+                staged["value"], staged["owner"], staged["owner_action_ref"])
             described.append({
                 "engine": "tag", "registry_type": registry_type, "entry_id": entry_id,
-                "tag": tag_name,
-                "action": "delete" if staged is _DELETE else "write",
-                "value": None if staged is _DELETE else staged["value"],
-                "owner": None if staged is _DELETE else staged["owner"],
+                "tag": tag_name, "kind": classify(before, after),
+                "before": before, "after": after,
             })
         return sorted(described, key=lambda d: (d["registry_type"], d["entry_id"], d["tag"]))
 
@@ -131,20 +262,28 @@ class BlueprintStaging:
         self._pending = {}
         # (blueprint, instance) -> created_by
         self._new_instances = {}
+        # See `L2Staging._touched` — same reason, one set per collection.
+        self._touched = set()
+        self._touched_instances = set()
         self.inverse = []
 
     # --- staging writes (no DB contact) ---
 
     def create_instance(self, blueprint, instance, *, created_by=None):
         self._new_instances[(blueprint, instance)] = created_by
+        self._touched_instances.add((blueprint, instance))
 
     def write(self, blueprint, instance, slot_path, value, *, owner, owner_action_ref=None):
-        self._pending[(blueprint, instance, slot_path)] = {
+        key = (blueprint, instance, slot_path)
+        self._pending[key] = {
             "value": value, "owner": owner, "owner_action_ref": owner_action_ref,
         }
+        self._touched.add(key)
 
     def delete(self, blueprint, instance, slot_path):
-        self._pending[(blueprint, instance, slot_path)] = _DELETE
+        key = (blueprint, instance, slot_path)
+        self._pending[key] = _DELETE
+        self._touched.add(key)
 
     # --- reads (read-your-writes) ---
 
@@ -187,21 +326,65 @@ class BlueprintStaging:
     def has_pending(self) -> bool:
         return bool(self._pending or self._new_instances)
 
-    def pending(self) -> list:
-        """What this buffer WOULD write, as plain data. Instance creations are included:
-        they are staged too, so a dry run that omitted them would under-report."""
-        described = [
-            {"engine": "blueprint", "blueprint": blueprint, "instance": instance,
-             "slot": None, "action": "create", "value": None, "owner": created_by}
-            for (blueprint, instance), created_by in self._new_instances.items()
-        ]
-        for (blueprint, instance, slot_path), staged in self._pending.items():
+    def begin_step(self):
+        self._touched = set()
+        self._touched_instances = set()
+        return (dict(self._pending), dict(self._new_instances))
+
+    def rollback(self, savepoint):
+        pending, instances = savepoint
+        self._pending = dict(pending)
+        self._new_instances = dict(instances)
+        self._touched = set()
+        self._touched_instances = set()
+
+    def changes(self, since=None) -> list:
+        """What this buffer would DO, classified. Instance creations are included: they are
+        staged too, so a dry run that omitted them would under-report — and creating an
+        instance is exactly the change §3.2.2 cares most about, since it is a new row of
+        gaps to fill.
+
+        ``since`` behaves as it does on :class:`L2Staging` — see there."""
+        since_pending, since_instances = since if since is not None else (None, None)
+        described = []
+        instance_keys = (self._touched_instances if since is not None
+                         else self._new_instances.keys())
+        for key in list(instance_keys):
+            if key not in self._new_instances:
+                continue                       # rolled back out from under us
+            blueprint, instance = key
+            created_by = self._new_instances[key]
+            # `commit` skips a create for an instance that already exists, so this has to
+            # as well, or a re-run reports inventing something that was already there.
+            exists = any(i.name == instance for i in self._safe_instances(blueprint))
             described.append({
                 "engine": "blueprint", "blueprint": blueprint, "instance": instance,
-                "slot": slot_path,
-                "action": "unbind" if staged is _DELETE else "bind",
-                "value": None if staged is _DELETE else staged["value"],
-                "owner": None if staged is _DELETE else staged["owner"],
+                "slot": None, "kind": UNCHANGED if exists else CREATED,
+                "before": None,
+                "after": None if exists else _side(None, "action", created_by),
+            })
+        slot_keys = self._touched if since is not None else self._pending.keys()
+        for key in list(slot_keys):
+            staged = self._pending.get(key)
+            if staged is None:
+                continue
+            blueprint, instance, slot_path = key
+            earlier = since_pending.get(key) if since_pending is not None else None
+            if earlier is not None:
+                before = None if earlier is _DELETE else _side(
+                    earlier["value"], earlier["owner"], earlier["owner_action_ref"])
+            else:
+                prior = None
+                if any(i.name == instance for i in self._safe_instances(blueprint)):
+                    prior = self._store.bindings(blueprint, instance).get(slot_path)
+                before = None if prior is None else _side(
+                    prior.value, prior.owner, prior.action_ref)
+            after = None if staged is _DELETE else _side(
+                staged["value"], staged["owner"], staged["owner_action_ref"])
+            described.append({
+                "engine": "blueprint", "blueprint": blueprint, "instance": instance,
+                "slot": slot_path, "kind": classify(before, after),
+                "before": before, "after": after,
             })
         return sorted(described,
                       key=lambda d: (d["blueprint"], d["instance"], d["slot"] or ""))

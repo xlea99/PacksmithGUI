@@ -9,6 +9,7 @@ undo/redo).
 import dataclasses
 import re
 import time
+from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtWidgets import (
@@ -52,17 +53,20 @@ from packsmith.core.packages import (
 from packsmith.core.bindings import (
     best_guess_bindings, record_names, resolve_step, step_problems)
 from packsmith.core import filetypes
-from packsmith.core.files import FileStore
+from packsmith.core.files import FileStore, content_hash
 from packsmith.core.history import StepRunStore, JobRunStore
 from packsmith.core.views import ViewStore
 from packsmith.core.jobs import JobStore
 from packsmith.core.blueprints import BlueprintError, BlueprintStore
-from packsmith.core.job_runner import run_job
+from packsmith.core.job_runner import describe_summary, run_job
 
 from packsmith.gui.demo_views import demo_views
 from packsmith.gui.queries import blueprint_query, browse_query, tag_query
 from packsmith.gui.query_constructor import QueryConstructorDialog
+from packsmith.core import reports
+from packsmith.core.history import rollback_step
 from packsmith.gui.action_page import ActionPageTab
+from packsmith.gui.run_report import RunReportTab
 from packsmith.gui.encyclopedia import EncyclopediaTab
 from packsmith.gui import encyclopedia_pages
 from packsmith.gui.tag_editor import TagCreateDialog, EnumValuesDialog
@@ -70,7 +74,8 @@ from packsmith.gui.shell import icons, style
 from packsmith.gui.shell.sidebar import Sidebar, PanelStack
 from packsmith.gui.shell.workspace import Workspace
 from packsmith.gui.shell.bottom_panel import BottomPanel
-from packsmith.gui.shell.bottom_views import PackdumpView, JobResultsView, ErrorsView
+from packsmith.gui.shell.bottom_views import (
+    PackdumpView, JobResultsView, ErrorsView, _has_rollback)
 from packsmith.gui.shell.panels import PANEL_SPECS
 from packsmith.gui.shell.panels.base import StubPanel
 from packsmith.gui.shell.panels.registry_panel import RegistryPanel
@@ -78,7 +83,8 @@ from packsmith.gui.shell.panels.views_panel import ViewsPanel
 from packsmith.gui.shell.panels.tags_panel import TagsPanel
 from packsmith.gui.shell.panels.jobs_panel import JobsPanel
 from packsmith.gui.shell.panels.files_panel import FilesPanel
-from packsmith.gui.editor.host import EditorHost, EditorTab, UnsupportedFileTab
+from packsmith.gui.editor.host import (
+    DiffTab, EditorHost, EditorTab, UnsupportedFileTab)
 from packsmith.gui.editor.sources import (
     InstanceFileSource, JarMemberSource, PackageFileSource, is_overridable, member_path,
     split_member)
@@ -351,6 +357,7 @@ class MainWindow(QMainWindow):
         self._jobs_panel = JobsPanel(self._jobs.all(), readiness=self._job_problems)
         self._jobs_panel.job_activated.connect(self._open_job_editor)
         self._jobs_panel.run_requested.connect(self._run_job)
+        self._jobs_panel.dry_run_requested.connect(self._dry_run_job)
         self._jobs_panel.new_job_requested.connect(self._new_job)
         self._jobs_panel.rename_requested.connect(self._rename_job)
         self._jobs_panel.delete_requested.connect(self._delete_job)
@@ -476,6 +483,7 @@ class MainWindow(QMainWindow):
                                  tag_store=self._tags, file_store=self._file_store,
                                  blueprint_store=self._blueprints)
         results.rolled_back.connect(self._on_rolled_back)
+        results.report_requested.connect(self.open_run_report)
         self._bottom.set_panel("job_results", results)
         errors = ErrorsView(self._tags, self._packdump,
                             job_store=self._jobs, package_index=self._packages,
@@ -547,6 +555,8 @@ class MainWindow(QMainWindow):
                           activated=lambda: self._bottom.toggle()),
                 QShortcut(QKeySequence("Ctrl+R"), self,
                           activated=self._run_selected_job),
+                QShortcut(QKeySequence("Ctrl+Shift+R"), self,
+                          activated=lambda: self._run_selected_job(dry_run=True)),
             ]
 
     def _resize_bottom(self, splitter, opened: bool):
@@ -619,6 +629,7 @@ class MainWindow(QMainWindow):
         # panel to press play. See gui/run_control.py.
         self._run_control = RunControl()
         self._run_control.run_requested.connect(self._run_job)
+        self._run_control.dry_run_requested.connect(self._dry_run_job)
 
         lay.addWidget(name)
         lay.addStretch()
@@ -2334,7 +2345,10 @@ class MainWindow(QMainWindow):
         that wasn't in front any more. A status bar that is wrong is worse than one that is
         empty, because you have no way to tell which."""
         self._reconcile(widget)
-        if isinstance(widget, EditorTab):
+        if isinstance(widget, (EditorTab, DiffTab)):
+            # Both hold the one shared web view (§4.2), so both have to claim it back when
+            # they come forward — a diff left un-activated shows whatever the last editor
+            # tab had in it.
             widget.activate()
             self._set_status(self._status_for(widget))
         else:
@@ -2457,6 +2471,8 @@ class MainWindow(QMainWindow):
             # with it as a child.
             widget.detach()
             self._editor_host.close_document(widget.key)
+        elif isinstance(widget, DiffTab):
+            widget.detach()      # reclaims the view and disposes both diff models
         for key, tab in list(self._open_tabs.items()):
             if tab is widget:
                 del self._open_tabs[key]
@@ -2807,12 +2823,21 @@ class MainWindow(QMainWindow):
                            tag_store=self._tags, parent=self, packdump=self._packdump)
         tab.changed.connect(self._reload_jobs)
         tab.run_requested.connect(self._run_job)
+        tab.dry_run_requested.connect(self._dry_run_job)
         self._workspace.add_tab(tab, f"Job: {job.name}")
         self._open_tabs[key] = tab
         return tab
 
-    def _run_job(self, job):
-        """Execute a job: every step in order, each its own transaction (design 3.3.2)."""
+    def _dry_run_job(self, job):
+        return self._run_job(job, dry_run=True)
+
+    def _run_job(self, job, dry_run=False):
+        """Execute a job: every step in order, each its own transaction (design 3.3.2).
+
+        ``dry_run`` walks the identical path and promotes nothing. It is the same call with
+        one flag — not a second code path — because a preview produced by different code is
+        a preview that can disagree with the run.
+        """
         job = self._jobs.get(job.id)
         if job is None:
             return
@@ -2831,7 +2856,8 @@ class MainWindow(QMainWindow):
         self._job_running = True
         self._run_control.set_running(True)
         QApplication.setOverrideCursor(Qt.WaitCursor)
-        self._bottom.log(f"=== running job '{job.name}' ===")
+        verb = "dry-running" if dry_run else "running"
+        self._bottom.log(f"=== {verb} job '{job.name}' ===")
         try:
             result = run_job(job, blueprint_store=self._blueprints,
                              job_store=self._jobs, package_index=self._packages,
@@ -2839,14 +2865,38 @@ class MainWindow(QMainWindow):
                              file_store=self._file_store, history=self._history,
                              job_history=self._job_history,
                              pack_targets=self._pack_targets(),
-                             on_progress=self._on_job_progress)
+                             on_progress=self._on_job_progress,
+                             dry_run=dry_run)
         finally:
             QApplication.restoreOverrideCursor()
             self._job_running = False
             self._run_control.set_running(False)
 
+        if result.blocked:
+            # A pre-flight refusal never reaches a step, so it records nothing and the
+            # Job Results panel has nothing to show — leaving "failed, 0 steps run" as the
+            # entire explanation for a job that refused on purpose. §3.2.1 asks for the
+            # opposite: "won't start, here's what to relink".
+            detail = "; ".join(b.describe() for b in result.blocked[:3])
+            if len(result.blocked) > 3:
+                detail += f"; and {len(result.blocked) - 3} more"
+            refused = f"[{job.name}] won't run until relinked — {detail}"
+            self._bottom.log(refused)
+            self._set_status(refused)
+            self._bottom.show_panel("errors")
+            return
+
         summary = (f"[{job.name}] {result.status} — {len(result.step_results)} step(s) run"
                    + (f", {result.not_run} not reached" if result.not_run else ""))
+        if dry_run:
+            # The whole point of the gesture, so it goes in the headline rather than being
+            # left for the log. Until the report tab lands (§3.3's Pre-Run Preview) this
+            # count IS the answer — and "nothing" is a real one, which is how you find out
+            # a job you already ran is idempotent.
+            summary = (f"[{job.name}] dry run — would change "
+                       f"{describe_summary(result.summary())}"
+                       + (f"; {len(result.failed_steps)} step(s) failed"
+                          if result.failed_steps else ""))
         self._bottom.log(summary)
         self._bottom.set_status(summary)
         if result.status != "success":
@@ -2854,7 +2904,131 @@ class MainWindow(QMainWindow):
             # BOTTOM_TABS is reordered, and it silently means the wrong one.
             self._bottom.show_panel("job_results")
 
+        self._open_run_report(result)
+        if not dry_run:
+            # Nothing moved, so there is nothing to re-read — and a refresh here would
+            # rebuild every open table to show it exactly as it was.
+            self._refresh_after_run()
+
+    def _open_run_report(self, result):
+        """Open (or replace) the report for a run that just finished.
+
+        A **real** run is keyed by its `job_runs` id, so re-opening it from history lands on
+        the same tab. A **dry** run has no id and no history: each preview is its own
+        answer, so the previous one is closed rather than left beside it, which would leave
+        two tabs called the same thing describing different worlds.
+        """
+        if not result.step_results:
+            return                    # nothing ran; the status line already said why
+        finished = datetime.now().strftime("%H:%M:%S")
+        if result.dry_run:
+            stale = self._open_tabs.pop(("report", "dry"), None)
+            if stale is not None:
+                self._workspace.close_widget(stale)
+            key = ("report", "dry")
+        else:
+            # `run_id` is None when the run was not recorded — and then every unrecorded
+            # run would share one key, so the second would silently focus the first and
+            # show you the wrong report. An unkeyable run gets a key nothing else can
+            # match instead.
+            key = ("report", result.run_id if result.run_id is not None
+                   else ("unrecorded", id(result)))
+        report = reports.from_result(result, finished_at=finished, key=key)
+        return self._show_report(report, key)
+
+    def _show_report(self, report, key):
+        existing = self._open_tabs.get(key)
+        if existing is not None and self._workspace.focus_widget(existing):
+            return existing
+        tab = RunReportTab(report)
+        tab.status.connect(self._set_status)
+        # The report's key travels with the request, because a diff belongs to ONE run: two
+        # runs that both rewrote `emi.json` are two different before/after pairs, and a key
+        # of just the path would hand the second one the first one's tab.
+        tab.diff_requested.connect(
+            lambda change, k=key: self._open_file_diff(change, k))
+        tab.rollback_requested.connect(self._roll_back_step)
+        self._workspace.add_tab(tab, tab.title(), icon=tab.tab_icon())
+        self._open_tabs[key] = tab
+        return tab
+
+    def open_run_report(self, job_run_id):
+        """Re-open a recorded run from the bottom panel. Same tab type, same key — so a run
+        you already have open comes forward instead of opening twice."""
+        run = self._job_history.get(job_run_id)
+        if run is None:
+            return
+        report = reports.from_history(run, self._history.for_job_run(job_run_id))
+        return self._show_report(report, ("report", job_run_id))
+
+    def _roll_back_step(self, run_id):
+        """Reverse one committed step, from the report that shows what it did."""
+        step = self._history.get(run_id)
+        if step is None:
+            return
+        # Re-checked against the store, not against what the report said when it was built.
+        # A report is a snapshot: roll a step back, leave the tab open, right-click the same
+        # row again, and its menu still offers it. The second rollback would replay an
+        # emptied inverse — harmless, and it would report success at undoing nothing.
+        if not _has_rollback(step):
+            self._set_status(
+                f"{step['action_ref']} has already been rolled back")
+            return
+        if QMessageBox.question(
+                self, "Roll back step",
+                f"Undo everything '{step['action_ref']}' committed?\n\n"
+                f"Its writes are restored to what they were before the step ran. Later "
+                f"steps are NOT rolled back — each step is its own transaction (§3.3.2).",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
+            return
+        try:
+            rollback_step(run_id, tag_store=self._tags, history=self._history,
+                          file_store=self._file_store,
+                          blueprint_store=self._blueprints)
+        except (ValueError, KeyError) as e:
+            QMessageBox.warning(self, "Can't roll back", str(e))
+            return
+        self._set_status(f"Rolled back {step['action_ref']}")
         self._refresh_after_run()
+        self._bottom.refresh_panels()
+
+    def _open_file_diff(self, change, report_key=("report", None)):
+        """Show what a run did to one file — the snapshot on the left, today's bytes on
+        the right.
+
+        Where "today's bytes" come from is the whole subtlety. A run that just happened
+        carries the new content in memory; a run read back from history does not, because
+        §1.1 warns against growing the store-by-path snapshot and only the **hash** was
+        persisted. So the current file is read from disk and the hash decides whether it
+        can still be called the run's own output.
+        """
+        if change is None or change.get("engine") != "file":
+            return
+        path = change["path"]
+        before = (change.get("before") or {}).get("value") or ""
+        after = (change.get("after") or {}).get("value")
+        note = ""
+        if after is None:
+            after = self._file_store.read(path) or ""
+            expected = (change.get("after") or {}).get("hash")
+            if expected and content_hash(after) != expected:
+                note = "this file has been edited since the run"
+
+        tab_key = ("diff", report_key, path)
+        existing = self._open_tabs.get(tab_key)
+        if existing is not None and self._workspace.focus_widget(existing):
+            return existing
+        # The Monaco-side model key has to be unique for the same reason the tab key is:
+        # two diffs open on one path would otherwise share one pair of models, and the
+        # second `openDiff` would find them already there and show the first one's text.
+        tab = DiffTab(self._editor_host, f"diff:{report_key[1]}:{path}", path,
+                      left="before this run", right="now", original=before,
+                      modified=after, note=note)
+        self._workspace.add_tab(tab, f"Diff: {Path(path).name}",
+                                icon=icons.file_icon(Path(path).name,
+                                                     colour=style.TEXT_MUTED))
+        self._open_tabs[tab_key] = tab
+        return tab
 
     def _on_job_progress(self, progress):
         """Say what is happening, while it happens (design 3.3.2).
@@ -3020,12 +3194,13 @@ class MainWindow(QMainWindow):
             if job_id is not None:
                 save_ui_state(self._profile.name, last_job=int(job_id))
 
-    def _run_selected_job(self):
-        """Ctrl+R. The whole point of the control: re-running without going anywhere."""
+    def _run_selected_job(self, dry_run=False):
+        """Ctrl+R, or Ctrl+Shift+R for a dry one. The whole point of the control:
+        re-running without going anywhere."""
         control = getattr(self, "_run_control", None)
         job = control.current_job() if control is not None else None
         if job is not None:
-            self._run_job(job)
+            self._run_job(job, dry_run=dry_run)
 
     # --- dev seed ----------------------------------------------------------
 

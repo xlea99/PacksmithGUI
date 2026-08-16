@@ -34,6 +34,7 @@ class JobsPanel(Panel):
 
     job_activated = Signal(object)      # Job — open its editor tab
     run_requested = Signal(object)      # Job — execute now
+    dry_run_requested = Signal(object)  # Job — walk it, promote nothing
     new_job_requested = Signal()
     rename_requested = Signal(object)
     delete_requested = Signal(object)
@@ -160,6 +161,7 @@ class JobsPanel(Panel):
             menu.addAction("New Job…", lambda: self.new_job_requested.emit())
             return menu
         menu.addAction("Run now", lambda: self.run_requested.emit(job))
+        menu.addAction("Dry run", lambda: self.dry_run_requested.emit(job))
         menu.addAction("Edit steps…", lambda: self.job_activated.emit(job))
         menu.addSeparator()
         menu.addAction("Unpin" if job.pinned else "Pin",

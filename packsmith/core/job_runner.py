@@ -33,7 +33,7 @@ from datetime import datetime, timezone
 
 from packsmith.core.bindings import (
     resolve_step, conflict_policies_for, stale_bindings)
-from packsmith.core.runner import run_action, StepResult
+from packsmith.core.runner import Buffers, run_action, StepResult
 from packsmith.common.logging import log
 
 
@@ -46,6 +46,7 @@ class JobResult:
     run_id: int | None = None         # job_runs id, if recorded
     not_run: int = 0                  # steps never reached because something halted
     blocked: list = field(default_factory=list)   # StaleBinding: relinks owed (3.2.1)
+    dry_run: bool = False
 
     @property
     def ok(self) -> bool:
@@ -54,6 +55,30 @@ class JobResult:
     @property
     def failed_steps(self) -> list:
         return [r for r in self.step_results if not r.ok]
+
+    @property
+    def changes(self) -> list:
+        """Every change the run made, in step order. A dry run's list is what a real run's
+        would be — that equivalence is the point, and `tests/test_dry_run.py` asserts it."""
+        return [change for result in self.step_results for change in result.changes]
+
+    def summary(self) -> dict:
+        """How many real changes per engine — no-ops excluded, since "the action asserted a
+        cell that was already right" is not something that happened to the pack."""
+        counts = {}
+        for change in self.changes:
+            if change["kind"] != "unchanged":
+                counts[change["engine"]] = counts.get(change["engine"], 0) + 1
+        return counts
+
+
+def describe_summary(counts: dict) -> str:
+    """A run's headline, in words. "nothing" is a real and useful answer — a re-run of an
+    already-applied job changing nothing is how you learn it is idempotent."""
+    nouns = {"tag": "tag", "blueprint": "blueprint binding", "file": "file"}
+    parts = [f"{n} {nouns.get(engine, engine)}{'s' if n != 1 else ''}"
+             for engine, n in sorted(counts.items()) if n]
+    return ", ".join(parts) if parts else "nothing"
 
 
 @dataclass(frozen=True)
@@ -96,12 +121,20 @@ def count_action_steps(job, job_store, seen=frozenset()) -> int:
 
 def run_job(job, *, job_store, package_index, tag_store, packdump,
             file_store=None, history=None, job_history=None,
-            blueprint_store=None, pack_targets=None, on_progress=None) -> JobResult:
+            blueprint_store=None, pack_targets=None, on_progress=None,
+            dry_run=False) -> JobResult:
     """Run every step of ``job`` in order, honouring each step's error policy.
 
     Returns a JobResult; never raises for a failing step — failures are captured, exactly
     like ``run_action``. ``history`` records each action step; ``job_history`` records the
     run itself and links the steps to it.
+
+    ``dry_run=True`` walks the identical path and promotes nothing. **The steps still see
+    each other**: one set of staging buffers spans the whole job, so step 2 reads step 1's
+    staged writes exactly as it would read step 1's committed ones — every read on `pack`
+    is staged-first, so an action cannot tell which it got. A failing step rolls back to its
+    own savepoint, leaving earlier steps intact, which is what a real run's per-step commits
+    achieve. Nothing is recorded to history, because nothing happened.
     """
     # PRE-FLIGHT, before a run is even recorded. §3.2.1 requires a step bound to a renamed
     # tag to refuse until relinked; checking that per-step as we reach it would mean steps
@@ -115,20 +148,34 @@ def run_job(job, *, job_store, package_index, tag_store, packdump,
     blocked = stale_bindings(job, package_index=package_index, tag_store=tag_store)
     if blocked:
         return JobResult(job_id=job.id, job_name=job.name, status="failed",
-                         not_run=len(job.steps), blocked=blocked)
+                         not_run=len(job.steps), blocked=blocked, dry_run=dry_run)
 
+    if dry_run:
+        # A dry run records nothing. §3.3's own reasoning for previews: "a run history that
+        # lists things that never ran is worse than no history."
+        history = job_history = None
     run_id = job_history.start(job.id, job.name) if job_history is not None else None
     ctx = _Context(job_store=job_store, package_index=package_index, tag_store=tag_store,
                    packdump=packdump, file_store=file_store, history=history,
                    job_run_id=run_id, blueprint_store=blueprint_store,
                    pack_targets=pack_targets, on_progress=on_progress,
-                   total_steps=count_action_steps(job, job_store))
+                   total_steps=count_action_steps(job, job_store),
+                   buffers=Buffers.build(tag_store=tag_store,
+                                         blueprint_store=blueprint_store,
+                                         file_store=file_store) if dry_run else None)
 
-    status, _halted = _run_steps(job, ctx, seen=frozenset({job.id}))
+    try:
+        status, _halted = _run_steps(job, ctx, seen=frozenset({job.id}))
+    finally:
+        if ctx.buffers is not None:
+            # Whatever happens, nothing staged survives the call. The change records were
+            # taken per step and are already on the results.
+            ctx.buffers.discard()
     if job_history is not None:
         job_history.finish(run_id, status)
     return JobResult(job_id=job.id, job_name=job.name, status=status,
-                     step_results=ctx.results, run_id=run_id, not_run=ctx.not_run)
+                     step_results=ctx.results, run_id=run_id, not_run=ctx.not_run,
+                     dry_run=dry_run)
 
 
 @dataclass
@@ -146,6 +193,9 @@ class _Context:
     pack_targets: object = None
     on_progress: object = None
     total_steps: int = 0
+    # Set only for a dry run: one staging set for the whole job, so steps see each other.
+    # None means every step builds and commits its own, which is a real run.
+    buffers: object = None
     # Counted separately from `position`, which is a history column and is also bumped by
     # steps that never ran. Progress is about what the user is watching.
     reported: int = 0
@@ -265,6 +315,7 @@ def _run_action_step(step, ctx) -> StepResult:
         mappings=mappings, config=config, file_store=ctx.file_store, history=ctx.history,
         blueprint_store=ctx.blueprint_store, pack_targets=ctx.pack_targets,
         conflict_policies=conflict_policies_for(manifest, mappings),
+        buffers=ctx.buffers, commit=ctx.buffers is None,
         history_context={"job_run_id": ctx.job_run_id, "step_id": step.id,
                          "position_in_run": ctx.position},
     )
