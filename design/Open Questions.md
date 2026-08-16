@@ -44,6 +44,24 @@ not a second way to run things.
 Revisit only if real use produces the specific symptom: avoiding experiments because you
 don't want to name them.
 
+**Update (2026-08-15): the strongest remaining case for this was testing, and it went
+elsewhere.** Once packages became authorable inside Packsmith (§3.3.1), the missing piece
+was *"how do I see what the action I just wrote would do, without wiring it into a job and
+without risking real data?"* — which reads like an argument for a standalone run, or for a
+whole parallel "test configuration" list.
+
+It is neither, and the relegation above already contains the reason: **binding is the
+entire cost, and a saved job step IS a run configuration** — a named (action, bindings,
+config) tuple you press play on. A second list of those would be the job system rebuilt
+under another name, which is exactly what §3.3's "there is exactly one execution model:
+jobs" exists to prevent.
+
+What the case actually wanted was a *mode*, not a surface: **Dry Run** beside Run, which
+walks a job and promotes nothing. That is one flag on the existing execution path, and the
+1:1 guarantee in §3.3 is what makes it a test rather than an approximation. The residual
+friction — an action nothing uses yet has no step to borrow bindings from — is answered by
+best-guess fill (§3.3), not by a second list.
+
 ### Asynchronous Job Runs — Maybe Someday, and Only for Snappiness (2026-08-12)
 
 §3.3.2 describes running jobs on a background thread with a global queue. **Not built, and
