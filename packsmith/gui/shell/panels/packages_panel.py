@@ -84,6 +84,15 @@ class _DropDownStyle(QProxyStyle):
 
     Turned off here rather than app-wide because it is this control's behaviour that is
     wrong for this control; a combo somewhere else may want the platform's answer.
+
+    **Constructed with no base style, deliberately.** ``QProxyStyle(style)`` *takes
+    ownership* of what it is handed, and a widget that has no style of its own returns the
+    APPLICATION's style from ``.style()`` — so the obvious-looking
+    ``_DropDownStyle(self._picker.style())`` made this proxy the owner of the style the
+    whole app shares. Both then deleted it on the way out, and Packsmith exited with an
+    access violation (0xC0000005) every single time. With no base, the proxy resolves to
+    the application style without owning it, which is the same behaviour and the documented
+    usage. See `tests/test_shutdown.py`.
     """
 
     def styleHint(self, hint, option=None, widget=None, returnData=None):
@@ -121,7 +130,7 @@ class PackagesPanel(Panel):
         # like, since the popup placement also brings a different item delegate with it.
         # Together they give the behaviour every IDE has: opens downward, starts at the
         # top, and simply highlights where you currently are.
-        self._picker_style = _DropDownStyle(self._picker.style())
+        self._picker_style = _DropDownStyle()       # no base — see _DropDownStyle
         self._picker.setStyle(self._picker_style)   # kept alive on self, not owned by Qt
         self._picker.setView(QListView())
         self._picker.setStyleSheet(f"""
