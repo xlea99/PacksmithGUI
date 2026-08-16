@@ -2820,10 +2820,18 @@ class MainWindow(QMainWindow):
             return existing
         tab = JobEditorTab(job, blueprint_store=self._blueprints,
                            job_store=self._jobs, package_index=self._packages,
-                           tag_store=self._tags, parent=self, packdump=self._packdump)
+                           tag_store=self._tags, parent=self, packdump=self._packdump,
+                           history=self._history)
         tab.changed.connect(self._reload_jobs)
         tab.run_requested.connect(self._run_job)
         tab.dry_run_requested.connect(self._dry_run_job)
+        tab.step_run_requested.connect(
+            lambda j, step_id, dry, through: self._run_one_step(
+                j, step_id, dry_run=dry, through=through))
+        tab.status.connect(self._set_status)
+        # The same page the Actions and Packages panels open, reached from the step that
+        # uses it — one action, one tab, whichever door you came through.
+        tab.action_info_requested.connect(self._open_action)
         self._workspace.add_tab(tab, f"Job: {job.name}")
         self._open_tabs[key] = tab
         return tab
@@ -2831,7 +2839,18 @@ class MainWindow(QMainWindow):
     def _dry_run_job(self, job):
         return self._run_job(job, dry_run=True)
 
-    def _run_job(self, job, dry_run=False):
+    def _run_one_step(self, job, step_id, dry_run=False, through=False):
+        """Run part of a job — the authoring loop (design 3.3).
+
+        ``through`` runs the job from the top up to and including this step, rather than
+        the step alone. Which you want depends on whether the step reads anything the ones
+        above it write; see `run_job` for why that is not a detail.
+        """
+        if through:
+            return self._run_job(job, dry_run=dry_run, through_step=step_id)
+        return self._run_job(job, dry_run=dry_run, only_step=step_id)
+
+    def _run_job(self, job, dry_run=False, only_step=None, through_step=None):
         """Execute a job: every step in order, each its own transaction (design 3.3.2).
 
         ``dry_run`` walks the identical path and promotes nothing. It is the same call with
@@ -2857,7 +2876,19 @@ class MainWindow(QMainWindow):
         self._run_control.set_running(True)
         QApplication.setOverrideCursor(Qt.WaitCursor)
         verb = "dry-running" if dry_run else "running"
-        self._bottom.log(f"=== {verb} job '{job.name}' ===")
+        what = f"job '{job.name}'"
+        target = only_step if only_step is not None else through_step
+        if target is not None:
+            position = next((i for i, s in enumerate(job.steps, start=1)
+                             if s.id == target), None)
+            if position is None:
+                what = f"part of '{job.name}'"
+            elif only_step is not None:
+                what = f"step {position} of '{job.name}'"
+            else:
+                what = (f"steps 1–{position} of '{job.name}'" if position > 1
+                        else f"step 1 of '{job.name}'")
+        self._bottom.log(f"=== {verb} {what} ===")
         try:
             result = run_job(job, blueprint_store=self._blueprints,
                              job_store=self._jobs, package_index=self._packages,
@@ -2866,7 +2897,8 @@ class MainWindow(QMainWindow):
                              job_history=self._job_history,
                              pack_targets=self._pack_targets(),
                              on_progress=self._on_job_progress,
-                             dry_run=dry_run)
+                             dry_run=dry_run, only_step=only_step,
+                             through_step=through_step)
         finally:
             QApplication.restoreOverrideCursor()
             self._job_running = False
@@ -2886,14 +2918,21 @@ class MainWindow(QMainWindow):
             self._bottom.show_panel("errors")
             return
 
-        summary = (f"[{job.name}] {result.status} — {len(result.step_results)} step(s) run"
+        if result.reason:
+            self._bottom.log(f"[{job.name}] {result.reason}")
+            self._set_status(f"[{job.name}] {result.reason}")
+            return
+
+        partial = only_step is not None or through_step is not None
+        label = what if partial else job.name
+        summary = (f"[{label}] {result.status} — {len(result.step_results)} step(s) run"
                    + (f", {result.not_run} not reached" if result.not_run else ""))
         if dry_run:
             # The whole point of the gesture, so it goes in the headline rather than being
             # left for the log. Until the report tab lands (§3.3's Pre-Run Preview) this
             # count IS the answer — and "nothing" is a real one, which is how you find out
             # a job you already ran is idempotent.
-            summary = (f"[{job.name}] dry run — would change "
+            summary = (f"[{label}] dry run — would change "
                        f"{describe_summary(result.summary())}"
                        + (f"; {len(result.failed_steps)} step(s) failed"
                           if result.failed_steps else ""))
@@ -2904,13 +2943,13 @@ class MainWindow(QMainWindow):
             # BOTTOM_TABS is reordered, and it silently means the wrong one.
             self._bottom.show_panel("job_results")
 
-        self._open_run_report(result)
+        self._open_run_report(result, label=label if partial else None)
         if not dry_run:
             # Nothing moved, so there is nothing to re-read — and a refresh here would
             # rebuild every open table to show it exactly as it was.
             self._refresh_after_run()
 
-    def _open_run_report(self, result):
+    def _open_run_report(self, result, label=None):
         """Open (or replace) the report for a run that just finished.
 
         A **real** run is keyed by its `job_runs` id, so re-opening it from history lands on
@@ -2933,7 +2972,7 @@ class MainWindow(QMainWindow):
             # match instead.
             key = ("report", result.run_id if result.run_id is not None
                    else ("unrecorded", id(result)))
-        report = reports.from_result(result, finished_at=finished, key=key)
+        report = reports.from_result(result, finished_at=finished, key=key, label=label)
         return self._show_report(report, key)
 
     def _show_report(self, report, key):

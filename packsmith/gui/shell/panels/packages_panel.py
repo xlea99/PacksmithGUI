@@ -23,14 +23,15 @@ should not depend on which tree you found it in.
 from pathlib import Path
 
 from PySide6.QtCore import QUrl, Qt, Signal
-from PySide6.QtGui import QColor, QDesktopServices, QFont, QPainter
+from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
-    QAbstractItemView, QComboBox, QHBoxLayout, QHeaderView, QListView, QMenu, QProxyStyle,
-    QPushButton, QStyle, QTreeWidgetItem, QWidget,
+    QAbstractItemView, QHBoxLayout, QHeaderView, QMenu, QPushButton, QTreeWidgetItem,
+    QWidget,
 )
 
 from packsmith.core.packages import MANIFEST_NAME, folders, source_files
 from packsmith.gui.shell import icons, style
+from packsmith.gui.shell.dropdown import DropDown
 from packsmith.gui.shell.tree import PanelTree
 from packsmith.gui.shell.panels.base import Panel, note_row
 
@@ -45,60 +46,6 @@ _FILES_LABEL = "Files"
 def _parent_of(path: str) -> str:
     """The containing folder of a package-relative path; "" for the package root."""
     return path.rsplit("/", 1)[0] if "/" in path else ""
-
-
-class _Picker(QComboBox):
-    """A combo box that paints its own caret.
-
-    Styling ``::drop-down`` at all replaces the whole sub-control, arrow included, so the
-    caret has to be drawn back — and Qt does **not** honour the CSS zero-size-border
-    triangle trick that would do it in a browser: it renders the border as a flat bar. An
-    image would mean shipping an asset for six pixels of chrome, so the caret is the same
-    Phosphor glyph the rest of the shell uses, painted here.
-    """
-
-    def paintEvent(self, event):
-        super().paintEvent(event)
-        glyph = icons.ui("down")
-        if not glyph:
-            return
-        font = QFont(icons.family())
-        font.setPixelSize(10)
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.TextAntialiasing)
-        painter.setFont(font)
-        painter.setPen(QColor(style.TEXT if self.underMouse() else style.TEXT_MUTED))
-        painter.drawText(self.rect().adjusted(0, 0, -6, 0),
-                         Qt.AlignRight | Qt.AlignVCenter, glyph)
-        painter.end()
-
-
-class _DropDownStyle(QProxyStyle):
-    """Make a combo box's list DROP DOWN instead of opening over the box.
-
-    ``SH_ComboBox_Popup`` is the switch, and the platform style turns it on: the list is
-    then placed so the current item lands under the pointer, which means the popup appears
-    somewhere different depending on what is selected, and reaches up over the panel header
-    once the selection is far enough down. Handing it a `QListView` is not enough — that
-    changes what is drawn, not where it is put.
-
-    Turned off here rather than app-wide because it is this control's behaviour that is
-    wrong for this control; a combo somewhere else may want the platform's answer.
-
-    **Constructed with no base style, deliberately.** ``QProxyStyle(style)`` *takes
-    ownership* of what it is handed, and a widget that has no style of its own returns the
-    APPLICATION's style from ``.style()`` — so the obvious-looking
-    ``_DropDownStyle(self._picker.style())`` made this proxy the owner of the style the
-    whole app shares. Both then deleted it on the way out, and Packsmith exited with an
-    access violation (0xC0000005) every single time. With no base, the proxy resolves to
-    the application style without owning it, which is the same behaviour and the documented
-    usage. See `tests/test_shutdown.py`.
-    """
-
-    def styleHint(self, hint, option=None, widget=None, returnData=None):
-        if hint == QStyle.SH_ComboBox_Popup:
-            return 0
-        return super().styleHint(hint, option, widget, returnData)
 
 
 class PackagesPanel(Panel):
@@ -124,42 +71,9 @@ class PackagesPanel(Panel):
         row.setContentsMargins(6, 4, 6, 4)
         row.setSpacing(4)
 
-        self._picker = _Picker()
-        # Two changes, and both are needed. The proxy style decides WHERE the list goes —
-        # below the box, top row first — and the plain QListView decides what it looks
-        # like, since the popup placement also brings a different item delegate with it.
-        # Together they give the behaviour every IDE has: opens downward, starts at the
-        # top, and simply highlights where you currently are.
-        self._picker_style = _DropDownStyle()       # no base — see _DropDownStyle
-        self._picker.setStyle(self._picker_style)   # kept alive on self, not owned by Qt
-        self._picker.setView(QListView())
-        self._picker.setStyleSheet(f"""
-            QComboBox {{
-                background: {style.BG_DEEP}; color: {style.TEXT};
-                border: 1px solid {style.BORDER}; padding: 2px 6px; font-size: 11px;
-            }}
-            /* Reserves the caret's space so a long package name never runs under it. The
-               caret itself is painted by `_Picker`. */
-            QComboBox::drop-down {{ border: none; width: 18px; }}
-            QComboBox:hover {{ border-color: {style.ACCENT_EDGE}; }}
-            QComboBox QAbstractItemView {{
-                background: {style.BG_DEEP}; color: {style.TEXT};
-                border: 1px solid {style.BORDER};
-                outline: none;
-                /* The bright accent, not the muted selection blue. This list is open for
-                   one moment and closes on the next click — a tint you have to look for is
-                   no use at all when the whole job is "which row am I about to hit". */
-                selection-background-color: {style.ACCENT_EDGE};
-                selection-color: #ffffff;
-            }}
-            QComboBox QAbstractItemView::item {{ padding: 3px 6px; }}
-            QComboBox QAbstractItemView::item:selected {{
-                background: {style.ACCENT_EDGE}; color: #ffffff;
-            }}
-            QComboBox QAbstractItemView::separator {{
-                height: 1px; background: {style.BORDER}; margin: 3px 6px;
-            }}
-        """)
+        # This control is where the shared dropdown came from — it is now the same widget
+        # every simple dropdown in the app uses (`shell/dropdown.py`).
+        self._picker = DropDown()
         self._picker.currentIndexChanged.connect(self._on_picked)
         row.addWidget(self._picker, 1)
 
@@ -459,7 +373,9 @@ class PackagesPanel(Panel):
 
         if kind == "action":
             ref = item.data(0, _ROLE_REF)
-            menu.addAction("Open", lambda: self.action_activated.emit(ref))
+            # See the Actions panel: an action opens a reference page, a file opens its
+            # bytes, and both used to be called "Open".
+            menu.addAction("View Info", lambda: self.action_activated.emit(ref))
             return menu
 
         if kind not in ("files", "folder", "file"):

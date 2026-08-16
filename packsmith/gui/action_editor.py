@@ -19,13 +19,14 @@ created on its own.
 """
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
-    QDialog, QVBoxLayout, QFormLayout, QComboBox, QLineEdit, QLabel, QDialogButtonBox,
+    QDialog, QVBoxLayout, QFormLayout, QLineEdit, QLabel, QDialogButtonBox,
     QMessageBox,
 )
 
 from packsmith.core.packages import (
     MANIFEST_NAME, SOURCE_SUFFIX, check_file_path, folders, source_files)
 from packsmith.gui.shell import style
+from packsmith.gui.shell.dropdown import DropDown
 
 _NEW_PACKAGE = "New package…"
 _NEW_FILE = "New file…"
@@ -131,7 +132,7 @@ class _PackageChooser(QDialog):
         self._authored = sorted(
             name for name, pkg in package_index.packages.items()
             if pkg.provenance == "authored")
-        self._package = QComboBox()
+        self._package = DropDown()
         self._package.addItems(self._authored)
         self._package.addItem(_NEW_PACKAGE)
         if package in self._authored:
@@ -218,7 +219,7 @@ class NewActionDialog(_PackageChooser):
         self._action_id.textEdited.connect(self._sync_suggestions)
         self._form.addRow("Action id", self._action_id)
 
-        self._file = QComboBox()
+        self._file = DropDown()
         self._file.currentTextChanged.connect(self._on_file_changed)
         self._form.addRow("File", self._file)
 
@@ -384,7 +385,7 @@ class _DestinationChooser(_PackageChooser):
                  fixed=False):
         super().__init__(package_index, title, package, parent, fixed=fixed)
         self._preferred_folder = folder
-        self._folder = QComboBox()
+        self._folder = DropDown()
         self._folder.setToolTip("Where in the package to put it. Purely organisational.")
         self._form.addRow("Folder", self._folder)
 

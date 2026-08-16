@@ -17,10 +17,10 @@ spent where nobody is looking.
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QListWidget, QPushButton,
-    QDialogButtonBox, QComboBox,
-)
+    QDialogButtonBox, )
 
 from packsmith.gui.shell import icons, style
+from packsmith.gui.shell.dropdown import DropDown
 
 KINDS = (("datapacks", "Datapacks"), ("resourcepacks", "Resource Packs"))
 
@@ -43,7 +43,7 @@ class LoadOrderDialog(QDialog):
         root.addWidget(self._explain(
             "Later packs override earlier ones. This is the order the game loads them in."))
 
-        self._kind = QComboBox()
+        self._kind = DropDown()
         for key, label in self._kinds:
             self._kind.addItem(label, key)
         self._kind.currentIndexChanged.connect(self._show_kind)

@@ -65,6 +65,28 @@ class StepRunStore:
     def list(self) -> list[dict]:
         return [dict(r) for r in self._db.fetch_all("SELECT * FROM step_runs ORDER BY id DESC")]
 
+    def latest_for_steps(self, step_ids) -> dict:
+        """The most recent run of each of these job steps, as ``{step_id: row}``.
+
+        What the job editor puts on each row, and the reason is the loop it serves: the
+        editor is where you *change* a step, so it is where "what did this do last time"
+        belongs. Sending the user to another surface to find that out is what makes an
+        editing screen feel like a form rather than a workbench.
+
+        Highest id wins rather than latest `finished_at`: ids are monotonic and always
+        present, while a run killed mid-flight never gets a finish time and would then
+        outrank nothing.
+        """
+        wanted = [int(i) for i in step_ids if i is not None]
+        if not wanted:
+            return {}
+        holes = ",".join("?" * len(wanted))
+        rows = self._db.fetch_all(
+            f"SELECT * FROM step_runs WHERE step_id IN ({holes}) "
+            f"AND id IN (SELECT MAX(id) FROM step_runs WHERE step_id IN ({holes}) "
+            f"GROUP BY step_id)", tuple(wanted) * 2)
+        return {row["step_id"]: dict(row) for row in rows}
+
 
 class JobRunStore:
     """Records job executions (design 3.3.3). ``job_name`` is denormalized so history

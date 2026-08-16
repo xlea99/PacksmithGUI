@@ -188,7 +188,10 @@ class ActionsPanel(Panel):
         ref = item.data(0, _ROLE_REF)
 
         if ref:
-            menu.addAction("Open", lambda: self.action_activated.emit(ref))
+            # "View Info" rather than "Open": an action opens a *reference page*, while
+            # "Open source" right below it opens the actual file. Two things called Open
+            # that give you different surfaces is the ambiguity worth spending a word on.
+            menu.addAction("View Info", lambda: self.action_activated.emit(ref))
             if document:
                 menu.addAction("Open source", lambda: self.document_activated.emit(document))
             if editable:

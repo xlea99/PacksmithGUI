@@ -13,11 +13,12 @@ would be lying to the user.
 """
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
-    QDialog, QVBoxLayout, QHBoxLayout, QFormLayout, QComboBox, QLineEdit, QPushButton,
+    QDialog, QVBoxLayout, QHBoxLayout, QFormLayout, QLineEdit, QPushButton,
     QLabel, QCheckBox, QListWidget, QDialogButtonBox, QWidget, QMessageBox,
 )
 
 from packsmith.gui.shell import style
+from packsmith.gui.shell.dropdown import DropDown
 
 TAG_TYPES = [
     ("bool", "true / false"),
@@ -226,7 +227,7 @@ class TagCreateDialog(QDialog):
         form = QFormLayout()
         form.setSpacing(6)
 
-        self._registry = QComboBox()
+        self._registry = DropDown()
         self._registry.addItems(registries)
         if preferred_registry in registries:
             self._registry.setCurrentText(preferred_registry)
@@ -236,7 +237,7 @@ class TagCreateDialog(QDialog):
         self._name.setPlaceholderText("remove")
         form.addRow("Name", self._name)
 
-        self._type = QComboBox()
+        self._type = DropDown()
         for key, blurb in TAG_TYPES:
             self._type.addItem(f"{key}  —  {blurb}", key)
         self._type.currentIndexChanged.connect(self._on_type_changed)
@@ -255,7 +256,7 @@ class TagCreateDialog(QDialog):
         self._has_default = QCheckBox("Default value")
         self._has_default.toggled.connect(self._sync_default_widget)
         default_row.addWidget(self._has_default)
-        self._default_combo = QComboBox()
+        self._default_combo = DropDown()
         self._default_text = QLineEdit()
         default_row.addWidget(self._default_combo)
         default_row.addWidget(self._default_text)

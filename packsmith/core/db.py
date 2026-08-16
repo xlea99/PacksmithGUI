@@ -12,7 +12,7 @@ from packsmith.common.logging import log
 # machinery can be built the day a change needs it, but a database holding work you care
 # about that cannot say what shape it is has permanently lost the ability to be reasoned
 # about. Hence this landing long before there is anything to migrate.
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2      # v2: job_steps.enabled (design 3.3.2's step muting)
 
 
 class SchemaTooNewError(RuntimeError):
@@ -284,7 +284,12 @@ class UserDB:
                 ref_job_id  INTEGER REFERENCES jobs(id) ON DELETE CASCADE,
                 on_error    TEXT CHECK(on_error IN ('halt', 'skip')),  -- NULL = inherit job default
                 bindings    TEXT,          -- JSON: slot -> tag name
-                config      TEXT           -- JSON: param -> value
+                config      TEXT,          -- JSON: param -> value
+                -- Muted, but still part of the job. Deleting a step to skip it once costs
+                -- its bindings; this keeps them. A disabled step never runs and is ignored
+                -- by the pre-flight gate, because a step that will not execute cannot
+                -- half-apply anything and so has nothing to block the job over.
+                enabled     INTEGER NOT NULL DEFAULT 1
             );
 
             -- One row per job execution. job_name is denormalized so run history survives
@@ -415,6 +420,10 @@ class UserDB:
         # recorded name" and therefore "nothing to contradict" — correct, because rename
         # did not exist to have been used.
         self._add_column_if_missing("job_steps", "bound_names", "TEXT")
+        # Whether a step participates in a run at all (design 3.3.2). Defaulting to 1 is
+        # what makes this safe to migrate: every step that existed before the column did
+        # was, by definition, one that ran.
+        self._add_column_if_missing("job_steps", "enabled", "INTEGER NOT NULL DEFAULT 1")
         self._conn.commit()
 
     def _add_column_if_missing(self, table: str, column: str, definition: str):

@@ -34,6 +34,8 @@ class JobStep:
     # {slot: name | [names]} — what the bound TAGS were called when this step was saved.
     # Compared against their current names to decide whether a relink is owed (3.2.1).
     bound_names: dict = field(default_factory=dict)
+    # Muted steps stay in the job, keep their bindings, and never run.
+    enabled: bool = True
 
     @property
     def is_action(self) -> bool:
@@ -176,6 +178,16 @@ class JobStore:
             self._db.execute("UPDATE job_steps SET on_error = ? WHERE id = ?",
                              (on_error, step_id))
 
+    def set_step_enabled(self, step_id: int, enabled: bool):
+        """Mute or unmute a step (design 3.3.2).
+
+        Deliberately not a delete-and-recreate: the whole value is that the step's bindings
+        and config survive being switched off, so turning it back on costs one click rather
+        than re-filling every slot.
+        """
+        self._db.execute("UPDATE job_steps SET enabled = ? WHERE id = ?",
+                         (1 if enabled else 0, step_id))
+
     def relink_step(self, step_id: int, bound_names: dict):
         """Accept a step's current bindings under their new names (design 3.2.1).
 
@@ -217,6 +229,8 @@ class JobStore:
         if job is None:
             return
         for step in job.steps:
+            if not step.enabled:
+                continue        # muted: it isn't one of the steps this job would run
             if step.is_action:
                 out.append(FlatStep(step, job.on_error_for(step), job.name))
             elif step.ref_job_id is not None:
@@ -287,4 +301,6 @@ class JobStore:
             bindings=json.loads(row["bindings"]) if row["bindings"] else {},
             config=json.loads(row["config"]) if row["config"] else {},
             bound_names=json.loads(row["bound_names"]) if row["bound_names"] else {},
+            # A row from before the column existed reads as enabled, which is what it was.
+            enabled=bool(row["enabled"]) if "enabled" in row.keys() else True,
         )

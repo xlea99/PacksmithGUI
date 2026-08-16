@@ -17,8 +17,7 @@ from pathlib import Path
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QCheckBox, QLineEdit, QPushButton,
-    QDialogButtonBox, QFileDialog, QWidget, QFrame, QComboBox,
-)
+    QDialogButtonBox, QFileDialog, QWidget, QFrame, )
 
 from packsmith.core import launchers
 from packsmith.core.capabilities import (
@@ -28,6 +27,7 @@ from packsmith.core.packdump import AUTO_ADOPT_SETTING
 from packsmith.integrations import PACK_LOADERS
 from packsmith.gui.load_order_dialog import LoadOrderDialog
 from packsmith.gui.shell import style
+from packsmith.gui.shell.dropdown import DropDown
 
 
 class SettingsDialog(QDialog):
@@ -126,7 +126,7 @@ class SettingsDialog(QDialog):
         self._installed = [loader for loader in PACK_LOADERS
                            if loader.detect(self._packdump)]
 
-        self._loader = QComboBox()
+        self._loader = DropDown()
         for loader in self._installed:
             self._loader.addItem(loader.name, loader.name)
         self._loader.currentIndexChanged.connect(self._refresh_loader_status)

@@ -33,6 +33,7 @@ from packsmith.core.revalidate import project_removal, project_rename, project_r
 from packsmith.gui.shell import style
 from packsmith.gui.shell.picker import PickerPopup
 from packsmith.gui.shell.tree import PanelTree
+from packsmith.gui.shell.dropdown import DropDown
 
 _ROLE_PATH = Qt.UserRole
 _ROLE_KIND = Qt.UserRole + 1
@@ -1501,7 +1502,7 @@ class SlotDialog(QDialog):
             self._name.setEnabled(False)      # rename is its own operation
         form.addRow("Names" if self._multi else "Name", self._name)
 
-        self._inside = QComboBox()
+        self._inside = DropDown()
         if slot is None:
             self._inside.addItem(_TOP_LEVEL)
             self._inside.addItems(list(groups))
@@ -1509,7 +1510,7 @@ class SlotDialog(QDialog):
                 self._inside.setCurrentText(parent_group)
             form.addRow("Inside", self._inside)
 
-        self._type = QComboBox()
+        self._type = DropDown()
         self._type.addItems(SLOT_TYPES)
         # Sticky: a schema is built in runs of the same kind of slot, so defaulting back
         # to 'string' every time taxes the common case to serve the rare one.
@@ -1521,7 +1522,7 @@ class SlotDialog(QDialog):
         # Same suggester as the cell editor, one level up: the registry TYPE rather than an
         # entry within it. 135 of them in a real pack, and a typo here silently creates a
         # slot nothing can ever be bound into.
-        self._registry = QComboBox()
+        self._registry = DropDown()
         self._registry.setEditable(True)
         self._registry.addItems(sorted(registry_types))
         self._registry.setCurrentText(
@@ -1537,7 +1538,7 @@ class SlotDialog(QDialog):
         self._registry_label = QLabel("Registry")
         form.addRow(self._registry_label, self._registry)
 
-        self._ref = QComboBox()
+        self._ref = DropDown()
         self._ref.addItems(store.names())
         if slot and slot.ref_blueprint:
             self._ref.setCurrentText(slot.ref_blueprint)

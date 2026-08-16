@@ -178,3 +178,44 @@ def test_a_flat_shape_needs_no_continuation_bars(qapp):
              for line in _shape_tree(shape).text().splitlines()]
 
     assert drawn == ["├─ one", "└─ two"]
+
+
+# --- the tab's own name ---------------------------------------------------------------
+
+def _titled(name, action_id="nuke"):
+    manifest = ActionManifest(package_name="removal_suite", action_id=action_id,
+                              file="n.star", function="run", name=name)
+
+    class Jobs:
+        def all(self):
+            return []
+
+    return ActionPageTab(manifest, None, Jobs(), tag_store=Tags()).title()
+
+
+def test_the_tab_names_the_action_both_ways(qapp):
+    """`"Display Name" (action_id)`.
+
+    Both halves earn their place: the id is what a job step names and what you search for,
+    and the name is what tells you which of `nuke`, `audit` and `fill` you are looking at.
+    The quotes and brackets are what keep them visibly separate — two bare words ran
+    together at a glance.
+    """
+    assert _titled("Nuke Items") == '"Nuke Items" (nuke)'
+
+
+def test_a_long_name_is_truncated_so_the_id_survives(qapp):
+    """The id is the shorter, more identifying half, so it is the half that must not be
+    pushed off the end of the tab by a wordy display name."""
+    title = _titled("Obliterate Every Trace Of This Item Everywhere")
+
+    assert title.startswith('"Obliterate Every')
+    assert title.endswith("(nuke)")
+    assert "…" in title
+
+
+def test_a_name_that_is_just_the_id_is_not_said_twice(qapp):
+    """`name` defaults to the id when a manifest omits it, and `"nuke" (nuke)` is a tab
+    that looks like a bug."""
+    assert _titled("nuke") == "nuke"
+    assert _titled("") == "nuke"

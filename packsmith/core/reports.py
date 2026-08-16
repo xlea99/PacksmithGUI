@@ -74,10 +74,16 @@ class RunReport:
         return [(key, groups[key]) for key in order]
 
 
-def from_result(result, *, finished_at: str = "", key=None) -> RunReport:
-    """A run that just happened. `JobResult` already carries everything."""
+def from_result(result, *, finished_at: str = "", key=None, label: str = None) -> RunReport:
+    """A run that just happened. `JobResult` already carries everything.
+
+    ``label`` overrides the heading only. A single-step run reads better as
+    *"Full Removal · step 3"* than as the job's bare name, but the job's real name is what
+    history stores and what a rollback is described against, so the override stops at the
+    display and never reaches `JobResult`.
+    """
     return RunReport(
-        job_name=result.job_name,
+        job_name=label or result.job_name,
         status=result.status,
         dry_run=getattr(result, "dry_run", False),
         finished_at=finished_at,

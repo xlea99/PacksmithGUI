@@ -28,7 +28,7 @@ and crashed look identical — and that is what ``on_progress`` addresses, witho
 concurrency. The runner stays GUI-free: it calls a plain function and never learns that the
 GUI's handler repaints.
 """
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 
 from packsmith.core.bindings import (
@@ -47,6 +47,9 @@ class JobResult:
     not_run: int = 0                  # steps never reached because something halted
     blocked: list = field(default_factory=list)   # StaleBinding: relinks owed (3.2.1)
     dry_run: bool = False
+    reason: str = None                # why the run never started, when nothing else says
+    only_step: int = None             # set when this was a deliberate single-step run
+    through_step: int = None          # set when this ran the job's first N steps
 
     @property
     def ok(self) -> bool:
@@ -100,6 +103,36 @@ class StepProgress:
     result: object = None       # the StepResult, on "done"
 
 
+def _narrow(job, *, only_step=None, through_step=None):
+    """``job`` cut down to the steps a partial run should execute, or None if the named
+    step is not in it.
+
+    A copy rather than a mutation, and a whole Job rather than a list of steps, so
+    everything downstream — the recursion, the error policies, `on_error_for`, the
+    nested-job case — keeps working on the shape it already understands.
+    """
+    if only_step is None and through_step is None:
+        return job
+    if only_step is not None:
+        found = next((s for s in job.steps if s.id == only_step), None)
+        if found is None:
+            return None
+        # A muted step asked for BY NAME still runs. Muting says "not part of the
+        # sequence", and running this one is not the sequence — it is a person pointing at
+        # a row. The alternative is a menu item that silently does nothing, and testing the
+        # step you just switched off is a normal thing to want.
+        return replace(job, steps=[replace(found, enabled=True)])
+
+    index = next((i for i, s in enumerate(job.steps) if s.id == through_step), None)
+    if index is None:
+        return None
+    # A prefix, with muting left alone — this IS the sequence, so a muted step inside it is
+    # skipped exactly as the whole job would skip it. (The menu does not offer this on a
+    # muted step: "run the sequence up to and including a step you switched off" is a
+    # contradiction, so it is not a question worth answering here.)
+    return replace(job, steps=list(job.steps[:index + 1]))
+
+
 def count_action_steps(job, job_store, seen=frozenset()) -> int:
     """How many action steps this job can reach, following nested jobs once each.
 
@@ -112,6 +145,8 @@ def count_action_steps(job, job_store, seen=frozenset()) -> int:
     seen = seen | {job.id}
     total = 0
     for step in job.steps:
+        if not step.enabled:
+            continue        # muted: never part of "step 3 of 7"
         if step.is_action:
             total += 1
         elif step.ref_job_id:
@@ -122,7 +157,7 @@ def count_action_steps(job, job_store, seen=frozenset()) -> int:
 def run_job(job, *, job_store, package_index, tag_store, packdump,
             file_store=None, history=None, job_history=None,
             blueprint_store=None, pack_targets=None, on_progress=None,
-            dry_run=False) -> JobResult:
+            dry_run=False, only_step=None, through_step=None) -> JobResult:
     """Run every step of ``job`` in order, honouring each step's error policy.
 
     Returns a JobResult; never raises for a failing step — failures are captured, exactly
@@ -135,6 +170,23 @@ def run_job(job, *, job_store, package_index, tag_store, packdump,
     is staged-first, so an action cannot tell which it got. A failing step rolls back to its
     own savepoint, leaving earlier steps intact, which is what a real run's per-step commits
     achieve. Nothing is recorded to history, because nothing happened.
+
+    Two ways to run part of a job, and they answer different questions:
+
+    ``only_step`` runs exactly one step, by id, against **committed** state. The authoring
+    loop: editing step 4 of 6 should not mean executing — and re-applying — steps 1 to 3
+    every time you want to see what 4 does.
+
+    ``through_step`` runs the job from the top **up to and including** that step. This is
+    the one that reproduces a real run, and the distinction matters more than it looks: a
+    job's steps see each other (one staging set spans the run), so a lone step 4 previews
+    a world where steps 1 to 3 never happened. On any job whose steps chain, that is a
+    world nobody is in. ``only_step`` is *"the world is already how I want it, re-run this
+    action"*; ``through_step`` is *"build the world from the top, then run this"*.
+
+    Neither is a second execution model. §3.3 relegated standalone runs on the grounds that
+    *"a saved job step IS a run configuration"*, and both run that configuration through the
+    identical path, with the same staging, the same policies and the same records.
     """
     # PRE-FLIGHT, before a run is even recorded. §3.2.1 requires a step bound to a renamed
     # tag to refuse until relinked; checking that per-step as we reach it would mean steps
@@ -145,10 +197,22 @@ def run_job(job, *, job_store, package_index, tag_store, packdump,
     # This is deliberately wider than 3.2.1's letter, which gates the step: one stale
     # binding blocks the whole job, including its unrelated steps. That trade is recorded
     # in 3.2.1 — a job is the unit you press play on.
-    blocked = stale_bindings(job, package_index=package_index, tag_store=tag_store)
+    #
+    # A PARTIAL run narrows the gate to what it is actually about to run, and the wide
+    # gate's own reasoning is why: it exists to stop a job half-applying, so it should cover
+    # the steps in the run and no others. Blocking a deliberate one-step run because a step
+    # further down owes a relink refuses the thing the user asked for over a fact about
+    # something they didn't.
+    scope = _narrow(job, only_step=only_step, through_step=through_step)
+    if scope is None:
+        missing = only_step if only_step is not None else through_step
+        return JobResult(job_id=job.id, job_name=job.name, status="failed",
+                         reason=f"step {missing} is not in this job", dry_run=dry_run)
+    blocked = stale_bindings(scope, package_index=package_index, tag_store=tag_store)
     if blocked:
         return JobResult(job_id=job.id, job_name=job.name, status="failed",
-                         not_run=len(job.steps), blocked=blocked, dry_run=dry_run)
+                         not_run=len(scope.steps), blocked=blocked, dry_run=dry_run)
+    job = scope
 
     if dry_run:
         # A dry run records nothing. §3.3's own reasoning for previews: "a run history that
@@ -175,7 +239,7 @@ def run_job(job, *, job_store, package_index, tag_store, packdump,
         job_history.finish(run_id, status)
     return JobResult(job_id=job.id, job_name=job.name, status=status,
                      step_results=ctx.results, run_id=run_id, not_run=ctx.not_run,
-                     dry_run=dry_run)
+                     dry_run=dry_run, only_step=only_step, through_step=through_step)
 
 
 @dataclass
@@ -210,6 +274,11 @@ def _run_steps(job, ctx, seen) -> tuple[str, bool]:
     any_failure = False
 
     for index, step in enumerate(job.steps):
+        if not step.enabled:
+            # Muted (§3.3.2). Not counted as `not_run` either: that number means "never
+            # reached because something halted", and reporting a step the user switched
+            # off as a casualty of a failure would misdescribe both.
+            continue
         policy = job.on_error_for(step)
 
         if step.is_action:
@@ -272,7 +341,9 @@ def _report(ctx, phase: str, action_ref: str, result=None) -> None:
 
 
 def _remaining(job, index) -> int:
-    return max(0, len(job.steps) - index - 1)
+    """How many steps a halt here prevented. Muted steps are not among them — they were
+    never going to run, so counting them would inflate the casualty list of a failure."""
+    return sum(1 for step in job.steps[index + 1:] if step.enabled)
 
 
 def _record_failure(ctx, step, action_ref, reason) -> StepResult:

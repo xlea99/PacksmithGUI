@@ -22,7 +22,7 @@ from PySide6.QtCore import Qt, Signal, QUrl
 from PySide6.QtGui import QColor, QDesktopServices, QIcon, QPixmap, QPainter
 from PySide6.QtWidgets import (
     QApplication, QTreeWidget, QTreeWidgetItem, QWidget, QHBoxLayout, QLabel, QMenu,
-    QMessageBox, QAbstractItemView, QComboBox, QInputDialog,
+    QMessageBox, QAbstractItemView, QInputDialog,
 )
 
 from packsmith.core.capabilities import DATAPACKS_WRITE, RESOURCEPACKS_WRITE
@@ -30,6 +30,7 @@ from packsmith.core.files import FileStore
 from packsmith.gui.shell import icons, style
 from packsmith.gui.shell.tree import PanelTree
 from packsmith.gui.shell.panels.base import Panel, SearchBox
+from packsmith.gui.shell.dropdown import DropDown
 
 # How many matches are drawn. Measured on a real 300-mod instance: 41,515 files, of which
 # 37,754 are Minecraft's own `debug/` dumps — so a common word can match tens of thousands
@@ -91,7 +92,7 @@ class FilesPanel(Panel):
         mode_row = QWidget()
         mode_lay = QHBoxLayout(mode_row)
         mode_lay.setContentsMargins(6, 4, 6, 2)
-        self._mode = QComboBox()
+        self._mode = DropDown()
         self._mode.addItem("Honest — raw filesystem")
         self._mode.addItem("Smart — by purpose"
                            + ("" if loader else " (needs a pack loader)"))

@@ -19,9 +19,10 @@ Two things it deliberately does NOT do:
   itself for the duration rather than relying on nobody trying.
 """
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtWidgets import QComboBox, QHBoxLayout, QPushButton, QWidget
+from PySide6.QtWidgets import QHBoxLayout, QPushButton, QWidget
 
 from packsmith.gui.shell import icons, style
+from packsmith.gui.shell.dropdown import DropDown
 
 _COMBO_QSS = f"""
     QComboBox {{
@@ -78,7 +79,7 @@ class RunControl(QWidget):
         row.setContentsMargins(0, 0, 0, 0)
         row.setSpacing(4)
 
-        self._picker = QComboBox()
+        self._picker = DropDown(styled=False)
         self._picker.setStyleSheet(_COMBO_QSS)
         self._picker.currentIndexChanged.connect(lambda _: self._sync())
         row.addWidget(self._picker)

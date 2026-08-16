@@ -7,22 +7,79 @@ user; they just fill in what the action asks for."* So both kinds of slot render
 of one form — artifact pickers for mappings, inline editors for config — and nothing in
 the UI names the distinction.
 """
+import json
+from datetime import datetime, timezone
+
 from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QCursor
 from PySide6.QtWidgets import (
     QWidget, QDialog, QVBoxLayout, QHBoxLayout, QFormLayout, QLabel, QPushButton,
     QComboBox, QLineEdit, QCheckBox, QTreeWidget, QTreeWidgetItem, QDialogButtonBox,
-    QAbstractItemView, QMessageBox, QListWidget, QListWidgetItem,
+    QAbstractItemView, QMessageBox, QListWidget, QListWidgetItem, QMenu, QScrollArea,
+    QSplitter, QFrame, QHeaderView,
 )
 
 from packsmith.core.bindings import (
-    binding_id, binding_name, mapping_mismatches, record_names, step_problems)
+    binding_id, binding_name, mapping_mismatches, record_names, stale_bindings,
+    step_problems)
 from packsmith.core.shapes import describe_shape
 from packsmith.gui.shell import icons, style
 from packsmith.gui.shell.picker import PickerPopup, _token_match
 from packsmith.gui.shell.tree import PanelTree
+from packsmith.gui.shell.dropdown import DropDown
 
 _INHERIT = "(inherit from job)"
+
+
+def _ago(stamp: str) -> str:
+    """"3m ago" from an ISO timestamp. Relative because the question the editor answers is
+    *did this run since I last changed it* — and "4 minutes ago" answers that at a glance
+    where "2026-08-16 13:42:07" makes you do the arithmetic. The exact time stays in the
+    tooltip for when it is the exact time you want."""
+    if not stamp:
+        return ""
+    try:
+        when = datetime.fromisoformat(stamp)
+    except (TypeError, ValueError):
+        return ""
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    seconds = (datetime.now(timezone.utc) - when).total_seconds()
+    if seconds < 0:
+        return "just now"               # clock skew; never render a negative age
+    for limit, divisor, unit in ((60, 1, "s"), (3600, 60, "m"), (86400, 3600, "h")):
+        if seconds < limit:
+            return f"{int(seconds // divisor)}{unit} ago"
+    return f"{int(seconds // 86400)}d ago"
+
+
+def _changed_count(row: dict) -> str:
+    """How much the last run of this step actually did.
+
+    Counted from the **change record** rather than the inverse, and `unchanged` excluded —
+    so a re-run that asserted 200 already-correct cells reads as "no changes", which is
+    how you learn a step is idempotent instead of thinking it did 200 things again.
+    """
+    try:
+        stored = json.loads(row.get("rollback_data") or "{}")
+    except (TypeError, ValueError):
+        return ""
+    # Shape-checked, not just parse-checked. This reads a blob off disk, and valid JSON
+    # that isn't an object (`null` is the easy one) would raise straight through a
+    # parse-only guard and take the whole tab down over a cosmetic column.
+    if not isinstance(stored, dict):
+        return ""
+    changes = stored.get("changes")
+    if changes is None:
+        return ""           # a row written before change records existed: nothing to say
+    # An empty list and an all-`unchanged` list are the same answer, and it is a useful
+    # one: the step ran and the pack did not move. That is how you find out a job is
+    # idempotent, so it is worth a phrase rather than a blank cell — which would read as
+    # "no record" and is a different fact entirely.
+    real = [c for c in changes if c.get("kind") != "unchanged"]
+    if not real:
+        return "no changes"
+    return f"{len(real)} change{'s' if len(real) != 1 else ''}"
 
 
 def _refers_to(stored, artifact_id, label) -> bool:
@@ -145,6 +202,8 @@ class _EntryField(QWidget):
     recommendation "must never restrict" applies just as much to a picker as to a template.
     """
 
+    changed = Signal()
+
     def __init__(self, registry_type, entries, current):
         super().__init__()
         self._entries = entries
@@ -157,6 +216,7 @@ class _EntryField(QWidget):
         self._edit.setPlaceholderText(f"{len(entries):,} in {registry_type}")
         if current:
             self._edit.setText(str(current))
+        self._edit.editingFinished.connect(self.changed)
         row.addWidget(self._edit, 1)
         browse = QPushButton("…", self)
         browse.setFixedWidth(28)
@@ -166,6 +226,7 @@ class _EntryField(QWidget):
     def _browse(self):
         picker = PickerPopup(self._entries, header=self._registry_type, parent=self)
         picker.chosen.connect(self._edit.setText)
+        picker.chosen.connect(lambda *_: self.changed.emit())
         self._picker = picker           # held: a popup with no owner vanishes mid-show
         QTimer.singleShot(0, lambda: picker.popup_at(QCursor.pos()))
 
@@ -187,6 +248,8 @@ class _MultiSelect(QWidget):
     """
 
     _FILTER_THRESHOLD = 12
+
+    changed = Signal()
 
     def __init__(self, candidates, current):
         super().__init__()
@@ -218,6 +281,9 @@ class _MultiSelect(QWidget):
         self._list.setUniformItemSizes(True)
         self._list.setMaximumHeight(150)
         self._list.setStyleSheet(style.LIST_QSS)
+        # Connected after the rows are built, so populating the list doesn't read as a
+        # hundred separate edits by the user.
+        self._list.itemChanged.connect(lambda *_: self.changed.emit())
         root.addWidget(self._list)
         # Ordered after addWidget: setVisible on a parentless widget shows a real window.
         self._filter.setVisible(len(candidates) >= self._FILTER_THRESHOLD)
@@ -245,40 +311,40 @@ class _MultiSelect(QWidget):
 
 # --- editing one step -------------------------------------------------------
 
-class StepEditorDialog(QDialog):
-    """Fill in what a step needs. Mappings and config are one list of slots."""
+class StepForm(QWidget):
+    """The slots one step needs, as a form. Mappings and config are one list.
+
+    Kept apart from :class:`StepPanel` — the chrome around it — because this is where every
+    binding decision lives: which artifacts are candidates, what a legacy name-binding
+    resolves to, what gets stored. That is worth being able to test without building a
+    window around it.
+    """
+
+    # Emitted when a field is committed — a combo changed, a line edit finished, a box
+    # ticked. Not on every keystroke: a half-typed number is not an edit yet.
+    committed = Signal()
 
     def __init__(self, manifest, tag_store, step, parent=None, blueprint_store=None,
                  packdump=None, pack_targets=None):
         super().__init__(parent)
         self._dump = packdump
         self._pack_targets = pack_targets
-        self.setWindowTitle(f"Step — {manifest.name or manifest.action_id}")
-        self.setMinimumWidth(480)
         self._manifest = manifest
         self._tags = tag_store
         self._blueprints = blueprint_store
         self._mapping_widgets = {}
         self._config_widgets = {}
 
-        self.result_bindings = dict(step.bindings)
-        self.result_config = dict(step.config)
-        self.result_on_error = step.on_error
-
         root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(8)
-
-        title = QLabel(f"<b>{manifest.ref}</b>")
-        title.setTextFormat(Qt.RichText)
-        root.addWidget(title)
-        if manifest.description:
-            desc = QLabel(manifest.description)
-            desc.setWordWrap(True)
-            desc.setStyleSheet(f"color: {style.TEXT_MUTED}; font-size: 11px;")
-            root.addWidget(desc)
 
         form = QFormLayout()
         form.setSpacing(6)
+        form.setLabelAlignment(Qt.AlignLeft)
+        # The panel is narrow, so labels sit ABOVE their fields rather than beside them —
+        # otherwise a long slot name and its picker fight over the same 300px.
+        form.setRowWrapPolicy(QFormLayout.WrapAllRows)
 
         # One list of slots — mappings and config together, in declaration order.
         for name, slot in manifest.mappings.items():
@@ -293,26 +359,43 @@ class StepEditorDialog(QDialog):
             form.addRow(self._label_for(name, param.description, param.required), widget)
 
         if not manifest.mappings and not manifest.config:
-            form.addRow(QLabel("This action needs nothing configured."))
+            nothing = QLabel("This action needs nothing configured.")
+            nothing.setStyleSheet(f"color: {style.TEXT_MUTED}; font-size: 11px;")
+            form.addRow(nothing)
         root.addLayout(form)
 
         # Error policy is step state, not action state (design 3.3.2, Model B).
-        policy_row = QHBoxLayout()
-        policy_row.addWidget(QLabel("If this step fails"))
-        self._on_error = QComboBox()
+        policy_label = QLabel("If this step fails")
+        policy_label.setStyleSheet(f"color: {style.TEXT_MUTED}; font-size: 11px;")
+        root.addWidget(policy_label)
+        self._on_error = DropDown()
         self._on_error.addItem(_INHERIT, None)
         self._on_error.addItem("halt — stop the job", "halt")
         self._on_error.addItem("skip — carry on", "skip")
         index = self._on_error.findData(step.on_error)
         self._on_error.setCurrentIndex(max(0, index))
-        policy_row.addWidget(self._on_error)
-        policy_row.addStretch()
-        root.addLayout(policy_row)
+        root.addWidget(self._on_error)
 
-        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        root.addWidget(buttons)
+        self._wire_commits()
+
+    def _wire_commits(self):
+        """Every field reports when it settles, so the panel can write it through.
+
+        `editingFinished` rather than `textChanged` for text: typing "1" on the way to "12"
+        should not be persisted and then complained about.
+        """
+        widgets = ([w for w in self._mapping_widgets.values()]
+                   + [w for w, _ in self._config_widgets.values()]
+                   + [self._on_error])
+        for widget in widgets:
+            if isinstance(widget, QComboBox):
+                widget.currentIndexChanged.connect(self.committed)
+            elif isinstance(widget, QCheckBox):
+                widget.toggled.connect(self.committed)
+            elif isinstance(widget, QLineEdit):
+                widget.editingFinished.connect(self.committed)
+            elif isinstance(widget, (_EntryField, _MultiSelect)):
+                widget.changed.connect(self.committed)
 
     @staticmethod
     def _label_for(name, description, required):
@@ -327,7 +410,7 @@ class StepEditorDialog(QDialog):
             # 3.3: "many — zero or more artifacts (UI: multi-select list)".
             return _MultiSelect(self._candidates_for(slot), current)
 
-        combo = QComboBox()
+        combo = DropDown()
         if not slot.required:
             combo.addItem("(unbound)", None)
 
@@ -465,7 +548,14 @@ class StepEditorDialog(QDialog):
             edit.setPlaceholderText(f"default: {param.default}")
         return edit
 
-    def accept(self):
+    def read(self):
+        """``(bindings, config, on_error)`` as the widgets currently stand.
+
+        Raises :class:`ValueError` for a value the action cannot accept. Raising rather
+        than warning in a message box is what lets the panel report it inline and simply
+        not persist that field — a modal complaint per keystroke-ish commit would be
+        unusable in a surface you edit continuously.
+        """
         bindings = {}
         for name, widget in self._mapping_widgets.items():
             if isinstance(widget, _EntryField):
@@ -497,16 +587,249 @@ class StepEditorDialog(QDialog):
                     try:
                         config[name] = float(text)
                     except ValueError:
-                        QMessageBox.warning(self, "Invalid value",
-                                            f"'{name}' expects a number.")
-                        return
+                        raise ValueError(f"'{name}' expects a number.")
             else:
                 config[name] = text
 
-        self.result_bindings = bindings
-        self.result_config = config
-        self.result_on_error = self._on_error.currentData()
-        super().accept()
+        return bindings, config, self._on_error.currentData()
+
+
+class StepPanel(QWidget):
+    """The selected step's controls, docked beside the step list.
+
+    This replaces a modal dialog, and the reason is the shape of the work rather than
+    taste: configuring a step is not a decision you make once and dismiss — it is where
+    you spend the iteration, tweaking a binding and running the step again. A modal makes
+    that a sequence of round trips through a window that hides the list you are working
+    against, and it cannot be open while you look at anything else.
+
+    **Edits are written as they are committed**, with no OK button. A docked panel has no
+    natural moment to press one, and an Apply you can forget is how edits get lost. Each
+    field persists when it settles, which is what every property panel in every IDE does.
+    """
+
+    changed = Signal()                      # the step was written; refresh the row
+    status = Signal(str)
+
+    def __init__(self, *, job_store, tag_store, package_index, blueprint_store=None,
+                 packdump=None, pack_targets=None, parent=None):
+        super().__init__(parent)
+        self._jobs = job_store
+        self._tags = tag_store
+        self._packages = package_index
+        self._blueprints = blueprint_store
+        self._dump = packdump
+        self._pack_targets = pack_targets
+        self._step_id = None
+        self._form = None
+        self._writing = False
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(12, 10, 12, 12)
+        root.setSpacing(8)
+
+        self._title = QLabel()
+        self._title.setWordWrap(True)
+        self._title.setTextFormat(Qt.RichText)
+        self._title.setStyleSheet(f"font-size: 13px; color: {style.TEXT};")
+        root.addWidget(self._title)
+
+        self._subtitle = QLabel()
+        self._subtitle.setWordWrap(True)
+        self._subtitle.setStyleSheet(f"color: {style.TEXT_MUTED}; font-size: 11px;")
+        root.addWidget(self._subtitle)
+
+        self._notice = QLabel()
+        self._notice.setWordWrap(True)
+        self._notice.hide()
+        root.addWidget(self._notice)
+
+        self._relink = QPushButton("Relink this step")
+        self._relink.setToolTip("Confirm this step still means what you want it to mean")
+        self._relink.clicked.connect(self._do_relink)
+        self._relink.hide()
+        root.addWidget(self._relink)
+
+        self._host = QWidget()
+        self._host_layout = QVBoxLayout(self._host)
+        self._host_layout.setContentsMargins(0, 0, 0, 0)
+        root.addWidget(self._host)
+        root.addStretch()
+
+        self.set_step(None)
+
+    # --- what is being edited ---------------------------------------------
+
+    @property
+    def step_id(self):
+        return self._step_id
+
+    def set_packdump(self, packdump):
+        """Adopt a new dump (design 3.1). The form is rebuilt rather than repointed: its
+        registry pickers were populated FROM the old dump, so swapping the reference alone
+        would leave 14,000 entries from a registry the game no longer has."""
+        self._dump = packdump
+        showing, self._step_id = self._step_id, None    # force a real rebuild
+        self.set_step(self._find_step(showing))
+
+    def set_step(self, step):
+        """Show this step, or the empty state when there isn't one.
+
+        Re-showing the step already on screen keeps the existing widgets. Rebuilding them
+        would be actively hostile here: the panel writes as you edit, every write refreshes
+        the row, and the refresh reselects the step — so a rebuild-on-show would destroy
+        the combo box you just used, mid-use, on every single change.
+        """
+        if (step is not None and self._form is not None
+                and step.id == self._step_id and step.is_action):
+            self._notice.hide()
+            self._relink.hide()
+            self._show_relink_if_owed(step)
+            return
+        self._step_id = step.id if step is not None else None
+        self._clear_form()
+        self._notice.hide()
+        self._relink.hide()
+
+        if step is None:
+            self._title.setText("<b>No step selected</b>")
+            self._subtitle.setText("Pick a step on the left to configure it.")
+            return
+        if not step.is_action:
+            referenced = self._jobs.get(step.ref_job_id)
+            self._title.setText("<b>Job step</b>")
+            self._subtitle.setText(
+                f"Runs '{referenced.name}' in place." if referenced else
+                "The job this step referenced no longer exists.")
+            return
+        try:
+            manifest = self._packages.get(step.action_ref)
+        except (KeyError, ValueError):
+            self._title.setText(f"<b>{step.action_ref}</b>")
+            self._notice.setText(f"'{step.action_ref}' isn't installed in this profile, so "
+                                 f"there is nothing to configure. The step will refuse to "
+                                 f"run until the package is installed or the step removed.")
+            self._notice.setStyleSheet(f"color: {style.ERROR}; font-size: 11px;")
+            self._notice.show()
+            self._subtitle.clear()
+            return
+
+        self._title.setText(f"<b>{manifest.name or manifest.action_id}</b>"
+                            f"<span style='color:{style.TEXT_FAINT}'>  {manifest.ref}</span>")
+        self._subtitle.setText(manifest.description or "")
+        self._subtitle.setVisible(bool(manifest.description))
+
+        self._form = StepForm(manifest, self._tags, step, blueprint_store=self._blueprints,
+                              packdump=self._dump, pack_targets=self._pack_targets)
+        self._form.committed.connect(self._write)
+        self._host_layout.addWidget(self._form)
+        self._show_relink_if_owed(step)
+
+    def _clear_form(self):
+        if self._form is not None:
+            self._form.setParent(None)
+            self._form.deleteLater()
+            self._form = None
+
+    def _show_relink_if_owed(self, step):
+        """§3.2.1's relink, as an explicit button rather than a side effect.
+
+        The dialog this replaces cleared every relink the step owed the moment you pressed
+        OK, whether or not you had touched the slot in question — "saving is an assertion"
+        applied to the whole step at once. A panel has no OK, so the assertion gets its own
+        control, which is also more honest: confirming a renamed tag still means what you
+        want is a decision, not a side effect of having opened something.
+        """
+        job = self._jobs.get(step.job_id)
+        if job is None or self._packages is None:
+            return
+        try:
+            owed = [s for s in stale_bindings(job, package_index=self._packages,
+                                              tag_store=self._tags)
+                    if s.step_id == step.id]
+        except Exception:
+            return
+        if not owed:
+            return
+        detail = "; ".join(f"'{s.slot}' was bound to '{s.was}', now called '{s.now}'"
+                           for s in owed)
+        self._notice.setText(f"This step won't run until you confirm it: {detail}")
+        self._notice.setStyleSheet(f"color: {style.WARNING}; font-size: 11px;")
+        self._notice.show()
+        self._relink.show()
+
+    def _do_relink(self):
+        step = self._current_step()
+        if step is None:
+            return
+        manifest = self._packages.get(step.action_ref)
+        self._jobs.relink_step(step.id, record_names(manifest, step.bindings,
+                                                     tag_store=self._tags))
+        self.changed.emit()
+        self.status.emit("Step relinked — it will run as bound")
+        self.set_step(self._jobs.get(step.job_id) and self._current_step())
+
+    def _current_step(self):
+        return self._find_step(self._step_id)
+
+    def _find_step(self, step_id):
+        """Re-read the step from the store rather than holding the one we were handed —
+        it is a frozen snapshot, and every write here makes the copy we have stale."""
+        if step_id is None:
+            return None
+        for job in self._jobs.all():
+            for step in job.steps:
+                if step.id == step_id:
+                    return step
+        return None
+
+    # --- persisting -------------------------------------------------------
+
+    def _write(self):
+        """A field settled: put it in the database."""
+        if self._writing or self._form is None:
+            return
+        step = self._current_step()
+        if step is None:
+            return
+        try:
+            bindings, config, on_error = self._form.read()
+        except ValueError as e:
+            self._notice.setText(str(e))
+            self._notice.setStyleSheet(f"color: {style.ERROR}; font-size: 11px;")
+            self._notice.show()
+            self.status.emit(str(e))
+            return
+        if (bindings, config, on_error) == (step.bindings, step.config, step.on_error):
+            return                          # nothing moved; don't churn the row
+        self._writing = True
+        try:
+            self._jobs.update_step(step.id, bindings=bindings, config=config,
+                                   on_error=on_error,
+                                   bound_names=self._names_after(step, bindings))
+        finally:
+            self._writing = False
+        self.changed.emit()
+
+    def _names_after(self, step, bindings) -> dict:
+        """What each bound tag is called, recorded only for the slots that actually moved.
+
+        The dialog re-recorded everything on OK, so opening a step and pressing OK silently
+        settled a relink you never looked at. Here, changing a slot asserts *that* slot —
+        which is what the gesture actually means — and any other slot goes on owing its
+        relink until the button above says otherwise.
+        """
+        manifest = self._packages.get(step.action_ref)
+        fresh = record_names(manifest, bindings, tag_store=self._tags)
+        merged = dict(step.bound_names)
+        for slot_name, recorded in fresh.items():
+            if bindings.get(slot_name) != step.bindings.get(slot_name):
+                merged[slot_name] = recorded
+        # A slot that is no longer bound has no name to remember.
+        for slot_name in list(merged):
+            if slot_name not in bindings:
+                merged.pop(slot_name)
+        return merged
 
 
 # --- the job editor tab -----------------------------------------------------
@@ -517,9 +840,16 @@ class JobEditorTab(QWidget):
     changed = Signal()             # the job was modified; panels should refresh
     run_requested = Signal(object)  # Job
     dry_run_requested = Signal(object)  # Job — walk it, promote nothing
+    # (Job, step_id, dry) — run ONE step. The authoring loop: iterating on step 4 of 6
+    # should not mean executing, and re-applying, steps 1 to 3 every time.
+    # (Job, step_id, dry, through). `through` runs the job's first N steps rather than
+    # the one step alone — see `run_job` for why those answer different questions.
+    step_run_requested = Signal(object, int, bool, bool)
+    status = Signal(str)           # a line for the status bar, from the step panel
+    action_info_requested = Signal(str)    # action ref — open its reference page
 
     def __init__(self, job, *, job_store, package_index, tag_store, parent=None,
-                 blueprint_store=None, packdump=None, pack_targets=None):
+                 blueprint_store=None, packdump=None, pack_targets=None, history=None):
         super().__init__(parent)
         self._job_id = job.id
         self._jobs = job_store
@@ -528,6 +858,9 @@ class JobEditorTab(QWidget):
         self._blueprints = blueprint_store
         self._dump = packdump
         self._pack_targets = pack_targets
+        # Optional: without it the Last run column simply stays empty, which is the honest
+        # rendering of "this tab has no history to read" rather than a reason to refuse.
+        self._history = history
 
         root = QVBoxLayout(self)
         root.setContentsMargins(8, 8, 8, 8)
@@ -539,7 +872,7 @@ class JobEditorTab(QWidget):
         header.addWidget(self._title)
         header.addSpacing(16)
         header.addWidget(QLabel("On failure:"))
-        self._default_policy = QComboBox()
+        self._default_policy = DropDown()
         self._default_policy.addItem("halt", "halt")
         self._default_policy.addItem("skip", "skip")
         self._default_policy.currentIndexChanged.connect(self._on_policy_changed)
@@ -574,8 +907,8 @@ class JobEditorTab(QWidget):
         root.addLayout(header)
 
         self._tree = PanelTree()
-        self._tree.setColumnCount(4)
-        self._tree.setHeaderLabels(["#", "Step", "Configured", "On failure"])
+        self._tree.setColumnCount(5)
+        self._tree.setHeaderLabels(["#", "Step", "Configured", "On failure", "Last run"])
         self._tree.setRootIsDecorated(False)
         self._tree.setSelectionMode(QAbstractItemView.SingleSelection)
         self._tree.setStyleSheet(style.LIST_QSS + f"""
@@ -585,13 +918,34 @@ class JobEditorTab(QWidget):
                 padding: 3px 6px; font-size: 11px;
             }}
         """)
-        self._tree.itemDoubleClicked.connect(lambda *_: self._edit_step())
-        root.addWidget(self._tree)
+        # Sizing every column to its contents overflowed the tree once the step panel took
+        # a third of the width, and what fell off the right was **Last run** — the column
+        # added precisely so you would not have to go looking for it. One column has to
+        # absorb the slack instead, and `Configured` is the one that can: it is the longest,
+        # and it is the only one the panel beside it also spells out in full.
+        header = self._tree.header()
+        header.setSectionResizeMode(0, QHeaderView.ResizeToContents)   # #
+        header.setSectionResizeMode(1, QHeaderView.ResizeToContents)   # Step
+        header.setSectionResizeMode(2, QHeaderView.Stretch)            # Configured
+        header.setSectionResizeMode(3, QHeaderView.ResizeToContents)   # On failure
+        header.setSectionResizeMode(4, QHeaderView.ResizeToContents)   # Last run
+        self._tree.setTextElideMode(Qt.ElideRight)
+
+        self._loading = False
+        # Rebuilds that must not happen inside a signal — see `_set_step_enabled`.
+        self._pending_select = None
+        self._rebuild_timer = QTimer(self)
+        self._rebuild_timer.setSingleShot(True)
+        self._rebuild_timer.timeout.connect(self._deferred_rebuild)
+        self._tree.itemChanged.connect(self._on_item_changed)
+        self._tree.currentItemChanged.connect(self._on_selection_changed)
+        self._tree.setContextMenuPolicy(Qt.CustomContextMenu)
+        self._tree.customContextMenuRequested.connect(self._on_context_menu)
 
         buttons = QHBoxLayout()
+        # "Edit…" is gone with the dialog it opened: selecting a step IS editing it now.
         for label, slot in (("＋ Action step", self._add_action_step),
                             ("＋ Job step", self._add_job_step),
-                            ("Edit…", self._edit_step),
                             ("Remove", self._remove_step),
                             (icons.ui("up") or "↑", lambda: self._move(-1)),
                             (icons.ui("down") or "↓", lambda: self._move(+1))):
@@ -609,7 +963,40 @@ class JobEditorTab(QWidget):
             btn.clicked.connect(slot)
             buttons.addWidget(btn)
         buttons.addStretch()
-        root.addLayout(buttons)
+
+        # The list and its buttons on the left, the selected step's controls on the right.
+        left = QWidget()
+        left_layout = QVBoxLayout(left)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.setSpacing(8)
+        left_layout.addWidget(self._tree)
+        left_layout.addLayout(buttons)
+
+        self._panel = StepPanel(job_store=job_store, tag_store=tag_store,
+                                package_index=package_index,
+                                blueprint_store=blueprint_store, packdump=packdump,
+                                pack_targets=pack_targets)
+        self._panel.changed.connect(self._on_panel_changed)
+        self._panel.status.connect(self.status)
+
+        # Scrolled, because an action with a dozen slots is taller than the tab — and the
+        # whole point of docking this is that configuring a step never takes you out of
+        # the window you are working in.
+        scroller = QScrollArea()
+        scroller.setWidget(self._panel)
+        scroller.setWidgetResizable(True)
+        scroller.setFrameShape(QFrame.NoFrame)
+        scroller.setMinimumWidth(240)
+        scroller.setStyleSheet(f"QScrollArea {{ background: {style.BG_PANEL}; "
+                               f"border-left: 1px solid {style.BORDER}; }}")
+
+        self._split = QSplitter(Qt.Horizontal)
+        self._split.addWidget(left)
+        self._split.addWidget(scroller)
+        self._split.setStretchFactor(0, 3)
+        self._split.setStretchFactor(1, 1)
+        self._split.setSizes([680, 320])
+        root.addWidget(self._split)
 
         self.refresh()
 
@@ -623,14 +1010,23 @@ class JobEditorTab(QWidget):
 
         The tab flags steps whose bindings no longer resolve, and a mod update is exactly
         what breaks one — so this has to re-run that check, not just swap the reference.
+
+        The step panel holds a dump of its own — its registry-entry pickers enumerate one —
+        so it is rebound here rather than being left to answer from a registry the game no
+        longer has. §3.1's rule about holders, applied one level down.
         """
         self._dump = packdump
+        self._panel.set_packdump(packdump)
         self.refresh()
 
     def refresh(self):
         job = self.job()
         if job is None:
             return
+        # Rebuilding sets check states, and setting one emits `itemChanged` — which is the
+        # same signal a user's click arrives on. Without this the refresh that FOLLOWS a
+        # mute would re-fire the mute for every other row.
+        self._loading = True
         self._title.setText(job.name)
         self._default_policy.blockSignals(True)
         self._default_policy.setCurrentIndex(self._default_policy.findData(job.default_on_error))
@@ -650,6 +1046,14 @@ class JobEditorTab(QWidget):
                     self._problems.setdefault(problem.step_id, []).append(problem)
             except Exception:        # a cosmetic check must never stop the tab opening
                 pass
+        # One query for the whole job rather than one per row.
+        last = {}
+        if self._history is not None:
+            try:
+                last = self._history.latest_for_steps([s.id for s in job.steps])
+            except Exception:            # never let a cosmetic column stop the tab opening
+                last = {}
+
         for index, step in enumerate(job.steps, start=1):
             if step.is_action:
                 what = step.action_ref
@@ -663,8 +1067,23 @@ class JobEditorTab(QWidget):
                 what = f"job: {referenced.name if referenced else '(missing job)'}"
                 configured = ""
             policy = step.on_error or f"({job.default_on_error})"
-            item = QTreeWidgetItem([str(index), what, configured or "—", policy])
+            item = QTreeWidgetItem([str(index), what, configured or "—", policy, ""])
             item.setData(0, Qt.UserRole, step)
+            # The mute switch lives on the number column, which is otherwise pure
+            # decoration — so the row gains a control without gaining a column.
+            item.setCheckState(0, Qt.Checked if step.enabled else Qt.Unchecked)
+            item.setToolTip(0, "Muted — this step is skipped when the job runs"
+                            if not step.enabled else "Part of this job's run")
+            self._render_last_run(item, last.get(step.id))
+            if not step.enabled:
+                # Struck through as well as dimmed: dimming alone is what "disabled" looks
+                # like everywhere else in the app, and this row is very much still yours to
+                # click on.
+                font = item.font(1)
+                font.setStrikeOut(True)
+                for col in range(self._tree.columnCount()):
+                    item.setFont(col, font)
+                    item.setForeground(col, style.qt_colour(style.TEXT_FAINT))
             # 3.2.2: a step whose mapping no longer validates "is flagged as needing
             # attention". It already refuses to run — this is what stops that being a
             # surprise at run time, long after the schema edit that caused it.
@@ -680,8 +1099,35 @@ class JobEditorTab(QWidget):
                     style.WARNING if relink_only else style.ERROR))
                 item.setToolTip(1, chr(10).join(p.detail for p in found))
             self._tree.addTopLevelItem(item)
-        for col in range(self._tree.columnCount()):
-            self._tree.resizeColumnToContents(col)
+        self._loading = False
+        # Clearing the tree dropped the selection, and the panel is driven by it — without
+        # this, any refresh (a run finishing, a tag being renamed elsewhere) would empty the
+        # panel out from under whatever step you were configuring.
+        if self._panel.step_id is not None:
+            self._select_step(self._panel.step_id)
+
+    _LAST_RUN_COLOURS = {"success": style.TEXT_MUTED, "rolled_back": style.TEXT_FAINT}
+
+    def _render_last_run(self, item, row):
+        """The loop's feedback, on the row you are editing.
+
+        A step that has never run reads as "never" rather than blank: blank is what an
+        absent *column* looks like, and "this has not run yet" is a fact worth stating
+        when the whole point of the row is deciding whether to run it.
+        """
+        if not row:
+            item.setText(4, "never")
+            item.setForeground(4, style.qt_colour(style.TEXT_FAINT))
+            return
+        status = row.get("status") or ""
+        when = _ago(row.get("finished_at") or row.get("started_at"))
+        parts = [when] + ([_changed_count(row)] if status == "success" else [status])
+        item.setText(4, "  ·  ".join(p for p in parts if p))
+        item.setForeground(4, style.qt_colour(
+            self._LAST_RUN_COLOURS.get(status, style.ERROR)))
+        stamp = (row.get("finished_at") or "")[:19].replace("T", " ")
+        item.setToolTip(4, "\n".join(filter(None, (
+            f"Last run {stamp} UTC" if stamp else None, row.get("reason")))))
 
     def _binding_label(self, step, mapping_name, stored):
         """A binding is stored as an id; a human needs the name. Falls back to a visible
@@ -734,6 +1180,14 @@ class JobEditorTab(QWidget):
         item = self._tree.currentItem()
         return item.data(0, Qt.UserRole) if item else None
 
+    def _select_step(self, step_id):
+        for index in range(self._tree.topLevelItemCount()):
+            item = self._tree.topLevelItem(index)
+            step = item.data(0, Qt.UserRole)
+            if step is not None and step.id == step_id:
+                self._tree.setCurrentItem(item)
+                return
+
     def _touched(self):
         self.refresh()
         self.changed.emit()
@@ -750,8 +1204,9 @@ class JobEditorTab(QWidget):
             return
         step = self._jobs.add_action_step(self._job_id, picker.result_ref)
         self._touched()
-        # Go straight into configuring it — an unbound required mapping can't run.
-        self._edit_specific_step(step)
+        # Select it, which puts it in the panel — an unbound required mapping can't run,
+        # so landing on its controls is the useful next thing.
+        self._select_step(step.id)
 
     def _add_job_step(self):
         candidates = [j for j in self._jobs.all()
@@ -766,41 +1221,140 @@ class JobEditorTab(QWidget):
             return
         self._touched()
 
-    def _edit_step(self):
-        step = self._selected_step()
-        if step is not None:
-            self._edit_specific_step(step)
+    def _on_selection_changed(self, current, _previous=None):
+        """Selecting a step is what opens it — there is no separate edit gesture now."""
+        if self._loading:
+            return
+        self._panel.set_step(current.data(0, Qt.UserRole) if current is not None else None)
 
-    def _edit_specific_step(self, step):
-        if not step.is_action:
-            QMessageBox.information(self, "Job step",
-                                    "A job step just runs another job — set its failure "
-                                    "policy from the job it belongs to.")
+    def _on_panel_changed(self):
+        """The panel wrote a field. Redraw the row it belongs to, keeping the selection.
+
+        Deferred for the same reason muting is: the panel's write can arrive from inside a
+        widget's own signal, and rebuilding the tree from there destroys items Qt is still
+        working with.
+        """
+        self._pending_select = self._panel.step_id
+        self._rebuild_timer.start(0)
+
+    def _on_item_changed(self, item, column):
+        """A step's mute checkbox was clicked."""
+        if self._loading or column != 0:
             return
-        try:
-            manifest = self._packages.get(step.action_ref)
-        except KeyError:
-            QMessageBox.warning(self, "Action missing",
-                                f"'{step.action_ref}' isn't installed in this profile.")
+        step = item.data(0, Qt.UserRole)
+        if step is None:
             return
-        dlg = StepEditorDialog(manifest, self._tags, step, self,
-                               blueprint_store=self._blueprints,
-                               packdump=self._dump, pack_targets=self._pack_targets)
-        if not dlg.exec():
+        wanted = item.checkState(0) == Qt.Checked
+        if wanted == step.enabled:
             return
-        # Re-record what the bound tags are called. Saving a step is an assertion that it
-        # means what you want, which is exactly what a relink asserts (design 3.2.1) — so
-        # editing a step through this dialog also clears any relink it owed.
-        self._jobs.update_step(step.id, bindings=dlg.result_bindings,
-                               config=dlg.result_config, on_error=dlg.result_on_error,
-                               bound_names=record_names(manifest, dlg.result_bindings,
-                                                        tag_store=self._tags))
+        self._set_step_enabled(step, wanted)
+
+    def _set_step_enabled(self, step, enabled):
+        """Write the mute, then rebuild — but **not from inside this call**.
+
+        `refresh()` clears the tree, which destroys every `QTreeWidgetItem` in it. When the
+        caller is `itemChanged`, one of those is the item Qt is *still delivering the signal
+        for*: it returns into `QTreeModel` code that goes on using the pointer, and that is
+        a use-after-free. It crashes only when the freed block happens to have been reused,
+        so it survives being clicked in a test and takes the application down in real use —
+        measured as an access violation (0xC0000005) on a single click.
+
+        The rebuild is therefore posted to the event loop, to run once this signal has
+        finished unwinding. The timer is parented to the tab so closing the tab destroys
+        it; a bare `singleShot` would fire into a deleted widget instead.
+        """
+        self._jobs.set_step_enabled(step.id, enabled)
+        self._pending_select = step.id
+        self._rebuild_timer.start(0)
+
+    def _deferred_rebuild(self):
         self._touched()
+        if self._pending_select is not None:
+            self._select_step(self._pending_select)
+            self._pending_select = None
+
+    def _on_context_menu(self, pos):
+        self._menu_for(self._tree.itemAt(pos)).exec(self._tree.mapToGlobal(pos))
+
+    def _menu_for(self, item):
+        """The row's own menu. Built separately from showing it so a test can read the
+        actions without `exec()` blocking on a modal event loop."""
+        menu = QMenu(self)
+        step = item.data(0, Qt.UserRole) if item is not None else None
+        if step is None:
+            menu.addAction("Add action step…", self._add_action_step)
+            return menu
+        # Three groups, weakest consequence first: read it, run it, change it. "View Action
+        # Info" leads because it is the only one that does nothing at all — and because
+        # "what does this action actually do" is the question you have while looking at a
+        # step you did not write.
+        if step.is_action:
+            menu.addAction("View Action Info",
+                           lambda: self.action_info_requested.emit(step.action_ref))
+            menu.addSeparator()
+        # Dry run before Run, deliberately. It is the one you want while iterating, it
+        # cannot hurt anything, and putting the destructive twin at the top of a menu you
+        # open dozens of times an hour is how a mis-click writes files.
+        #
+        # The labels state the range rather than saying "up to here", which never settles
+        # whether *this* step is included. Two gestures, two questions: run the prefix and
+        # you get the world the job would build; run the step alone and you get it against
+        # whatever is committed now.
+        position = next((i for i, s in enumerate(self.job().steps, start=1)
+                         if s.id == step.id), None)
+        for dry, verb in ((True, "Dry run"), (False, "Run")):
+            # Hidden on step 1 (identical to running it alone) and on a muted step, where
+            # "run the sequence up to and including one you switched off" is a contradiction.
+            if position and position > 1 and step.enabled:
+                menu.addAction(
+                    f"{verb} steps 1–{position}",
+                    lambda _=False, d=dry: self.step_run_requested.emit(
+                        self.job(), step.id, d, True))
+            menu.addAction(
+                f"{verb} step {position} only" if position else f"{verb} this step",
+                lambda _=False, d=dry: self.step_run_requested.emit(
+                    self.job(), step.id, d, False))
+        menu.addSeparator()
+        menu.addAction("Duplicate", lambda: self._duplicate_step(step))
+        menu.addAction("Unmute step" if not step.enabled else "Mute step",
+                       lambda: self._set_step_enabled(step, not step.enabled))
+        menu.addAction("Remove", lambda: self._remove_specific_step(step))
+        return menu
+
+    def _duplicate_step(self, step):
+        """Copy a step, bindings and all, directly beneath the original.
+
+        Two steps that differ in one binding are common — the same action over `remove`
+        and then over `deprecated` — and rebuilding the second by hand means re-picking the
+        action and re-filling every slot to change one of them.
+        """
+        if not step.is_action:
+            copy = self._jobs.add_job_step(self._job_id, step.ref_job_id,
+                                           on_error=step.on_error)
+        else:
+            # `bound_names` copies too: the duplicate is bound to the same tags under the
+            # same names, so it owes exactly the relinks the original owes — no more (a
+            # fresh copy that immediately demanded relinking would be nonsense) and no
+            # fewer (dropping them would launder a stale binding clean).
+            copy = self._jobs.add_action_step(
+                self._job_id, step.action_ref, bindings=dict(step.bindings),
+                config=dict(step.config), on_error=step.on_error,
+                bound_names=dict(step.bound_names))
+        # Added at the end, then moved to sit just after its original: a copy that appears
+        # eight rows away reads as a new step rather than a copy of this one.
+        job = self.job()
+        ids = [s.id for s in job.steps if s.id != copy.id]
+        at = ids.index(step.id) + 1
+        self._jobs.reorder_steps(self._job_id, ids[:at] + [copy.id] + ids[at:])
+        self._touched()
+        self._select_step(copy.id)
 
     def _remove_step(self):
         step = self._selected_step()
-        if step is None:
-            return
+        if step is not None:
+            self._remove_specific_step(step)
+
+    def _remove_specific_step(self, step):
         self._jobs.remove_step(step.id)
         self._touched()
 

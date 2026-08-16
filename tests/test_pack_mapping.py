@@ -336,12 +336,12 @@ def qapp():
 
 def dialog_for(targets, bound=None):
     from packsmith.core.jobs import JobStep
-    from packsmith.gui.job_editor import StepEditorDialog
+    from packsmith.gui.job_editor import StepForm
 
     step = JobStep(id=1, job_id=1, position=0, kind="action", action_ref="p:a",
                    bindings={"out": bound} if bound else {})
-    return StepEditorDialog(manifest(out=slot()), None, step, packdump=Dump(),
-                            pack_targets=targets)
+    return StepForm(manifest(out=slot()), None, step, packdump=Dump(),
+                    pack_targets=targets)
 
 
 def test_the_picker_lists_the_packs_in_load_order(world, qapp):
@@ -355,10 +355,10 @@ def test_the_picker_lists_the_packs_in_load_order(world, qapp):
 
 def test_a_bound_pack_comes_back_selected(world, qapp):
     _, _, targets = world
-    dialog = dialog_for(targets, bound="tweaks")
-    assert dialog._mapping_widgets["out"].currentData() == "tweaks"
-    dialog.accept()
-    assert dialog.result_bindings["out"] == "tweaks", "opening and accepting lost the binding"
+    form = dialog_for(targets, bound="tweaks")
+    assert form._mapping_widgets["out"].currentData() == "tweaks"
+    bindings, _config, _on_error = form.read()
+    assert bindings["out"] == "tweaks", "showing and reading back lost the binding"
 
 
 def test_no_loader_and_no_packs_are_different_messages(world, no_loader, qapp):

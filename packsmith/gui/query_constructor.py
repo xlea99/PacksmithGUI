@@ -10,7 +10,7 @@ from dataclasses import dataclass
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
-    QDialog, QVBoxLayout, QHBoxLayout, QGridLayout, QComboBox, QLineEdit, QPushButton,
+    QDialog, QVBoxLayout, QHBoxLayout, QGridLayout, QLineEdit, QPushButton,
     QLabel, QCheckBox, QDialogButtonBox, QWidget, QFrame, QMessageBox,
 )
 
@@ -21,6 +21,7 @@ from packsmith.core.query import (
     Query, Registry, Id, Mod, Tag, Attribute, Cmp, Has, Not, And, Or, column_name,
 )
 from packsmith.core.packdump import Packdump
+from packsmith.gui.shell.dropdown import DropDown
 
 
 @dataclass
@@ -111,12 +112,12 @@ class ConditionRow(QWidget):
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(6)
 
-        self._field_combo = QComboBox()
+        self._field_combo = DropDown()
         for f in fields:
             self._field_combo.addItem(f.label)
-        self._op_combo = QComboBox()
+        self._op_combo = DropDown()
         self._value_edit = QLineEdit()
-        self._value_combo = QComboBox()
+        self._value_combo = DropDown()
         remove_btn = QPushButton("×")
         remove_btn.setFixedWidth(26)
 
@@ -291,7 +292,7 @@ class QueryConstructorDialog(QDialog):
         if new_view and registries:
             scope_row = QHBoxLayout()
             scope_row.addWidget(QLabel("Registry"))
-            self._registry_combo = QComboBox()
+            self._registry_combo = DropDown()
             for name in registries:
                 self._registry_combo.addItem(name, name)
             index = self._registry_combo.findData(registry_type)
@@ -338,7 +339,7 @@ class QueryConstructorDialog(QDialog):
         # Combiner
         combiner_row = QHBoxLayout()
         combiner_row.addWidget(QLabel("Show entries that match"))
-        self._combiner = QComboBox()
+        self._combiner = DropDown()
         self._combiner.addItem("ALL of the conditions  (AND)", "AND")
         self._combiner.addItem("ANY of the conditions  (OR)", "OR")
         combiner_row.addWidget(self._combiner)

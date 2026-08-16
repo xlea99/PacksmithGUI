@@ -102,6 +102,7 @@ def test_a_cyclic_reference_does_not_hang_the_count():
     """
     class Step:
         is_action = False
+        enabled = True          # a real JobStep always has one; a muted step isn't counted
         def __init__(self, ref): self.ref_job_id = ref
 
     class Job:

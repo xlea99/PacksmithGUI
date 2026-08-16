@@ -14,14 +14,14 @@ from pathlib import Path
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
-    QDialog, QVBoxLayout, QHBoxLayout, QFormLayout, QLineEdit, QLabel, QComboBox,
-    QPushButton, QDialogButtonBox, QMessageBox, QFileDialog, QAbstractItemView,
+    QDialog, QVBoxLayout, QHBoxLayout, QFormLayout, QLineEdit, QLabel, QPushButton, QDialogButtonBox, QMessageBox, QFileDialog, QAbstractItemView,
     QTreeWidgetItem,
 )
 
 from packsmith.core.profile import MC_VERSION_POLICIES, list_profiles, Profile
 from packsmith.gui.shell import style
 from packsmith.gui.shell.tree import PanelTree
+from packsmith.gui.shell.dropdown import DropDown
 
 _POLICY_LABELS = {
     "strict": "Strict — any Minecraft version change is a different pack (recommended)",
@@ -207,7 +207,7 @@ class NewProfileDialog(QDialog):
         self._loader_version.setPlaceholderText("47.4.10")
         form.addRow("Loader version", self._loader_version)
 
-        self._policy = QComboBox()
+        self._policy = DropDown()
         for key in MC_VERSION_POLICIES:
             self._policy.addItem(_POLICY_LABELS[key], key)
         form.addRow("Version policy", self._policy)

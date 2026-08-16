@@ -17,7 +17,7 @@ from packsmith.core.bindings import binding_id
 from packsmith.core.blueprints import BlueprintStore
 from packsmith.core.jobs import JobStep
 from packsmith.core.packages import ActionManifest, MappingSlot
-from packsmith.gui.job_editor import StepEditorDialog
+from packsmith.gui.job_editor import StepForm
 
 REG = "minecraft:item"
 
@@ -52,9 +52,9 @@ def world(tags, user_db):
 def _round_trip(manifest, bindings, tags, bps):
     step = JobStep(id=1, job_id=1, position=0, kind="action", action_ref="p:a",
                    bindings=dict(bindings))
-    dlg = StepEditorDialog(manifest, tags, step, blueprint_store=bps, packdump=Dump())
-    dlg.accept()
-    return dlg.result_bindings
+    form = StepForm(manifest, tags, step, blueprint_store=bps, packdump=Dump())
+    bindings, _config, _on_error = form.read()
+    return bindings
 
 
 def _manifest(**slots):

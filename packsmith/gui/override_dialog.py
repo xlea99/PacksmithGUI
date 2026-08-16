@@ -11,11 +11,12 @@ path field would invite the one edit that silently produces a file the game neve
 """
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
-    QDialog, QVBoxLayout, QHBoxLayout, QLabel, QComboBox, QLineEdit, QPushButton,
+    QDialog, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit, QPushButton,
     QDialogButtonBox, QRadioButton, QButtonGroup, QWidget,
 )
 
 from packsmith.gui.shell import style
+from packsmith.gui.shell.dropdown import DropDown
 
 NEW_PACK = object()      # sentinel for "create one"
 
@@ -54,7 +55,7 @@ class OverrideTargetDialog(QDialog):
         self._group.addButton(self._create)
 
         root.addWidget(self._existing)
-        self._combo = QComboBox()
+        self._combo = DropDown()
         self._combo.addItems(self._packs)
         # The loader lists packs in LOAD ORDER, and later packs win. Saying so beats
         # letting someone put an override into a pack that something else overrides back.

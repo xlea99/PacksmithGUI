@@ -551,23 +551,25 @@ class ActionPageTab(QWidget):
     # --- for the window ----------------------------------------------------
 
     def title(self) -> str:
-        """The display name, then the id — because the tab bar needs both.
+        """``"Display Name" (action_id)`` — because the tab bar needs both halves.
 
         The id alone is what a job step names and what you search for, but `nuke` beside
-        `audit` beside `fill` tells you nothing about which pack they came from or what
-        they do. The name alone is prose and two actions may share one. Truncated at 16
-        characters so a wordy display name cannot push the id — the shorter, more
-        identifying half — off the end of the tab.
+        `audit` beside `fill` tells you nothing about what they do. The name alone is prose
+        and two actions may share one. Quoting the name and bracketing the id keeps them
+        visibly separate at a glance, which two space-separated words did not.
+
+        Truncated at 20 characters so a wordy display name cannot push the id — the
+        shorter, more identifying half — off the end of the tab.
 
         A name that IS the id is not repeated: `name` defaults to the id when the manifest
-        omits it, and "nuke nuke" is a tab that looks like a bug.
+        omits it, and `"nuke" (nuke)` is a tab that looks like a bug.
         """
         name = (self._manifest.name or "").strip()
         if not name or name == self._manifest.action_id:
             return self._manifest.action_id
-        if len(name) > 16:
-            name = name[:15].rstrip() + "…"
-        return f"{name}  {self._manifest.action_id}"
+        if len(name) > 20:
+            name = name[:19].rstrip() + "…"
+        return f'"{name}" ({self._manifest.action_id})'
 
     def tab_icon(self):
         return icons.ui_icon("action", colour=style.TEXT)

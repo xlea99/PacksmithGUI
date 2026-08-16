@@ -492,6 +492,12 @@ def stale_bindings(job, *, package_index, tag_store) -> list:
     """
     found = []
     for step in job.steps:
+        # A muted step is not part of the run, so it cannot make the run refuse. The wide
+        # pre-flight gate exists to stop a job half-applying (§3.2.1); a step that will not
+        # execute has nothing to half-apply, and blocking a job over one would make
+        # disabling a step useless exactly when you need it — to get past the broken one.
+        if not getattr(step, "enabled", True):
+            continue
         if not step.is_action or not step.bound_names:
             continue
         try:
@@ -559,8 +565,8 @@ def step_problems(job, *, package_index, tag_store, blueprint_store=None,
     # that leaves the step just as unrunnable, which is a worse failure than saying two
     # things. In the ordinary case the stale step still resolves fine, so nothing doubles.
     for step in job.steps:
-        if not step.is_action:
-            continue
+        if not step.is_action or not getattr(step, "enabled", True):
+            continue        # muted: not part of the run, so not a reason it won't run
         try:
             manifest = package_index.get(step.action_ref)
         except (KeyError, AttributeError):
