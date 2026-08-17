@@ -60,7 +60,6 @@ from packsmith.core.jobs import JobStore
 from packsmith.core.blueprints import BlueprintError, BlueprintStore
 from packsmith.core.job_runner import describe_summary, run_job
 
-from packsmith.gui.demo_views import demo_views
 from packsmith.gui.queries import blueprint_query, browse_query, tag_query
 from packsmith.gui.query_constructor import QueryConstructorDialog
 from packsmith.core import reports
@@ -193,8 +192,10 @@ class MainWindow(QMainWindow):
         if self._blocked:
             self._build_blocked_shell(self._blocked)
             return
-        self._seed_tags()
-        self._seed_views()
+        # Tag and View seeding lived here and is gone: `_seed_tags` existed because
+        # "the Tags panel doesn't exist yet", and it does, so the seeds had stopped
+        # being scaffolding and started being four junk tags and four demo Views
+        # written into every profile — including real ones — on every open.
         self._seed_packages()
         self._seed_jobs()
         self._build_shell()
@@ -2832,7 +2833,8 @@ class MainWindow(QMainWindow):
         # The same page the Actions and Packages panels open, reached from the step that
         # uses it — one action, one tab, whichever door you came through.
         tab.action_info_requested.connect(self._open_action)
-        self._workspace.add_tab(tab, f"Job: {job.name}")
+        self._workspace.add_tab(tab, f"Job: {job.name}",
+                                icon=icons.ui_icon("job", colour=style.TEXT))
         self._open_tabs[key] = tab
         return tab
 
@@ -3243,21 +3245,6 @@ class MainWindow(QMainWindow):
 
     # --- dev seed ----------------------------------------------------------
 
-    def _seed_tags(self):
-        """TEMP dev seed — ensures a handful of tags exist to work with (idempotent).
-        Real tag creation is a user action via the Tags panel, which doesn't exist yet."""
-        reg = "minecraft:item"
-        if not self._tags.definition(reg, "tier"):
-            self._tags.define(reg, "tier", "enum", ["early", "mid", "late", "oh my jesus christ wow"])
-        if not self._tags.definition(reg, "banned"):
-            self._tags.define(reg, "banned", "bool", default=False)
-        if not self._tags.definition(reg, "tooltip"):
-            self._tags.define(reg, "tooltip", "string")
-        if not self._tags.definition(reg, "weight"):
-            self._tags.define(reg, "weight", "number")
-        if not self._tags.definition(reg, "remove"):
-            self._tags.define(reg, "remove", "bool", default=False)
-
     def _seed_packages(self):
         """A fresh profile gets one ordinary authored package to put actions in.
 
@@ -3296,13 +3283,6 @@ class MainWindow(QMainWindow):
                 job.id, ref, bindings=bindings,
                 bound_names=record_names(manifest, bindings, tag_store=self._tags))
             self._jobs.set_pinned(job.id, True)
-
-    def _seed_views(self):
-        """A fresh profile ships with sensible default Views (§4.1). They're saved as
-        ordinary rows — there's no such thing as a built-in View, only saved ones."""
-        if self._views.count == 0:
-            for title, query in demo_views():
-                self._views.create(title, query)
 
     def closeEvent(self, event):
         self._db.close()

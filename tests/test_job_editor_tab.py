@@ -507,3 +507,193 @@ def test_a_job_step_offers_no_action_info(world, qapp):
     labels = [a.text() for a in tab._menu_for(tab._tree.topLevelItem(0)).actions()]
 
     assert "View Action Info" not in labels
+
+
+# --- adding a step, inline ------------------------------------------------------------
+
+RICH = ActionManifest(
+    package_name="removal_suite", action_id="nuke", file="n.star", function="run",
+    name="Nuke Items", description="Remove items everywhere.",
+    mappings={"target": MappingSlot(name="target", kind="tag", tag_type="bool",
+                                    registry_type=REG)})
+OTHER = ActionManifest(
+    package_name="lang_fixer", action_id="apply", file="l.star", function="run",
+    name="Apply Lang Overrides", description="Write a resource pack of renames.")
+RICH_ACTIONS = {"removal_suite:nuke": RICH, "lang_fixer:apply": OTHER}
+
+
+class RichIndex:
+    actions = RICH_ACTIONS
+
+    def get(self, ref):
+        return RICH_ACTIONS[ref]
+
+
+def rich_tab(world, job=None):
+    tags, jobs, blueprints = world
+    job = job or jobs.create("nightly")
+    return JobEditorTab(jobs.get(job.id), job_store=jobs, package_index=RichIndex(),
+                        tag_store=tags, blueprint_store=blueprints, packdump=None), jobs, job
+
+
+def test_choosing_is_what_creates_the_step(world, qapp):
+    """Nothing is written until something is picked.
+
+    A step created up front would have no action yet — and a step with no action is
+    *broken*: flagged, and blocking the whole job at pre-flight, for as long as it takes to
+    get distracted. So the button opens a chooser and cancelling leaves no trace.
+    """
+    tab, jobs, job = rich_tab(world)
+
+    tab._add_action_step()
+    qapp.processEvents()
+    assert tab._panel.picking
+    assert jobs.get(job.id).steps == [], "the step was created before anything was chosen"
+
+    tab._panel._picker.dismissed.emit()          # Escape
+    qapp.processEvents()
+    assert jobs.get(job.id).steps == [], "cancelling left a step behind"
+    assert not tab._panel.picking
+
+
+def test_picking_stores_the_ref_not_the_label(world, qapp):
+    """The row reads "Nuke Items" and the step must record `removal_suite:nuke`.
+
+    A picker that could only return what it displayed would store the display name as an
+    action ref — a step pointing at an action that does not exist, written without a
+    murmur.
+    """
+    tab, jobs, job = rich_tab(world)
+    tab._add_action_step()
+    qapp.processEvents()
+
+    picker = tab._panel._picker
+    picker._filter.setText("nuke items")
+    qapp.processEvents()
+    picker._pick(picker._list.item(0))
+    qapp.processEvents()
+
+    assert [s.action_ref for s in jobs.get(job.id).steps] == ["removal_suite:nuke"]
+    assert tab._panel.step_id == jobs.get(job.id).steps[0].id, "it should open for editing"
+
+
+def test_typing_a_package_name_finds_its_actions(world, qapp):
+    """Matching searches the ref and description too, not just the display name.
+
+    The row leads with "Apply Lang Overrides", so a label-only search would answer
+    "nothing matches" for `lang_fixer` — a confident falsehood about an action that is
+    installed and right there.
+    """
+    tab, jobs, job = rich_tab(world)
+    tab._add_action_step()
+    qapp.processEvents()
+    picker = tab._panel._picker
+
+    picker._filter.setText("lang_fixer")
+    qapp.processEvents()
+    assert picker.visible_values() == ["lang_fixer:apply"]
+
+    picker._filter.setText("renames")          # from the description
+    qapp.processEvents()
+    assert picker.visible_values() == ["lang_fixer:apply"]
+
+
+def test_the_ghost_row_carries_no_step(world, qapp):
+    """It shows where the step will land and nothing more. Backing it with a real row
+    would put a `None` step in front of every menu, mute checkbox and Remove button."""
+    tab, jobs, job = rich_tab(world)
+    add_step(jobs, job.id, world[0])
+    tab.refresh()
+
+    tab._add_action_step()
+    qapp.processEvents()
+
+    ghost = tab._tree.topLevelItem(tab._tree.topLevelItemCount() - 1)
+    assert ghost.data(0, Qt.UserRole) is None
+    assert not (ghost.flags() & Qt.ItemIsSelectable)
+
+
+def test_a_refresh_mid_pick_keeps_the_picker(world, qapp):
+    """Runs finish and tags get renamed while you are choosing; neither should shut the
+    chooser or drop the row showing where the step goes."""
+    tab, jobs, job = rich_tab(world)
+    tab._add_action_step()
+    qapp.processEvents()
+
+    tab.refresh()
+    qapp.processEvents()
+
+    assert tab._panel.picking, "a refresh closed the chooser"
+    assert tab._ghost is not None
+
+
+def test_mashing_the_button_leaves_one_placeholder(world, qapp):
+    """Four presses used to leave four ghost rows stacked up in the list.
+
+    `_begin_pick` appended a placeholder every time and nothing ever took the old one
+    away — the list clears on refresh, and starting a pick doesn't refresh.
+    """
+    tags, jobs, _ = world
+    jobs.create("something to nest")          # so +Job has candidates too
+    tab, jobs, job = rich_tab(world)
+    add_step(jobs, job.id, tags)
+    tab.refresh()
+    real = tab._tree.topLevelItemCount()
+
+    for _ in range(4):
+        tab._add_action_step()
+        qapp.processEvents()
+    assert tab._tree.topLevelItemCount() == real + 1, "the placeholders stacked up"
+
+    tab._add_job_step()                  # switching kind must replace, not add
+    qapp.processEvents()
+
+    assert tab._tree.topLevelItemCount() == real + 1
+    assert "run another job" in tab._tree.topLevelItem(real).text(1)
+
+
+def test_selecting_a_step_mid_pick_ends_the_pick(world, qapp):
+    """The state that produced the screenshot: no chooser, but the placeholder rows still
+    there and the tab still convinced it was picking.
+
+    The panel and the tab were each tracking "are we picking" — anything reaching
+    `set_step` cleared the chooser without the tab hearing about it. Now the panel
+    announces it, so both agree.
+    """
+    tags, jobs, _ = world
+    jobs.create("something to nest")          # or there is nothing to pick from
+    tab, jobs, job = rich_tab(world)
+    step = add_step(jobs, job.id, tags)
+    tab.refresh()
+    tab._add_job_step()
+    qapp.processEvents()
+    assert tab._picking == "job"
+
+    tab._select_step(step.id)            # click a real step instead
+    qapp.processEvents()
+
+    assert tab._picking is None, "the tab still thought it was picking"
+    assert tab._ghost is None
+    assert not tab._panel.picking
+    assert tab._tree.topLevelItemCount() == 1, "the placeholder was stranded in the list"
+    assert tab._panel.step_id == step.id
+
+
+def test_a_pick_with_nothing_to_choose_leaves_no_placeholder(world, qapp):
+    """A job with no nestable candidates has nothing to pick, so there is no pick to be in.
+
+    Entering picking mode anyway stranded the placeholder permanently: with no chooser on
+    screen the panel has nothing to clear, so it never announces that the pick is off and
+    the row never goes away.
+    """
+    tab, jobs, job = rich_tab(world)          # the only job, so nothing to nest
+    add_step(jobs, job.id, world[0])
+    tab.refresh()
+
+    tab._add_job_step()
+    qapp.processEvents()
+
+    assert tab._picking is None
+    assert tab._ghost is None
+    assert tab._tree.topLevelItemCount() == 1, "a placeholder was left with no way to clear it"
+    assert "cycle" in tab._panel._subtitle.text()

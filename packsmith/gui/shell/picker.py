@@ -14,14 +14,120 @@ Deliberately generic: it takes strings and emits the one you chose. Blueprint ca
 suggestions are the first caller, and any cell that wants "pick from a long list of ids"
 is the next.
 """
-from PySide6.QtCore import QEvent, QPoint, QRect, Qt, QTimer, Signal
-from PySide6.QtGui import QCursor
+from typing import NamedTuple
+
+from PySide6.QtCore import QEvent, QPoint, QRect, QSize, Qt, QTimer, Signal
+from PySide6.QtGui import QColor, QCursor, QFont, QFontMetrics
 from PySide6.QtWidgets import (
-    QApplication, QFrame, QLabel, QLineEdit, QListWidget, QListWidgetItem, QVBoxLayout,
+    QApplication, QFrame, QLabel, QLineEdit, QListWidget, QListWidgetItem,
+    QStyledItemDelegate, QVBoxLayout,
 )
 
 from packsmith.core.query.tokens import matches_tokens
 from packsmith.gui.shell import style
+
+
+class Choice(NamedTuple):
+    """One row: what it reads as, what it returns, and an optional second line.
+
+    Plain strings still work everywhere and mean ``Choice(text, text, "")`` — the registry
+    pickers pass ids and want the id back. A separate ``value`` exists because an action
+    reads as "Nuke" and is *identified* by `removal_suite:nuke`, and a picker that could
+    only return what it displayed would force one to be sacrificed for the other.
+    """
+    label: str
+    value: str = None
+    detail: str = ""
+
+    @property
+    def returns(self) -> str:
+        return self.label if self.value is None else self.value
+
+    @property
+    def haystack(self) -> str:
+        """What typing searches. All three parts, so a package name finds its actions even
+        though the row leads with the action's display name."""
+        return " ".join(p for p in (self.label, self.detail, self.value) if p)
+
+
+def _as_choice(item) -> Choice:
+    if isinstance(item, Choice):
+        return item
+    if isinstance(item, (tuple, list)):
+        return Choice(*item)
+    return Choice(str(item))
+
+
+_DETAIL_ROW_HEIGHT = 36
+
+
+class _TwoLineDelegate(QStyledItemDelegate):
+    """Label on top, detail beneath it in the muted colour.
+
+    A delegate rather than an embedded newline because the second line has to be *quieter*
+    than the first — same-weight two-line rows read as two entries rather than one, which
+    is worse than a single line.
+    """
+
+    @staticmethod
+    def _small(font: QFont) -> QFont:
+        """One notch down from whatever it is given.
+
+        A font carries EITHER a point size or a pixel size, and the other reads as -1. Qt's
+        default here is pixel-sized, so the obvious `setPointSizeF(pointSizeF() - 1)`
+        computed `max(6.0, -2.0)` and rendered the detail line at **6pt** — a size nobody
+        chose, and one that changes with whatever happened to set the application font
+        last. Measured, not deduced: `pointSizeF=-1.0 pixelSize=12` on a plain QApplication.
+        """
+        smaller = QFont(font)
+        if font.pointSizeF() > 0:
+            smaller.setPointSizeF(max(6.0, font.pointSizeF() - 1))
+        else:
+            smaller.setPixelSize(max(9, font.pixelSize() - 1))
+        return smaller
+
+    @classmethod
+    def detail_text(cls, font: QFont, detail: str, width: int) -> str:
+        """The detail line as it will actually be drawn, elided to `width`.
+
+        Split out of `paint` so it can be measured without rendering a row — the failure
+        this guards against is arithmetic, not painting, and reproducing the arithmetic in
+        a test would only ever agree with itself.
+        """
+        return QFontMetrics(cls._small(font)).elidedText(detail, Qt.ElideRight, width)
+
+    def sizeHint(self, option, index):
+        return QSize(option.rect.width(), _DETAIL_ROW_HEIGHT)
+
+    def paint(self, painter, option, index):
+        painter.save()
+        selected = bool(option.state & option.state.__class__.State_Selected)
+        if selected:
+            painter.fillRect(option.rect, QColor(style.ACCENT_EDGE))
+        box = option.rect.adjusted(6, 3, -6, -3)
+        label = index.data(Qt.DisplayRole) or ""
+        detail = index.data(Qt.UserRole + 2) or ""
+
+        # Elided RIGHT, not middle. These are a name and a description, not ids — the front
+        # is the informative end, and middle-elision mangles a sentence into two halves of
+        # different thoughts. (The plain single-line list still elides ids in the middle,
+        # where both ends carry meaning.)
+        painter.setFont(option.font)
+        painter.setPen(QColor("#ffffff" if selected else style.TEXT))
+        top = box.adjusted(0, 0, 0, -box.height() // 2)
+        painter.drawText(top, Qt.AlignLeft | Qt.AlignVCenter,
+                         option.fontMetrics.elidedText(label, Qt.ElideRight, top.width()))
+
+        # Measured with the font it is DRAWN in. `option.fontMetrics` describes the default
+        # font, and this line is a point smaller — measured on a real row, the same string
+        # is 1392px by those metrics and 928px by these, so eliding with the wrong ones
+        # threw away a third of the width and stopped well short of the edge.
+        painter.setFont(self._small(option.font))
+        painter.setPen(QColor("#d8e4f0" if selected else style.TEXT_FAINT))
+        bottom = box.adjusted(0, box.height() // 2, 0, 0)
+        painter.drawText(bottom, Qt.AlignLeft | Qt.AlignVCenter,
+                         self.detail_text(option.font, detail, bottom.width()))
+        painter.restore()
 
 
 def _token_match(candidate: str, text: str) -> bool:
@@ -53,7 +159,7 @@ class PickerPopup(QFrame):
     dismissed = Signal()
 
     def __init__(self, items, *, header="", placeholder="type to narrow", parent=None,
-                 match=None, attach=None, dock=None):
+                 match=None, attach=None, dock=None, inline=None):
         # Two different windows, decided here rather than flipped later: changing the flags
         # afterwards recreates the native window, and this frame should never spend even one
         # moment being an ordinary decorated window.
@@ -76,7 +182,15 @@ class PickerPopup(QFrame):
         # moves with its parent by construction, which is the only way to be genuinely
         # stuck to a cell rather than repeatedly chasing it. The cost is that it clips to
         # the viewport, so it must be sized to fit inside one (see `dock_under`).
-        if dock is not None:
+        # `inline` is the fourth case and the least window-like of all: an ordinary child
+        # whose geometry a LAYOUT owns, so it fills whatever it is put in rather than being
+        # positioned against a cell. Docked mode is still positioned by hand
+        # (`dock_under`); inline mode never is. This is what lets the same list serve as a
+        # panel's whole content instead of something that floats over one.
+        if inline is not None:
+            super().__init__(inline)
+            self.setAutoFillBackground(True)
+        elif dock is not None:
             super().__init__(dock)
             # A frameless child of a scroll area inherits nothing to paint on, so without
             # this the list renders over whatever cells are behind it.
@@ -84,6 +198,7 @@ class PickerPopup(QFrame):
         else:
             super().__init__(parent, (Qt.ToolTip | Qt.WindowDoesNotAcceptFocus)
                              if attach is not None else Qt.Popup)
+        self._inline = inline is not None
         self._docked = dock is not None
         self._dismissed = False    # set by dismiss(); nothing may re-show it after
         # Token matching by default, because that is what typing into a box means
@@ -91,12 +206,21 @@ class PickerPopup(QFrame):
         # "polished granite stair" (ids use underscores), and failing on a space is the
         # first thing anyone would type.
         self._match = match or _token_match
+        # The full list stays in Python; only a windowful goes into the widget. Fourteen
+        # thousand QListWidgetItems is a lot of machinery to build for the fourteen rows
+        # anyone can actually see, and the filter searches all of them regardless.
+        self._choices = [_as_choice(t) for t in items]
         self._attached = None      # a text box driving this list, in attached mode
         self._done = False         # itemActivated and itemClicked can both fire on one click
-        self.setFrameShape(QFrame.StyledPanel)
-        self.setMaximumSize(_MAX_WIDTH, _MAX_HEIGHT)
+        self.setFrameShape(QFrame.NoFrame if self._inline else QFrame.StyledPanel)
+        if not self._inline:
+            # Inline, the cap is wrong twice over: it stops the list filling its panel, and
+            # a floating widget's reason for being bounded (it covers the window) does not
+            # apply to one that IS the window's content.
+            self.setMaximumSize(_MAX_WIDTH, _MAX_HEIGHT)
         self.setStyleSheet(f"""
-            QFrame {{ background: {style.BG_PANEL}; border: 1px solid {style.BORDER}; }}
+            QFrame {{ background: {style.BG_PANEL};
+                      border: {'none' if self._inline else f'1px solid {style.BORDER}'}; }}
         """)
 
         lay = QVBoxLayout(self)
@@ -123,31 +247,38 @@ class PickerPopup(QFrame):
         """)
         self._filter.textChanged.connect(self._apply_filter)
         lay.addWidget(self._filter)
-        # Below the threshold you can see the whole list, so the box is just clutter.
+        # Below the threshold you can see the whole list, so the box is just clutter —
+        # except inline, where the panel exists TO be typed into and a box that comes and
+        # goes with the list length reads as a bug.
         # Ordered after addWidget deliberately: see the note above.
-        self._filter.setVisible(len(items) >= _FILTER_THRESHOLD)
+        self._filter.setVisible(self._inline or len(items) >= _FILTER_THRESHOLD)
 
         self._list = QListWidget(self)
         self._list.setTextElideMode(Qt.ElideMiddle)
+        # Rows elide, so there is never anything to scroll sideways TO — and a horizontal
+        # bar costs a row of height at the bottom of a list whose whole job is showing rows.
+        self._list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self._list.setUniformItemSizes(True)   # skip per-row layout on a long list
         self._list.setStyleSheet(style.LIST_QSS)
         self._list.itemActivated.connect(self._pick)
         self._list.itemClicked.connect(self._pick)
         lay.addWidget(self._list)
+        # Every row is the same height whether or not details are present, so the uniform
+        # sizing above still holds — it is one delegate for the whole list, not per row.
+        if any(c.detail for c in self._choices):
+            self._delegate = _TwoLineDelegate(self._list)   # held: Qt won't own it
+            self._list.setItemDelegate(self._delegate)
 
         self._footer = QLabel(self)
         self._footer.setStyleSheet(
             f"color: {style.TEXT_FAINT}; font-size: 10px; border: none;")
         lay.addWidget(self._footer)
 
-        # The full list stays in Python; only a windowful goes into the widget. Fourteen
-        # thousand QListWidgetItems is a lot of machinery to build for the fourteen rows
-        # anyone can actually see, and the filter searches all of them regardless.
-        self._items = [str(t) for t in items]
         self._repopulate("")
 
-        self.resize(min(_MAX_WIDTH, 420),
-                    min(_MAX_HEIGHT, 70 + 20 * min(len(self._items), 14)))
+        if not self._inline:
+            self.resize(min(_MAX_WIDTH, 420),
+                        min(_MAX_HEIGHT, 70 + 20 * min(len(self._choices), 14)))
         if attach is not None:
             self.attach_to(attach)
 
@@ -246,12 +377,15 @@ class PickerPopup(QFrame):
         self._repopulate(text)
 
     def _repopulate(self, text):
-        matched = [t for t in self._items
-                   if not text.strip() or self._match(t, text)]
+        matched = [c for c in self._choices
+                   if not text.strip() or self._match(c.haystack, text)]
         self._list.clear()
-        for entry in matched[:_MAX_ROWS]:
-            item = QListWidgetItem(entry)
-            item.setToolTip(entry)          # elided in the row, whole in the tooltip
+        for choice in matched[:_MAX_ROWS]:
+            item = QListWidgetItem(choice.label)
+            item.setData(Qt.UserRole + 1, choice.returns)
+            item.setData(Qt.UserRole + 2, choice.detail)
+            item.setToolTip("\n".join(filter(None, (choice.label, choice.detail)))
+                            or choice.label)   # elided in the row, whole in the tooltip
             self._list.addItem(item)
         if self._list.count():
             self._list.setCurrentRow(0)
@@ -271,8 +405,12 @@ class PickerPopup(QFrame):
         # Closed before the signal: a listener that writes the chosen value back into the
         # text box driving this list would otherwise re-filter a popup that is on its way
         # out, and in attached mode that text box is exactly where the value goes.
-        self.close()
-        self.chosen.emit(item.text())
+        #
+        # Inline is the exception — it is not floating over anything, and its owner replaces
+        # it on the very next line, so closing first only flashes an empty panel.
+        if not self._inline:
+            self.close()
+        self.chosen.emit(item.data(Qt.UserRole + 1) or item.text())
 
     def keyPressEvent(self, event):
         """Type in the filter, steer in the list — the list never takes focus, so its keys
@@ -288,6 +426,11 @@ class PickerPopup(QFrame):
                 return
             # Nothing highlighted — fall through, so Enter still commits what was typed.
         if key == Qt.Key_Escape:
+            # Inline, there is nothing to close — the owner decides what the panel shows
+            # next, so Escape is a report rather than an action.
+            if self._inline:
+                self.dismissed.emit()
+                return
             # Dismisses the suggestions, not the edit behind them.
             self.close()
             return
@@ -422,6 +565,14 @@ class PickerPopup(QFrame):
     def visible_items(self) -> list:
         return [self._list.item(r).text() for r in range(self._list.count())]
 
+    def visible_values(self) -> list:
+        return [self._list.item(r).data(Qt.UserRole + 1)
+                for r in range(self._list.count())]
+
     def match_count(self, text="") -> int:
         """How many of the FULL list match — the widget only ever holds a windowful."""
-        return sum(1 for t in self._items if not text.strip() or self._match(t, text))
+        return sum(1 for c in self._choices
+                   if not text.strip() or self._match(c.haystack, text))
+
+    def focus_filter(self):
+        self._filter.setFocus()

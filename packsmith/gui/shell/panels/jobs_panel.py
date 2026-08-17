@@ -107,7 +107,13 @@ class JobsPanel(Panel):
         self._tree.addTopLevelItem(header)
         header.setExpanded(True)
         for job in jobs:
-            item = QTreeWidgetItem([icons.ui("play") or "▶", job.name])
+            # Both marks are real QIcons. They used to be the raw glyph CHARACTER in the
+            # text column, with no Phosphor font set on it — so Windows font-fallback
+            # substituted whatever else claimed that codepoint, and the run triangle came
+            # out as a paper plane. Every other panel already does it this way.
+            item = QTreeWidgetItem(["", job.name])
+            item.setIcon(0, icons.ui_icon("play", colour=style.TEXT_MUTED))
+            item.setIcon(1, icons.ui_icon("job", colour=style.TEXT_MUTED))
             item.setData(0, _ROLE_JOB, job)
             item.setToolTip(0, f"Run '{job.name}' now")
             steps = len(job.steps)

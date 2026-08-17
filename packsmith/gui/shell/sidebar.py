@@ -90,7 +90,7 @@ class Sidebar(QWidget):
         line = QFrame()
         line.setFrameShape(QFrame.HLine)
         line.setFixedHeight(9)
-        line.setStyleSheet(f"color: {style.BORDER}; margin: 4px 9px;")
+        line.setStyleSheet(f"color: {style.DIVIDER}; margin: 4px 9px;")
         return line
 
     def _on_click(self, key):

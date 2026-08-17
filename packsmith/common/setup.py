@@ -155,6 +155,26 @@ def save_ui_state(profile: str, **changes) -> None:
     save_state(ui=ui)
 
 
+def forget_ui_state(profile: str) -> None:
+    """Drop everything remembered about one profile's furniture.
+
+    Called when a profile is deleted, because this state is keyed by profile **name** and
+    a name is reusable. Without it, deleting a profile and making a new one with the same
+    name inherits the dead one's layout — and that layout refers to rows by *id*: a View
+    group holding views 1 and 2, column widths for tags, a remembered job. None of those
+    ids mean anything in the new database, so the panel restores a group of views that do
+    not exist.
+
+    The profile's data lives in `profile.db` and its furniture lives here; nothing linked
+    the two lifecycles, so deleting one left the other behind.
+    """
+    if not profile:
+        return
+    ui = load_state().get("ui", {})
+    if ui.pop(profile, None) is not None:
+        save_state(ui=ui)
+
+
 def save_state(**changes) -> None:
     """Merge ``changes`` into the stored state. Best-effort — never fatal.
 

@@ -67,7 +67,7 @@ class SettingsDialog(QDialog):
     def _divider():
         line = QFrame()
         line.setFrameShape(QFrame.HLine)
-        line.setStyleSheet(f"color: {style.BORDER};")
+        line.setStyleSheet(f"color: {style.DIVIDER};")
         return line
 
     @staticmethod

@@ -1,7 +1,7 @@
 import json
 import shutil
 from pathlib import Path
-from packsmith.common.setup import GLOBAL_PATHS, ensure_directory
+from packsmith.common.setup import GLOBAL_PATHS, ensure_directory, forget_ui_state
 from packsmith.common.logging import log
 from packsmith.util.misc import raise_log, write_json
 
@@ -211,6 +211,10 @@ def delete_profile(name: str):
     if not (root / "profile.json").exists():
         raise_log(ValueError, f"No profile named '{name}'")
     shutil.rmtree(root)
+    # The remembered layout lives in app state, keyed by NAME — and a name is reusable, so
+    # leaving it behind means the next profile called this inherits a dead one's furniture:
+    # a View group holding view ids that no longer exist, column widths for deleted tags.
+    forget_ui_state(name)
     log.info(f"Profile '{name}' deleted")
 
 

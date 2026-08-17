@@ -55,7 +55,7 @@ QSS = f"""
         background: {style.ACCENT_EDGE}; color: #ffffff;
     }}
     QComboBox QAbstractItemView::separator {{
-        height: 1px; background: {style.BORDER}; margin: 3px 6px;
+        height: 1px; background: {style.DIVIDER}; margin: 4px 6px;
     }}
 """
 

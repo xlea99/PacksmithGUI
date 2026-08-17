@@ -22,6 +22,7 @@ from packsmith.core.query import (
 )
 from packsmith.core.packdump import Packdump
 from packsmith.gui.shell.dropdown import DropDown
+from packsmith.gui.shell import style
 
 
 @dataclass
@@ -333,7 +334,7 @@ class QueryConstructorDialog(QDialog):
 
         line = QFrame()
         line.setFrameShape(QFrame.HLine)
-        line.setStyleSheet("color: #3a3a3a;")
+        line.setStyleSheet(f"color: {style.DIVIDER};")
         root.addWidget(line)
 
         # Combiner

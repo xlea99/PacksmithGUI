@@ -5,6 +5,7 @@ import logging
 from PySide6.QtWidgets import QApplication
 from PySide6.QtGui import QPalette, QColor
 from PySide6.QtCore import Qt, QtMsgType, qInstallMessageHandler
+from packsmith.gui.shell import style
 from packsmith.gui.main_window import MainWindow
 
 log = logging.getLogger(__name__)
@@ -25,6 +26,30 @@ def _qt_message_handler(mode, context, message):
 def _exception_hook(exc_type, exc_value, exc_tb):
     log.critical("Uncaught exception:", exc_info=(exc_type, exc_value, exc_tb))
     traceback.print_exception(exc_type, exc_value, exc_tb)
+
+
+# Menus, styled once for the whole app. There are thirty-odd `addSeparator()` calls across
+# a dozen panels and they all want the same answer, so per-call-site styling would be
+# thirty chances to differ. Fusion draws a separator as a SUNKEN line — two near-black
+# hairlines on a near-black menu — so the grouping is there in the code and invisible on
+# screen. A flat line at `style.DIVIDER` reads at a glance.
+_MENU_QSS = f"""
+    QMenu {{
+        background: {style.BG_CHROME};
+        color: {style.TEXT};
+        border: 1px solid {style.BORDER};
+        padding: 4px 0;
+    }}
+    QMenu::item {{ padding: 4px 24px 4px 16px; }}
+    QMenu::item:selected {{ background: {style.ACCENT_EDGE}; color: #ffffff; }}
+    QMenu::item:disabled {{ color: {style.TEXT_FAINT}; }}
+    QMenu::separator {{
+        height: 1px;
+        background: {style.DIVIDER};
+        margin: 5px 10px;
+    }}
+    QMenuBar::item:selected {{ background: {style.BG_HOVER}; }}
+"""
 
 
 def apply_dark_mode(app: QApplication):
@@ -53,8 +78,10 @@ def apply_dark_mode(app: QApplication):
 
     app.setPalette(palette)
 
-    # Extra stylesheet for things palette doesn't cover
-    app.setStyleSheet("""
+    # Extra stylesheet for things palette doesn't cover. The menu block is built
+    # separately so the rest can stay a plain string — an f-string here would mean
+    # doubling every brace in every rule below, for no gain.
+    app.setStyleSheet(_MENU_QSS + """
         QTableView {
             gridline-color: #3a3a3a;
             font-size: 13px;

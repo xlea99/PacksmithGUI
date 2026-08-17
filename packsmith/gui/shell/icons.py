@@ -281,6 +281,10 @@ UI_GLYPHS = {
     # the drawing, the other is the object. Two silhouettes nobody can confuse, which
     # matters in a tree whose only other cue is one level of indent.
     "instance": "\ue1da",      # cube
+    # A JOB - a truck. Goofy on purpose and it earns it: a job hauls a payload from one
+    # place to another, which is exactly what one does. It also shares its silhouette
+    # with nothing else in the shell, and stays readable at the 13px of a sidebar row.
+    "job": "",           # truck
     # folder-simple rather than the notched folder the Files panel uses - a group of
     # views is not a directory, and borrowing that silhouette would imply it was.
     "group": "",          # folder-simple

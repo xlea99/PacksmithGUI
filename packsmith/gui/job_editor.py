@@ -24,7 +24,7 @@ from packsmith.core.bindings import (
     step_problems)
 from packsmith.core.shapes import describe_shape
 from packsmith.gui.shell import icons, style
-from packsmith.gui.shell.picker import PickerPopup, _token_match
+from packsmith.gui.shell.picker import Choice, PickerPopup, _token_match
 from packsmith.gui.shell.tree import PanelTree
 from packsmith.gui.shell.dropdown import DropDown
 
@@ -94,90 +94,6 @@ def _refers_to(stored, artifact_id, label) -> bool:
     if stored == artifact_id:
         return True
     return isinstance(stored, str) and stored == label
-
-
-# --- picking an action ------------------------------------------------------
-
-class ActionPickerDialog(QDialog):
-    """Choose an installed action to add as a step."""
-
-    def __init__(self, package_index, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Add Action Step")
-        self.setMinimumSize(520, 360)
-        self.result_ref = None
-
-        root = QVBoxLayout(self)
-        root.addWidget(QLabel("Installed actions"))
-
-        self._list = QListWidget()
-        self._list.setStyleSheet(style.LIST_QSS)
-        for ref, manifest in sorted(package_index.actions.items()):
-            item = QListWidgetItem(f"{manifest.name or manifest.action_id}   —   {ref}")
-            item.setData(Qt.UserRole, ref)
-            if manifest.description:
-                item.setToolTip(manifest.description)
-            self._list.addItem(item)
-        self._list.itemDoubleClicked.connect(lambda _: self.accept())
-        root.addWidget(self._list)
-
-        if self._list.count() == 0:
-            empty = QLabel("No action packages are installed in this profile.")
-            empty.setStyleSheet(f"color: {style.TEXT_FAINT}; font-size: 11px;")
-            root.addWidget(empty)
-
-        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        root.addWidget(buttons)
-
-    def accept(self):
-        item = self._list.currentItem()
-        if item is None:
-            QMessageBox.warning(self, "Pick an action", "Select an action to add.")
-            return
-        self.result_ref = item.data(Qt.UserRole)
-        super().accept()
-
-
-class JobPickerDialog(QDialog):
-    """Choose another job to nest as a step. Jobs that would create a cycle are excluded
-    up front rather than rejected after the fact."""
-
-    def __init__(self, candidates, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Add Job Step")
-        self.setMinimumSize(420, 300)
-        self.result_job_id = None
-
-        root = QVBoxLayout(self)
-        root.addWidget(QLabel("Run another job as a step"))
-        self._list = QListWidget()
-        self._list.setStyleSheet(style.LIST_QSS)
-        for job in candidates:
-            item = QListWidgetItem(job.name)
-            item.setData(Qt.UserRole, job.id)
-            self._list.addItem(item)
-        self._list.itemDoubleClicked.connect(lambda _: self.accept())
-        root.addWidget(self._list)
-        if not candidates:
-            note = QLabel("No other job can be nested here without creating a cycle.")
-            note.setWordWrap(True)
-            note.setStyleSheet(f"color: {style.TEXT_FAINT}; font-size: 11px;")
-            root.addWidget(note)
-
-        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        root.addWidget(buttons)
-
-    def accept(self):
-        item = self._list.currentItem()
-        if item is None:
-            self.reject()
-            return
-        self.result_job_id = item.data(Qt.UserRole)
-        super().accept()
 
 
 def _select_stored(combo, stored):
@@ -610,6 +526,8 @@ class StepPanel(QWidget):
 
     changed = Signal()                      # the step was written; refresh the row
     status = Signal(str)
+    picked = Signal(str)                    # a value chosen in picking mode
+    pick_cancelled = Signal()
 
     def __init__(self, *, job_store, tag_store, package_index, blueprint_store=None,
                  packdump=None, pack_targets=None, parent=None):
@@ -622,6 +540,7 @@ class StepPanel(QWidget):
         self._pack_targets = pack_targets
         self._step_id = None
         self._form = None
+        self._picker = None
         self._writing = False
 
         root = QVBoxLayout(self)
@@ -664,6 +583,68 @@ class StepPanel(QWidget):
     def step_id(self):
         return self._step_id
 
+    @property
+    def picking(self) -> bool:
+        return self._picker is not None
+
+    def show_picker(self, header, choices, *, empty=""):
+        """Turn the panel into a chooser.
+
+        Adding a step is the one thing here that still opened a modal, and it was the worst
+        candidate for one: a flat unfiltered list is unusable at a few hundred jobs, and the
+        dialog covered the very list you were adding to. The picker that already handles
+        14,000 registry ids does this properly — token matching, a windowful of rows at a
+        time — and it has an inline mode, so it can simply *be* the panel for a moment.
+
+        Nothing is created until something is chosen. A step that exists with no action yet
+        would be a broken step: flagged, and blocking the whole job on pre-flight, for as
+        long as it took you to get distracted.
+        """
+        self._clear_form()
+        self._clear_picker()
+        self._step_id = None
+        self._notice.hide()
+        self._relink.hide()
+        self._title.setText(f"<b>{header}</b>")
+        self._subtitle.setText("Type to narrow · Enter to add · Esc to cancel"
+                               if choices else empty)
+        self._subtitle.show()
+        if not choices:
+            return
+        self._picker = PickerPopup(choices, inline=self._host, placeholder="type to narrow")
+        self._picker.chosen.connect(self._on_picked)
+        self._picker.dismissed.connect(self._on_pick_cancelled)
+        self._host_layout.addWidget(self._picker)
+        self._picker.show()
+        self._picker.focus_filter()
+
+    def _clear_picker(self, *, cancelled=False):
+        """Drop the chooser, and **say so** when dropping it means the pick is off.
+
+        The panel and the tab were each tracking "are we picking" — the panel by holding a
+        picker, the tab by remembering which kind. Anything that reached `set_step` (a click
+        on a step, a click on empty space) cleared the picker without the tab hearing, and
+        the two then disagreed: no chooser on screen, but the tab still in picking mode with
+        its placeholder row stranded in the list. One owner announces the change instead.
+        """
+        had = self._picker is not None
+        if had:
+            self._picker.setParent(None)
+            self._picker.deleteLater()
+            self._picker = None
+        if had and cancelled:
+            self.pick_cancelled.emit()
+
+    def _on_picked(self, value):
+        # Cleared before the signal: the handler creates a step and asks this panel to show
+        # it, and the picker must be gone by then or it would sit above the new form.
+        self._clear_picker()
+        self.picked.emit(value)
+
+    def _on_pick_cancelled(self):
+        self._clear_picker()
+        self.pick_cancelled.emit()
+
     def set_packdump(self, packdump):
         """Adopt a new dump (design 3.1). The form is rebuilt rather than repointed: its
         registry pickers were populated FROM the old dump, so swapping the reference alone
@@ -680,6 +661,7 @@ class StepPanel(QWidget):
         the row, and the refresh reselects the step — so a rebuild-on-show would destroy
         the combo box you just used, mid-use, on every single change.
         """
+        self._clear_picker(cancelled=True)
         if (step is not None and self._form is not None
                 and step.id == self._step_id and step.is_action):
             self._notice.hide()
@@ -978,6 +960,10 @@ class JobEditorTab(QWidget):
                                 pack_targets=pack_targets)
         self._panel.changed.connect(self._on_panel_changed)
         self._panel.status.connect(self.status)
+        self._panel.picked.connect(self._on_picked)
+        self._panel.pick_cancelled.connect(self._end_pick)
+        self._picking = None        # "action" | "job" while the panel is a chooser
+        self._ghost = None
 
         # Scrolled, because an action with a dozen slots is taller than the tab — and the
         # whole point of docking this is that configuring a step never takes you out of
@@ -991,6 +977,8 @@ class JobEditorTab(QWidget):
                                f"border-left: 1px solid {style.BORDER}; }}")
 
         self._split = QSplitter(Qt.Horizontal)
+        self._split.setHandleWidth(style.SPLITTER_WIDTH)
+        self._split.setStyleSheet(style.SPLITTER_QSS)
         self._split.addWidget(left)
         self._split.addWidget(scroller)
         self._split.setStretchFactor(0, 3)
@@ -1100,9 +1088,15 @@ class JobEditorTab(QWidget):
                 item.setToolTip(1, chr(10).join(p.detail for p in found))
             self._tree.addTopLevelItem(item)
         self._loading = False
+        # A pick in flight owns the panel and the ghost row; a refresh arriving mid-pick
+        # (a run finishing, a tag renamed elsewhere) must not steal either.
+        if self._picking is not None:
+            self._show_ghost_row("Add an action step" if self._picking == "action"
+                                 else "Run another job as a step")
+            return
         # Clearing the tree dropped the selection, and the panel is driven by it — without
-        # this, any refresh (a run finishing, a tag being renamed elsewhere) would empty the
-        # panel out from under whatever step you were configuring.
+        # this, any refresh would empty the panel out from under whatever step you were
+        # configuring.
         if self._panel.step_id is not None:
             self._select_step(self._panel.step_id)
 
@@ -1199,27 +1193,99 @@ class JobEditorTab(QWidget):
         self._touched()
 
     def _add_action_step(self):
-        picker = ActionPickerDialog(self._packages, self)
-        if not picker.exec():
-            return
-        step = self._jobs.add_action_step(self._job_id, picker.result_ref)
-        self._touched()
-        # Select it, which puts it in the panel — an unbound required mapping can't run,
-        # so landing on its controls is the useful next thing.
-        self._select_step(step.id)
+        """Choose the action in the panel, then create the step.
+
+        Deliberately not the other way round. A step created first would have no action
+        yet, and a step with no action is a *broken* step — flagged, and blocking the whole
+        job at pre-flight — for as long as it takes to get distracted. Nothing is written
+        until something is chosen; Escape leaves the job exactly as it was.
+        """
+        choices = [Choice(label=(m.name or m.action_id), value=ref,
+                          detail=" · ".join(filter(None, (ref, m.description))))
+                   for ref, m in sorted(self._packages.actions.items())]
+        self._begin_pick("action", "Add an action step", choices,
+                         empty="No action packages are installed in this profile.")
 
     def _add_job_step(self):
         candidates = [j for j in self._jobs.all()
                       if j.id != self._job_id and not self._jobs._reaches(j.id, self._job_id)]
-        picker = JobPickerDialog(candidates, self)
-        if not picker.exec() or picker.result_job_id is None:
+        choices = [Choice(label=j.name, value=str(j.id),
+                          detail=f"{len(j.steps)} step{'s' if len(j.steps) != 1 else ''}")
+                   for j in candidates]
+        self._begin_pick("job", "Run another job as a step", choices,
+                         empty="No other job can be nested here without creating a cycle.")
+
+    def _begin_pick(self, kind, header, choices, *, empty):
+        # Mashing the button, or switching from +Action to +Job mid-pick, must REPLACE the
+        # placeholder rather than add another. Safe to remove directly: this runs from a
+        # button click, not from inside a tree signal.
+        self._drop_ghost()
+        self._picking = None
+        if not choices:
+            # Nothing to choose, so there is no pick to be in. Entering picking mode here
+            # would strand the placeholder for good: with no chooser on screen, the panel
+            # has nothing to clear and therefore never announces that the pick is off.
+            self._panel.show_picker(header, [], empty=empty)
+            self.refresh()
             return
-        try:
-            self._jobs.add_job_step(self._job_id, picker.result_job_id)
-        except ValueError as e:
-            QMessageBox.warning(self, "Can't nest that job", str(e))
+        self._picking = kind
+        self._show_ghost_row(header)
+        self._panel.show_picker(header, choices, empty=empty)
+
+    def _show_ghost_row(self, text):
+        """Where the new step will land, shown while you choose.
+
+        Purely visual — it carries no step and cannot be selected — because the alternative
+        (a real, action-less step row) is the broken state `_add_action_step` exists to
+        avoid. It is re-added by `refresh` so a reload mid-pick does not lose it.
+        """
+        # A plain ellipsis rather than a decorative glyph: the marker has to exist in the
+        # UI font, and a missing one renders as a tofu box on the row that is supposed to
+        # read as "not real yet".
+        ghost = QTreeWidgetItem([str(self._tree.topLevelItemCount() + 1),
+                                 f"{text.lower()}…", "", "", ""])
+        ghost.setFlags(Qt.ItemIsEnabled)
+        for col in range(self._tree.columnCount()):
+            ghost.setForeground(col, style.qt_colour(style.TEXT_FAINT))
+        self._tree.addTopLevelItem(ghost)
+        self._ghost = ghost
+
+    def _drop_ghost(self):
+        if self._ghost is None:
             return
+        index = self._tree.indexOfTopLevelItem(self._ghost)
+        if index >= 0:
+            self._tree.takeTopLevelItem(index)
+        self._ghost = None
+
+    def _end_pick(self):
+        """The pick is off — forget it and redraw, but **not from here**.
+
+        This is reached from `set_step`, which is reached from `currentItemChanged`. A
+        rebuild there destroys the very item Qt is still delivering for, which is the
+        use-after-free `_set_step_enabled` documents. Posted to the event loop instead.
+        """
+        self._picking = None
+        self._ghost = None
+        self._pending_select = self._panel.step_id
+        self._rebuild_timer.start(0)
+
+    def _on_picked(self, value):
+        kind, self._picking = self._picking, None
+        self._ghost = None
+        if kind == "action":
+            step = self._jobs.add_action_step(self._job_id, value)
+        else:
+            try:
+                step = self._jobs.add_job_step(self._job_id, int(value))
+            except (ValueError, TypeError) as e:
+                self.status.emit(str(e))
+                self._end_pick()
+                return
         self._touched()
+        # Select it, which puts it in the panel — an unbound required mapping can't run,
+        # so landing on its controls is the useful next thing.
+        self._select_step(step.id)
 
     def _on_selection_changed(self, current, _previous=None):
         """Selecting a step is what opens it — there is no separate edit gesture now."""
