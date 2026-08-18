@@ -28,6 +28,7 @@ from packsmith.core.capabilities import CapabilityError, PackTargets, resolve
 from packsmith.core.files import FileStore
 from packsmith.core.packages import ActionManifest, MappingSlot, _parse_mappings
 from packsmith.core.runner import run_action
+from packsmith.core.starlark_runtime import run_starlark
 from packsmith.integrations.paxi import PaxiProvider
 
 LOOT = "loot_tables/blocks/oak_leaves.json"
@@ -323,6 +324,79 @@ def test_an_action_can_ask_whether_a_capability_is_there(world, no_loader):
 
     assert run_with(files, targets, body).ok
     assert seen == {"yes": True, "no": False}
+
+
+# --- the same thing, through actual Starlark ----------------------------------------------------
+#
+# Everything above hands `run_action` a plain Python callable — §1.1's MVP language seam.
+# It is still real code, but it is no longer the path any action takes, and for nine
+# commits that difference hid the fact that `pack.datapacks` was absent from the Starlark
+# prelude entirely: the whole subsystem was built, wired into the GUI and covered by the
+# tests above, and unreachable from the only language that writes actions. A `def body(pack)`
+# that reads like Starlark is what made it invisible.
+#
+# `test_pack_surface.py` now pins the SHAPE — every member of `Pack` is reachable from
+# Starlark. These pin the BEHAVIOUR through the same boundary an author crosses.
+
+
+def starlark_body(source):
+    """The shape `PackageIndex.load_callable` produces: a closure the runner can call with
+    `pack`, whose body happens to be Starlark. Deliberately built the same way, so what is
+    exercised here is what production does."""
+    def invoke(pack):
+        return run_starlark(source, pack)
+    return invoke
+
+
+def test_a_starlark_action_writes_into_the_pack_the_user_bound(world):
+    """The flagship assertion of this file, through the boundary that matters.
+
+    Written with the `pack=` keyword on purpose: §3.3 and §7.3 both spell the call that
+    way, so the prelude's parameter has to be *named* `pack` for the documented form to
+    parse — even though it shadows the `pack` struct inside that function.
+    """
+    files, paxi, targets = world
+    src = f"""
+def run(pack):
+    pack.datapacks.resolve(
+        pack = pack.step.mappings["out"], namespace = "minecraft", path = "{LOOT}"
+    ).write('{{"pools": []}}')
+"""
+    result = run_with(files, targets, starlark_body(src), mappings={"out": "tweaks"})
+    assert result.ok, result.reason
+    landed = paxi.datapack_root(files.root) / "tweaks" / "data" / "minecraft" / LOOT
+    assert landed.read_text() == '{"pools": []}'
+
+
+def test_a_starlark_action_can_branch_on_a_capability(world):
+    """§7.6's capability-branching pattern. Without `pack.capabilities` in the prelude an
+    `optional = true` declaration was unusable — the action had no way to ask."""
+    files, _, targets = world
+    src = """
+def run(pack):
+    if pack.capabilities.has("datapacks.write"):
+        pack.log("info", "have it")
+    if not pack.capabilities.has("kubejs.script_write"):
+        pack.log("info", "skipping kubejs")
+    return True
+"""
+    result = run_with(files, targets, starlark_body(src))
+    assert result.ok, result.reason
+    assert [line for _level, line in result.log_lines] == ["have it", "skipping kubejs"]
+
+
+def test_the_missing_loader_message_survives_the_starlark_boundary(no_loader):
+    """The routing is done on the host so its refusals keep §8.1's wording. An author
+    reading a raw Starlark traceback would learn nothing about what to install."""
+    files, targets = no_loader
+    src = f"""
+def run(pack):
+    pack.datapacks.resolve(pack = "tweaks", namespace = "minecraft",
+                           path = "{LOOT}").write("{{}}")
+"""
+    result = run_with(files, targets, starlark_body(src))
+    assert not result.ok
+    assert "pack loader" in result.reason
 
 
 # --- the picker ---------------------------------------------------------------------------------

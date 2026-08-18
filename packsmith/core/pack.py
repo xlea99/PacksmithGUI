@@ -51,6 +51,7 @@ class _Registry:
         self._members = {}      # registry_type -> set of ids, built on first `has`
 
     def entries(self, registry_type):
+        """Every entry id in a registry, e.g. every `minecraft:item`. Layer 1, read-only."""
         return list(self._dump.registry.get(registry_type, {}).get("values", []))
 
     def has(self, registry_type, entry_id):
@@ -71,6 +72,9 @@ class _Registry:
         return entry_id in members
 
     def attribute(self, registry_type, entry_id, name):
+        """A packdump-provided attribute of one entry — `localization` (its display name)
+        or `localization_key` (the key a resource pack must write to rename it). None if
+        the dump has no such attribute. See design 3.1 for why the key is not derivable."""
         return self._dump.attribute(registry_type, entry_id, name)
 
 
@@ -141,12 +145,21 @@ class _Tags:
         return self._staging.query(registry_type, tag_name, value)
 
     def get(self, registry_type, entry_id, tag_name):
+        """This entry's value for a tag, or None if nothing is assigned. Staged-first, so
+        it reflects writes this step has already made."""
         return self._staging.read(registry_type, entry_id, tag_name)
 
     def ownership(self, registry_type, entry_id, tag_name):
+        """Who owns this assignment — `{"kind": "user"|"action", "action_ref": ...}` — or
+        None if the cell is pristine. Design 3.2.1: pristine is not the same as unset."""
         return self._staging.read_ownership(registry_type, entry_id, tag_name)
 
     def write(self, registry_type, entry_id, tag_name, value):
+        """Assign a tag value, claiming ownership of the cell for this action.
+
+        If someone else owns it, the mapping's declared conflict policy decides: overwrite
+        takes it, skip returns silently having done nothing, fail discards the step. With
+        no declared policy a contested write is refused (design 3.3 has no default)."""
         current = self._staging.read_ownership(registry_type, entry_id, tag_name)
         if not self._may_write(registry_type, entry_id, tag_name):
             return
@@ -190,6 +203,8 @@ class _Tags:
             f"'{tag_name}'. Declare one on the mapping that binds it.")
 
     def clear(self, registry_type, entry_id, tag_name):
+        """Return a cell this action owns to pristine. Refuses to delete another owner's
+        assignment — design 3.2.1 gives actions no way to destroy the user's decisions."""
         _refuse_foreign_delete(
             self._staging.read_ownership(registry_type, entry_id, tag_name),
             self._action_ref, cell=f"{tag_name} on {entry_id}", taken=self._taken)
@@ -227,6 +242,7 @@ class _Blueprints:
     # --- reads -------------------------------------------------------------
 
     def instances(self, blueprint):
+        """Every instance name of a blueprint, including ones created this step."""
         self._require_healthy(blueprint)
         return self._staging.instances(blueprint)
 
@@ -256,6 +272,7 @@ class _Blueprints:
         }
 
     def get(self, blueprint, instance, slot_path):
+        """What is bound at one slot of one instance, or None if the slot is empty."""
         self._require_healthy(blueprint)
         return self._staging.read(blueprint, instance, slot_path)
 
@@ -268,6 +285,8 @@ class _Blueprints:
                 if self._staging.read(blueprint, instance, path) is not None}
 
     def ownership(self, blueprint, instance, slot_path):
+        """Who owns one slot binding, or None if nothing is bound. Ownership on blueprint
+        data is per-(instance, slot), not per-instance (design 3.2.2)."""
         self._require_healthy(blueprint)
         return self._staging.read_ownership(blueprint, instance, slot_path)
 
@@ -279,6 +298,7 @@ class _Blueprints:
                 if self._staging.read(blueprint, instance, path) is None]
 
     def has(self, blueprint, instance) -> bool:
+        """Whether an instance exists yet — including one created earlier this step."""
         self._require_healthy(blueprint)
         return self._staging.instance_exists(blueprint, instance)
 
@@ -292,6 +312,10 @@ class _Blueprints:
         self._staging.create_instance(blueprint, instance, created_by=self._action_ref)
 
     def bind(self, blueprint, instance, slot_path, value):
+        """Bind a value into a slot, claiming ownership of that binding.
+
+        Conflicts resolve by the same declared policy `tags.write` uses, keyed per
+        blueprint. The instance must exist first — call `create` before binding."""
         self._require_healthy(blueprint)
         current = self._staging.read_ownership(blueprint, instance, slot_path)
         if not self._may_write(blueprint, instance, slot_path):
@@ -307,6 +331,7 @@ class _Blueprints:
                             owner="action", owner_action_ref=self._action_ref)
 
     def unbind(self, blueprint, instance, slot_path):
+        """Empty a slot this action owns. Refuses to unbind another owner's binding."""
         self._require_healthy(blueprint)
         _refuse_foreign_delete(
             self._staging.read_ownership(blueprint, instance, slot_path),
@@ -363,11 +388,30 @@ class _FileHandle:
         self._path = rel_path
         self._action_ref = action_ref
 
+    @property
+    def path(self):
+        """Where this handle writes, relative to the instance root.
+
+        Public because §7.3 has handles carrying their resolved path, and because it is
+        what a provider-routed resolver has to hand back: `pack.datapacks.resolve(...)`
+        does the loader routing on the host side, and the Starlark prelude rebuilds the
+        handle from the path it computed. Reading it tells an action where its output
+        landed; it grants no access the action didn't already have.
+        """
+        return self._path
+
     def write(self, content, *, file_must_exist=False):
+        """Write the whole file, claiming whole-file ownership for this action.
+
+        Creates it if missing; pass `file_must_exist=True` to fail instead when it is
+        gone. Staged — nothing reaches disk until the step completes. Writing over a
+        user-owned file is hard-blocked rather than resolved by policy (design 6.1)."""
         self._staging.write(self._path, content, owner="action",
                             owner_action_ref=self._action_ref, file_must_exist=file_must_exist)
 
     def read_all(self):
+        """The file's whole contents as text, or None if it does not exist. Staged-first,
+        so it reflects a write this step already made."""
         return self._staging.read(self._path)
 
     def read_json(self):
@@ -384,9 +428,12 @@ class _FileHandle:
                             owner_action_ref=self._action_ref, file_must_exist=file_must_exist)
 
     def exists(self):
+        """Whether the file is there — counting one this step has staged but not committed."""
         return self._staging.exists(self._path)
 
     def ownership(self):
+        """Who owns this file — `{"kind": "user"|"action", "action_ref": ...}` — or None if
+        Packsmith has never tracked it (design 6.1's untouched state)."""
         return self._staging.ownership(self._path)
 
 
@@ -399,6 +446,8 @@ class _Filesystem:
         self._action_ref = action_ref
 
     def resolve(self, path):
+        """A handle on one file, by path relative to the instance root. Escaping the root
+        is refused. The handle does the I/O — see its `read_all` / `write`."""
         if self._staging is None:
             raise RuntimeError("filesystem capability is not available for this step")
         return _FileHandle(self._staging, path, self._action_ref)
@@ -433,6 +482,11 @@ class _PackNamespace:
         return "datapack" if self._kind == "datapacks" else "resource pack"
 
     def resolve(self, pack, namespace, path):
+        """A handle on a file inside one of the user's packs, routed by the active loader.
+
+        `pack` is the pack's name, which comes from a `kind = "pack"` mapping the user
+        bound to this step — never a literal (design 3.3, principle 5). `namespace` and
+        `path` are Minecraft's own, e.g. "minecraft" and "recipes/stone.json"."""
         if self._staging is None:
             raise CapabilityError(
                 f"{self._kind} capability is not available for this step (no file store)")
@@ -464,6 +518,8 @@ class _Capabilities:
         self._table = table
 
     def has(self, name) -> bool:
+        """Whether a capability is provided in this profile, e.g. "datapacks.write".
+        For actions that declare a capability optional and branch on it (design 7.6)."""
         return bool(self._table is not None and self._table.satisfies(name))
 
     def version(self, name):
@@ -511,6 +567,13 @@ class Pack:
         self.step = _Step(mappings, config)
 
     def log(self, level, message):
+        """Say something in the run log — `level` is "debug", "info", "warning" or "error".
+
+        The only output channel an action has (design 3.3: all action output flows through
+        structured logging, there is no return value). `print(...)` is redirected here too.
+        Lines survive a failed step, so logging before `fail()` is how an author explains
+        one.
+        """
         self._log.append((level, message))
 
     def fail(self, reason):

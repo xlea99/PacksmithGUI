@@ -34,11 +34,13 @@ _HTML_PATH = Path(__file__).with_name("monaco_host.html")
 #
 # It has no TOML grammar either, and unlike Starlark there's no exact stand-in. `ini` is
 # the closest thing Monaco ships: `[sections]`, `key = value`, `#` comments — TOML's basic
-# shape, and all manifest.toml actually uses. Naming a language Monaco doesn't have is not
-# an error, it just silently renders as plaintext, which is how this went unnoticed.
+# shape, which is what mod configs are. Naming a language Monaco doesn't have is not an
+# error, it just silently renders as plaintext, which is how this went unnoticed.
+# Manifests are `.json5`, which Monaco has no support for at all — the host page
+# registers a `json5` language of its own. See monaco_host.html.
 _EXT_TO_LANGUAGE = {
     ".star": "python", ".py": "python", ".js": "javascript", ".ts": "typescript",
-    ".json": "json", ".json5": "json", ".mcmeta": "json", ".toml": "ini",
+    ".json": "json", ".json5": "json5", ".mcmeta": "json", ".toml": "ini",
     ".yaml": "yaml", ".yml": "yaml", ".xml": "xml", ".html": "html", ".css": "css",
     ".md": "markdown", ".txt": "plaintext", ".cfg": "ini", ".ini": "ini",
     ".properties": "ini", ".lang": "ini", ".snbt": "plaintext", ".mcfunction": "plaintext",
@@ -136,6 +138,20 @@ class EditorHost(QObject):
         for code in self._pending:
             self.view.page().runJavaScript(code)
         self._pending.clear()
+        self._send_starlark_api()
+
+    def _send_starlark_api(self):
+        """Hand the page the `pack` surface for `.star` completions (design 6.3).
+
+        Sent once, because the surface is the same in every profile — it is introspected
+        from `Pack`, not from the user's data, so there is nothing to refresh on a profile
+        switch or a packdump import. Anything profile-specific (registry ids, the user's
+        tag names) would need a request/response channel this bridge does not have; see
+        `gui/editor/starlark_api.py` for what is deliberately out of scope.
+        """
+        import json
+        from packsmith.gui.editor.starlark_api import catalog
+        self._js(f"setStarlarkApi({json.dumps(catalog())})")
 
     @staticmethod
     def _quote(text) -> str:

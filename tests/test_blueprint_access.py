@@ -411,11 +411,17 @@ def test_a_manifest_can_declare_a_blueprint_mapping(tmp_path, blueprints):
 
     root = tmp_path / "palette"
     root.mkdir()
-    (root / "manifest.toml").write_text(
-        '[package]\nname = "palette"\n\n'
-        '[[actions]]\nid = "autofill"\nfile = "a.star"\nfunction = "run"\n\n'
-        '[actions.mappings.palette]\nkind = "blueprint"\n'
-        'description = "the schema to fill"\n', encoding="utf-8")
+    (root / "manifest.json5").write_text('''{
+      "package": { "name": "palette" },
+      "actions": [
+        {
+          "id": "autofill", "file": "a.star", "function": "run",
+          "mappings": {
+            "palette": { "kind": "blueprint", "description": "the schema to fill" },
+          },
+        },
+      ],
+    }''', encoding="utf-8")
     manifest = load_package(root).actions[0]
     assert manifest.mappings["palette"].kind == "blueprint"
 
@@ -442,10 +448,10 @@ def test_an_unknown_mapping_kind_is_rejected_at_load(tmp_path):
     from packsmith.core.packages import load_package
     root = tmp_path / "bad"
     root.mkdir()
-    (root / "manifest.toml").write_text(
-        '[package]\nname = "bad"\n\n'
-        '[[actions]]\nid = "a"\nfile = "a.star"\nfunction = "run"\n\n'
-        '[actions.mappings.thing]\nkind = "vibes"\n', encoding="utf-8")
+    (root / "manifest.json5").write_text(
+        '{"package": {"name": "bad"},'
+        ' "actions": [{"id": "a", "file": "a.star", "function": "run",'
+        ' "mappings": {"thing": {"kind": "vibes"}}}]}', encoding="utf-8")
     with pytest.raises(ValueError, match="unknown kind 'vibes'"):
         load_package(root)
 

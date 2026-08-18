@@ -5,7 +5,7 @@ Three rows, top to bottom, modelled on IntelliJ's tool-window strip:
     ┌───────────────────────────────┐
     │  content        (only when expanded)
     ├───────────────────────────────┤
-    │  Logs  Job Results  Errors …  │  the tab strip — always visible
+    │  Logs  Job Runs  Errors …     │  the tab strip — always visible
     ├───────────────────────────────┤
     │  1,983 items in minecraft:item│  the true status bar — always visible
     └───────────────────────────────┘
@@ -36,7 +36,10 @@ from packsmith.gui.shell import style
 # §4.1's bottom tabs, with the blurbs that describe what each becomes.
 BOTTOM_TABS = [
     ("logs", "Logs", None),
-    ("job_results", "Job Results",
+    # Key kept as "job_results" though the label changed: it is persisted in
+    # state.json as the remembered bottom tab, and a renamed key would quietly
+    # forget which tab every existing profile had open.
+    ("job_results", "Job Runs",
      "Per-run summary — files modified, skipped, and why. Expandable to per-file diffs; "
      "where the file versioning system surfaces."),
     ("errors", "Errors",
@@ -115,7 +118,7 @@ class BottomPanel(QWidget):
         self._log_view.setReadOnly(True)
         self._log_view.setStyleSheet(
             f"background: {style.BG_DEEP}; color: {style.TEXT_MUTED};"
-            f" border: none; font-family: Consolas, monospace; font-size: 11px;")
+            f" border: none; font-family: {style.MONO_FAMILY}; font-size: 11px;")
 
         self._tab_index = {}
         self._panels = {}

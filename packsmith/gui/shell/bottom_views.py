@@ -1,10 +1,13 @@
 """Live content for the bottom panel (design 4.1).
 
-Two of §4.1's bottom tabs can be genuinely real on machinery we already have: **Job
-Results** reads the ``step_runs`` history the runner records, and **Errors** reports
+**Job Runs** reads the ``step_runs`` history the runner records, and **Errors** reports
 orphaned tags (assignments pointing at entries the current packdump no longer has).
-Both stay read-only summaries — the deeper surfaces (per-file diffs, click-to-jump,
-rollback buttons) are later slices.
+
+Both are deliberately shallow, and Job Runs is shallow on purpose *again*: it was written
+before the Run Report tab existed and had grown into a second, worse account of a run.
+§4.1's ruling for the packdump strip settles it for this one too — a strip a few rows tall
+says THAT something happened; reading WHAT belongs in a tab. Errors is the exception that
+proves the shape, because its rows are *resolved in place* rather than read (§4.1).
 """
 import json
 
@@ -63,9 +66,19 @@ _BAD_STATUSES = {"failed", "partial"}
 _ROLE_JOB_RUN = Qt.UserRole + 1     # job_runs id, on a run's top-level row
 
 
-class JobResultsView(_SummaryView):
-    """Per-run summary (design 4.1). Job runs are top-level with their steps nested
-    beneath; a standalone action run (no job) appears on its own."""
+class JobRunsView(_SummaryView):
+    """That a run happened, and how it went (design 4.1).
+
+    **Deliberately not comprehensive.** This was built before the Run Report tab existed,
+    when it was the only place a run described itself, so it grew failure reasons wrapped
+    across child rows and auto-expanding failures. The report tab now holds all of that —
+    with the change list on screen — and §4.1's own ruling applies: *a strip a few rows tall
+    is a place to learn THAT something changed, not to read WHAT.* Two surfaces competing to
+    be comprehensive means one of them is always the worse copy.
+
+    So: the run, its steps, how each went, how much each changed, when. A failure shows a
+    sliver of its reason and nothing more, because the row itself opens the report.
+    """
 
     rolled_back = Signal()
     report_requested = Signal(int)      # job_runs id
@@ -79,11 +92,33 @@ class JobResultsView(_SummaryView):
         self._tags = tag_store
         self._files = file_store
         self._blueprints = blueprint_store
+        # run id -> expanded, for this session only. A rebuild clears the tree, so without
+        # this every refresh — and a refresh happens on every run — would reset whatever
+        # the user had opened. Not persisted: which runs you had expanded is a fact about
+        # what you were looking at ten minutes ago, not about the profile.
+        self._expanded = {}
+        self._rebuilding = False
         self._tree.setRootIsDecorated(True)
         self._tree.setContextMenuPolicy(Qt.CustomContextMenu)
         self._tree.customContextMenuRequested.connect(self._on_context_menu)
         self._tree.itemDoubleClicked.connect(self._on_activated)
+        self._tree.itemExpanded.connect(self._remember_expansion)
+        self._tree.itemCollapsed.connect(self._remember_expansion)
         self.refresh()
+
+    def _remember_expansion(self, item):
+        """Record what the user opened — and only what the USER opened.
+
+        Qt fires these for a programmatic `setExpanded` too, so a refresh restoring state
+        would otherwise re-record what it just applied. Harmless here, but it would also
+        record the *default* for a run the user has never touched, which is how a default
+        stops being changeable later.
+        """
+        if self._rebuilding:
+            return
+        run_id = item.data(0, _ROLE_JOB_RUN)
+        if run_id is not None:
+            self._expanded[int(run_id)] = item.isExpanded()
 
     def _on_activated(self, item, _column=0):
         run_id = item.data(0, _ROLE_JOB_RUN)
@@ -138,6 +173,13 @@ class JobResultsView(_SummaryView):
         self.rolled_back.emit()
 
     def refresh(self):
+        self._rebuilding = True
+        try:
+            self._rebuild()
+        finally:
+            self._rebuilding = False
+
+    def _rebuild(self):
         self._tree.clear()
         steps = self._history.list()
         job_runs = self._job_history.list() if self._job_history is not None else []
@@ -152,11 +194,9 @@ class JobResultsView(_SummaryView):
         for run in job_runs:
             children = sorted(by_run.pop(run["id"], []),
                               key=lambda s: s.get("position_in_run") or 0)
-            changed = ", ".join(filter(None, (_describe_changes(c.get("rollback_data"))
-                                              for c in children if c.get("rollback_data"))))
             item = QTreeWidgetItem([
                 run["job_name"], run["status"],
-                f"{len(children)} step(s)" if children else "—",
+                _change_counts(c.get("rollback_data") for c in children),
                 (run.get("finished_at") or "")[:19].replace("T", " "),
             ])
             # The way through to the full report. This strip is where you learn THAT a run
@@ -164,11 +204,14 @@ class JobResultsView(_SummaryView):
             item.setData(0, _ROLE_JOB_RUN, run["id"])
             item.setToolTip(0, f"{run['job_name']} — double-click to open the report")
             if run["status"] in _BAD_STATUSES:
-                item.setForeground(1, Qt.red)
+                item.setForeground(1, QColor(style.ERROR))
             for child in children:
-                self._tree_add_step(item, child)
+                item.addChild(self._step_item(child))
             self._tree.addTopLevelItem(item)
-            item.setExpanded(run["status"] in _BAD_STATUSES)
+            # Collapsed unless the user opened this run before. A new run arriving expanded
+            # pushes everything below it down the moment you press play — and since a
+            # refresh happens on every run, it did that to *every* run at once.
+            item.setExpanded(self._expanded.get(run["id"], False))
 
         # Standalone action runs (job_run_id is NULL) — still first-class history.
         for step in by_run.get(None, []):
@@ -176,50 +219,34 @@ class JobResultsView(_SummaryView):
 
         for col in range(self._tree.columnCount()):
             self._tree.resizeColumnToContents(col)
-        self._expand_failures(self._tree.invisibleRootItem())
         self._show_empty(False)
-
-    def _tree_add_step(self, parent, step):
-        parent.addChild(self._step_item(step))
 
     @staticmethod
     def _step_item(step) -> QTreeWidgetItem:
+        """One step, as a leaf.
+
+        It used to carry its failure reason as wrapped child rows that auto-expanded. That
+        was right when this was the only account of a run and wrong now: the reason is in
+        the report, in full, next to what the step managed to change before it stopped.
+        Here it is a sliver — enough to recognise which failure this is without reading it.
+        """
         status = step.get("status") or ""
+        reason = step.get("reason")
+        failed = status not in ("success", "rolled_back")
         item = QTreeWidgetItem([
             step.get("action_ref") or "",
-            status,
-            "—" if status == "rolled_back" else _describe_changes(step.get("rollback_data")),
+            f"{status} — {_error_sliver(reason)}" if failed and reason else status,
+            "—" if status == "rolled_back" else _change_counts([step.get("rollback_data")]),
             (step.get("finished_at") or "")[:19].replace("T", " "),
         ])
-        if status not in ("success", "rolled_back"):
+        if failed:
             item.setForeground(1, QColor(style.ERROR))
         elif status == "rolled_back":
             item.setForeground(1, Qt.gray)
         item.setData(0, Qt.UserRole, step)
-        item.setToolTip(0, step.get("reason") or "Right-click to roll this step back")
-
-        # Why it failed belongs ON SCREEN, not in a tooltip nobody thinks to hover.
-        # Nested one level under the step, in red, wrapped across rows if it's long —
-        # and the step auto-expands (see _expand_failures) so it's visible immediately.
-        if status not in ("success", "rolled_back") and step.get("reason"):
-            for line in _reason_lines(step["reason"]):
-                detail = QTreeWidgetItem([line])
-                detail.setForeground(0, QColor(style.ERROR))
-                detail.setToolTip(0, step["reason"])
-                item.addChild(detail)
+        item.setToolTip(1, reason or "")
+        item.setToolTip(0, "Double-click the run above to open its report")
         return item
-
-    def _expand_failures(self, item):
-        """Open failed steps so their reason is on screen without a click, and let the
-        reason lines span the full width instead of being clipped by the Run column."""
-        for i in range(item.childCount()):
-            child = item.child(i)
-            step = child.data(0, Qt.UserRole)
-            if step is None:                       # a reason line
-                child.setFirstColumnSpanned(True)
-            elif step.get("status") not in ("success", "rolled_back"):
-                child.setExpanded(True)
-            self._expand_failures(child)
 
 
 class ErrorsView(_SummaryView):
@@ -573,26 +600,6 @@ class ErrorsView(_SummaryView):
         self.resolved.emit()
 
 
-_REASON_WRAP = 96
-
-
-def _reason_lines(reason) -> list[str]:
-    """Break a failure reason into displayable rows: honour its own line breaks, and wrap
-    anything longer than the panel comfortably shows rather than clipping it."""
-    lines = []
-    for raw in str(reason).splitlines():
-        line = raw.strip()
-        while len(line) > _REASON_WRAP:
-            cut = line.rfind(" ", 0, _REASON_WRAP)
-            if cut <= 0:
-                cut = _REASON_WRAP
-            lines.append(line[:cut].rstrip())
-            line = line[cut:].lstrip()
-        if line:
-            lines.append(line)
-    return lines or [str(reason)]
-
-
 def _has_rollback(step) -> bool:
     """Does this run have anything recorded to undo?"""
     if step.get("status") == "rolled_back":
@@ -604,25 +611,59 @@ def _has_rollback(step) -> bool:
     return any(data.get(key) for key in ("l2", "files", "blueprints"))
 
 
-def _describe_changes(rollback_json) -> str:
-    """Summarize what a run touched, from the inverse data it recorded."""
-    if not rollback_json:
+# The order counts are read in, which is not alphabetical: what came into existence, what
+# moved, what left. `unchanged` is absent on purpose — §3.3 keeps it in the record and out
+# of the headline, because "the action asserted a cell that was already correct" is not a
+# change and would inflate every re-run.
+_KIND_ORDER = ("added", "created", "changed", "claimed", "removed")
+
+
+def _change_counts(rollback_jsons) -> str:
+    """How much a step or a run changed, by kind — a number, never a list.
+
+    Reading *what* changed is the report tab's job (§4.1). This answers the only question
+    a strip can usefully answer: is this a run that did nothing, a handful of things, or
+    twelve thousand things?
+
+    Counted by KIND rather than by engine ("3 tag cells, 1 file") because the kinds are what
+    tell you the shape of the edit — a re-run that reports `claimed` where you expected
+    `added` has taken cells off you, and that is worth seeing before you open anything.
+    """
+    counts = {}
+    for raw in rollback_jsons:
+        if not raw:
+            continue
+        try:
+            data = json.loads(raw)
+        except (TypeError, ValueError):
+            continue
+        for change in data.get("changes") or []:
+            kind = change.get("kind")
+            if kind and kind != "unchanged":
+                counts[kind] = counts.get(kind, 0) + 1
+    if not counts:
         return "—"
-    try:
-        data = json.loads(rollback_json)
-    except (TypeError, ValueError):
-        return "—"
-    parts = []
-    cells = len(data.get("l2", []) or [])
-    files = len(data.get("files", {}) or {})
-    bindings = len(data.get("blueprints", []) or [])
-    if cells:
-        parts.append(f"{cells} tag cell{'s' if cells != 1 else ''}")
-    if bindings:
-        parts.append(f"{bindings} blueprint write{'s' if bindings != 1 else ''}")
-    if files:
-        parts.append(f"{files} file{'s' if files != 1 else ''}")
-    return ", ".join(parts) if parts else "no changes"
+    ordered = [k for k in _KIND_ORDER if k in counts] + \
+              [k for k in sorted(counts) if k not in _KIND_ORDER]
+    return ", ".join(f"{counts[kind]:,} {kind}" for kind in ordered)
+
+
+def _error_sliver(reason, limit: int = 64) -> str:
+    """Just enough of a failure to recognise which one it is.
+
+    Prefers a line *starting* with `error:` — Starlark's own convention for the line that
+    says what actually broke — over the first line, because a Starlark failure arrives as a
+    traceback headed *"StarlarkActionError: Traceback (most recent call last):"*, which is
+    true of every failure and therefore tells them apart not at all.
+
+    Matched on the prefix rather than anywhere in the line, because that header contains
+    the substring `Error:` itself and a looser test picks the very line it exists to skip.
+    """
+    lines = [line.strip() for line in str(reason or "").splitlines() if line.strip()]
+    if not lines:
+        return ""
+    pick = next((line for line in lines if line.lower().startswith("error:")), lines[0])
+    return pick if len(pick) <= limit else pick[:limit - 1].rstrip() + "…"
 
 
 class PackdumpView(_SummaryView):

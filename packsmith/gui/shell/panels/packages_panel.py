@@ -176,8 +176,8 @@ class PackagesPanel(Panel):
         actions_root.setTextAlignment(1, Qt.AlignRight | Qt.AlignVCenter)
         actions_root.setIcon(0, icons.ui_icon("action", colour=style.TEXT_MUTED))
         actions_root.setData(0, _ROLE_KIND, "actions")
-        actions_root.setToolTip(0, "Declared in manifest.toml — an id bound to a file and "
-                                   "a function. One file can hold several.")
+        actions_root.setToolTip(0, f"Declared in {MANIFEST_NAME} — an id bound to a file "
+                                   f"and a function. One file can hold several.")
         self._tree.addTopLevelItem(actions_root)
         self._build_actions(actions_root, package)
 
@@ -366,7 +366,7 @@ class PackagesPanel(Panel):
                 menu.addAction("New Action…",
                                lambda: self.new_action_requested.emit(package))
                 menu.addSeparator()
-            menu.addAction("Open manifest.toml",
+            menu.addAction(f"Open {MANIFEST_NAME}",
                            lambda: self.document_activated.emit(
                                f"{package}/{MANIFEST_NAME}"))
             return menu

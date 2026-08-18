@@ -74,7 +74,7 @@ from packsmith.gui.shell.sidebar import Sidebar, PanelStack
 from packsmith.gui.shell.workspace import Workspace
 from packsmith.gui.shell.bottom_panel import BottomPanel
 from packsmith.gui.shell.bottom_views import (
-    PackdumpView, JobResultsView, ErrorsView, _has_rollback)
+    PackdumpView, JobRunsView, ErrorsView, _has_rollback)
 from packsmith.gui.shell.panels import PANEL_SPECS
 from packsmith.gui.shell.panels.base import StubPanel
 from packsmith.gui.shell.panels.registry_panel import RegistryPanel
@@ -156,9 +156,20 @@ class MainWindow(QMainWindow):
         # be lost for good: `check_packdump` compares the instance against what is already
         # on disk, so it would answer "unchanged" from then on.
         self._rebuild_pending = False
+        # Set while tabs are being torn down or put back by Packsmith rather than by the
+        # user. Without it, `_close_all_tabs` on a profile switch would record an empty
+        # workspace over the one we are about to restore.
+        self._tab_memory_frozen = False
+        # Coalesced for the same reason the layout writes are: opening a tab fires an
+        # activation before `_open_tabs` has the new key, and closing several fires several.
+        self._tab_memory_timer = QTimer(self)
+        self._tab_memory_timer.setSingleShot(True)
+        self._tab_memory_timer.setInterval(250)
+        self._tab_memory_timer.timeout.connect(self._remember_open_tabs)
 
         self._build_menu_bar()
         self._enter_profile(profile_name or self._default_profile())
+        self._restore_open_tabs()
 
     # --- services ----------------------------------------------------------
 
@@ -451,6 +462,10 @@ class MainWindow(QMainWindow):
         self._workspace = Workspace()
         self._workspace.tab_closed.connect(self._on_tab_closed)
         self._workspace.tab_activated.connect(self._on_tab_activated)
+        # Opening a tab selects it, so activation covers opens and switches between them;
+        # tab_closed covers the rest. Both go through the debounce rather than writing.
+        self._workspace.tab_closed.connect(lambda *_: self._tab_memory_timer.start())
+        self._workspace.tab_activated.connect(lambda *_: self._tab_memory_timer.start())
         self._workspace.close_guard = self._may_close_tab
 
         # One Monaco for every editor tab (design 4.2 — measured: per-tab views cost a
@@ -480,7 +495,7 @@ class MainWindow(QMainWindow):
             self._editor_host.rebind(sources)
 
         self._bottom = BottomPanel()
-        results = JobResultsView(self._history, self._job_history,
+        results = JobRunsView(self._history, self._job_history,
                                  tag_store=self._tags, file_store=self._file_store,
                                  blueprint_store=self._blueprints)
         results.rolled_back.connect(self._on_rolled_back)
@@ -905,24 +920,40 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Couldn't open profile",
                                  f"{name}\n\n{e}\n\nStaying where we were.")
             self._enter_profile(self._profile.name)
+            self._restore_open_tabs()
             return
+        self._restore_open_tabs()
         self.setWindowTitle(f"Packsmith — {name}")
 
     def _close_all_tabs(self) -> bool:
         """Close every open tab, honouring the unsaved-changes guard. False if cancelled.
+
+        Freezes the open-tab memory for the duration. Every caller is a profile switch or a
+        rebuild that puts the tabs straight back, so the empty workspace this leaves behind
+        is a step in the middle of something — persisting it would lose the session it is
+        halfway through restoring.
 
         The blocked shell never builds a workspace, so "close everything" is vacuously
         done — this is reached by the profile switch that is the way OUT of that state.
         """
         if getattr(self, "_workspace", None) is None:
             return True
-        tabs = self._workspace._tabs
-        while tabs.count():
-            before = tabs.count()
-            self._workspace._close_tab(0)
-            if tabs.count() == before:
-                return False
-        return True
+        self._tab_memory_frozen = True
+        try:
+            tabs = self._workspace._tabs
+            while tabs.count():
+                before = tabs.count()
+                self._workspace._close_tab(0)
+                if tabs.count() == before:
+                    return False
+            return True
+        finally:
+            # Thawed here rather than after the restore, because the debounce means the
+            # pending write fires later anyway — and leaving it frozen on the cancel path
+            # (a dirty buffer refused) would stop the memory updating for the rest of the
+            # session, from a branch that changed nothing.
+            self._tab_memory_frozen = False
+            self._tab_memory_timer.stop()
 
     def _open_profile(self):
         dialog = OpenProfileDialog(
@@ -1312,6 +1343,67 @@ class MainWindow(QMainWindow):
         self._enter_profile(self._profile.name)
         self._reopen_tabs(reopen)
 
+    # Tab kinds that can be put back from nothing but their key, and are worth putting
+    # back. `_reopen_tabs` handles each; `test_open_tabs` asserts the two lists agree, so a
+    # kind cannot be persisted that nothing knows how to reopen.
+    #
+    # Three kinds are deliberately absent, all for the same reason — they describe a
+    # *moment* rather than a document, and restoring one a week later would be presenting
+    # an answer to a question nobody asked:
+    #   `packdump-diff` — what one import changed
+    #   `report`        — one run, and a dry run has no id to find it by
+    #   `diff`          — a file as it was during a particular run
+    RESTORABLE_TABS = ("doc", "browse", "tag", "view", "blueprint", "job", "action",
+                       "encyclopedia")
+
+    def _remember_open_tabs(self):
+        """Record what is open, per profile, in the order the tabs are actually in.
+
+        Order comes from the workspace rather than from `_open_tabs`, because tabs are
+        movable — the dict is in the order things were *opened*, which stops being the
+        order they are *in* the first time anyone drags one.
+        """
+        if self._tab_memory_frozen or self._blocked or self._profile is None:
+            return
+        if getattr(self, "_workspace", None) is None:
+            return                      # blocked shell, or teardown — nothing to record
+        by_widget = {widget: key for key, widget in self._open_tabs.items()}
+        keys, active = [], None
+        current = self._workspace.current_widget()
+        for widget in self._workspace.widgets():
+            key = by_widget.get(widget)
+            if key is None or key[0] not in self.RESTORABLE_TABS:
+                continue
+            keys.append(list(key))
+            if widget is current:
+                active = len(keys) - 1
+        save_ui_state(self._profile.name, open_tabs=keys, active_tab=active)
+
+    def _restore_open_tabs(self):
+        """Put back what was open last time this profile was.
+
+        Frozen while it runs: reopening fires the same signals a user opening a tab does,
+        and a half-restored list written back over the stored one would erase whatever
+        could not be reopened *yet* — a view that a rebuild is about to recreate, say.
+        """
+        if self._blocked or self._profile is None:
+            return                      # no workspace to put anything back into
+        state = load_ui_state(self._profile.name)
+        keys = state.get("open_tabs") or []
+        if not keys:
+            return
+        self._tab_memory_frozen = True
+        try:
+            # JSON has no tuples, so what comes back is a list of lists.
+            self._reopen_tabs([tuple(key) for key in keys if key])
+            active = state.get("active_tab")
+            if isinstance(active, int) and 0 <= active < len(keys):
+                widget = self._open_tabs.get(tuple(keys[active]))
+                if widget is not None:
+                    self._workspace.focus_widget(widget)
+        finally:
+            self._tab_memory_frozen = False
+
     def _reopen_tabs(self, keys):
         """Put back the tabs a rebuild closed, in the order they were in.
 
@@ -1352,6 +1444,11 @@ class MainWindow(QMainWindow):
                     job = self._jobs.get(key[1])
                     if job is not None:
                         self._open_job_editor(job)
+                elif kind == "action":
+                    if key[1] in self._packages.actions:
+                        self._open_action(key[1])
+                elif kind == "encyclopedia":
+                    self._open_encyclopedia()
             except Exception:
                 log.info("Could not reopen %s after the packdump changed", key, exc_info=True)
 
@@ -2414,6 +2511,38 @@ class MainWindow(QMainWindow):
         self._refresh_tab_icons()
         if source == "instance":
             self._files_panel.refresh()      # the save may have claimed ownership
+        elif source == "package":
+            self._reload_edited_package(path)
+
+    def _reload_edited_package(self, path):
+        """A hand-edited manifest has to take effect now, not on the next launch.
+
+        Half a package already hot-reloads and half did not, which is what made this
+        baffling rather than merely annoying: `load_callable` deliberately re-reads an
+        action's *source* on every run, so editing a `.star` file applies immediately — but
+        manifests are parsed once, at scan. So changing an action's `function` from `run` to
+        `helper` in `manifest.json5` kept invoking `run`, and kept reporting that `run` does
+        not exist, until a restart.
+
+        Reloading on any package save rather than only on `manifest.json5` is deliberate: a
+        package is a directory whose meaning lives in one file (3.3.1's two layers), and a
+        rule of "this file is special" is the kind a user has to be told. The scan is a few
+        JSON5 files.
+        """
+        self._packages.reload()
+        self._actions_panel.refresh()
+        self._packages_panel.reload()
+        broken = self._packages.errors
+        if not broken:
+            return
+        # Loud, and now, because the consequence is that those actions have stopped being
+        # declared — the Actions panel just lost them. The same argument §6.1 makes for
+        # locking rather than warning: put cause and effect in the same moment, or the user
+        # meets the effect days later with no way back to the cause.
+        QMessageBox.warning(
+            self, "Package not loaded",
+            "This package declares no actions until its manifest parses:\n\n"
+            + "\n\n".join(f"{name}: {reason}" for name, reason in sorted(broken.items())))
 
     def _may_close_tab(self, widget) -> bool:
         """Veto closing a tab with unsaved changes unless the user insists."""

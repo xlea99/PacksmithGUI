@@ -25,43 +25,34 @@ from packsmith.core.tags import TagStore
 REG = "minecraft:item"
 
 MANIFEST = """
-[package]
-name = "chain"
-
-[[actions]]
-id = "mark"
-file = "chain.star"
-function = "mark"
-
-[actions.mappings.flag]
-kind = "tag"
-tag_type = "bool"
-registry_type = "minecraft:item"
-access = "read_write"
-conflict_policy = "overwrite"
-
-[[actions]]
-id = "harvest"
-file = "chain.star"
-function = "harvest"
-
-[actions.mappings.flag]
-kind = "tag"
-tag_type = "bool"
-registry_type = "minecraft:item"
-access = "read"
-
-[actions.mappings.note]
-kind = "tag"
-tag_type = "string"
-registry_type = "minecraft:item"
-access = "write"
-conflict_policy = "overwrite"
-
-[[actions]]
-id = "explode"
-file = "chain.star"
-function = "explode"
+{
+  "package": { "name": "chain" },
+  "actions": [
+    {
+      "id": "mark", "file": "chain.star", "function": "mark",
+      "mappings": {
+        "flag": {
+          "kind": "tag", "tag_type": "bool", "registry_type": "minecraft:item",
+          "access": "read_write", "conflict_policy": "overwrite",
+        },
+      },
+    },
+    {
+      "id": "harvest", "file": "chain.star", "function": "harvest",
+      "mappings": {
+        "flag": {
+          "kind": "tag", "tag_type": "bool", "registry_type": "minecraft:item",
+          "access": "read",
+        },
+        "note": {
+          "kind": "tag", "tag_type": "string", "registry_type": "minecraft:item",
+          "access": "write", "conflict_policy": "overwrite",
+        },
+      },
+    },
+    { "id": "explode", "file": "chain.star", "function": "explode" },
+  ],
+}
 """
 
 SOURCE = '''
@@ -93,7 +84,7 @@ class Dump:
 def packages(tmp_path):
     root = tmp_path / "packages" / "chain"
     root.mkdir(parents=True)
-    (root / "manifest.toml").write_text(MANIFEST, encoding="utf-8")
+    (root / "manifest.json5").write_text(MANIFEST, encoding="utf-8")
     (root / "chain.star").write_text(SOURCE, encoding="utf-8")
     return PackageIndex(tmp_path / "packages")
 

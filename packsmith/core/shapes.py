@@ -16,7 +16,7 @@ declared; extra slots and extra groups are fine and invisible to it. This is the
 must never invalidate an action that doesn't care about it. An `exact` variant would only
 make sense for an action that exhaustively walks every slot, and nothing does.
 
-The shape is declared as nested TOML tables and parsed here into a **flat, ordered tuple of
+The shape is declared as nested JSON5 objects and parsed here into a **flat, ordered tuple of
 requirements keyed by dotted path** — the same addressing blueprint slots already use. Flat
 is what makes a mismatch reportable as a sentence about one slot ("'polished.stairs' takes
 minecraft:item, but the action needs minecraft:block") rather than a diff of two trees.

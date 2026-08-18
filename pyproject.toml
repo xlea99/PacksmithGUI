@@ -32,4 +32,8 @@ include = ["packsmith*"]
 [tool.setuptools.package-data]
 # Monaco is VENDORED, not CDN-loaded (design 6.3) — the editor has to work offline, so the
 # whole of it ships inside the package and must survive both an install and a freeze.
-"packsmith.gui.editor" = ["*.html", "monaco/**/*", "vendor/**/*"]
+#
+# `*.js` covers the editor's own scripts (starlark_lang.js), which are NOT under vendor/.
+# A missing one fails in the quietest possible way: the page loads, Monaco works, and the
+# feature that script provided is simply absent with no error anyone sees.
+"packsmith.gui.editor" = ["*.html", "*.js", "monaco/**/*", "vendor/**/*"]

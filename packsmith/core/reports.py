@@ -22,6 +22,11 @@ class StepReport:
     status: str
     reason: str = None
     changes: list = field(default_factory=list)
+    # Everything the action said, as ``[(level, message), ...]``. Persisted per step in
+    # `step_runs.log_output`, so a report read back out of history has it too — which is
+    # what makes the log worth putting in the report rather than only streaming it to the
+    # Logs strip, where it is gone the moment anything else is logged.
+    log: list = field(default_factory=list)
     run_id: int = None                  # step_runs id — None for a dry run
     can_roll_back: bool = False
 
@@ -61,6 +66,15 @@ class RunReport:
                 counts[change["engine"]] = counts.get(change["engine"], 0) + 1
         return counts
 
+    def log_lines(self) -> list:
+        """The whole run's log, in step order, as ``[(level, message), ...]``.
+
+        Flattened rather than kept per step because that is how it is read — a run reads as
+        one narrative, and the step boundaries are already visible in the Steps table above
+        it. Steps that said nothing contribute nothing.
+        """
+        return [line for step in self.steps for line in step.log]
+
     def blueprint_groups(self) -> list:
         """Blueprint changes as ``[((blueprint, instance), [changes])]``, in first-seen
         order — which is step order, and therefore the order things happened."""
@@ -90,6 +104,7 @@ def from_result(result, *, finished_at: str = "", key=None, label: str = None) -
         not_run=result.not_run,
         steps=[StepReport(action_ref=step.action_ref, status=step.status,
                           reason=step.reason, changes=list(step.changes),
+                          log=[tuple(line) for line in getattr(step, "log_lines", ())],
                           run_id=step.run_id,
                           # A dry run has no run_id and nothing to reverse. A real one is
                           # reversible while its inverse is intact, which is exactly what
@@ -118,11 +133,18 @@ def from_history(job_run, step_rows) -> RunReport:
         # keeps the change record, so an already-undone step still shows what it did and
         # cannot be undone twice — which is the same test the Job Results panel makes.
         inverse = any(stored.get(key) for key in ("l2", "files", "blueprints"))
+        # Its own column rather than a key inside `rollback_data` — `log_output` predates
+        # the change record and is written by `runner.run_action` for every step.
+        try:
+            logged = json.loads(row.get("log_output") or "[]")
+        except (TypeError, ValueError):
+            logged = []
         steps.append(StepReport(
             action_ref=row.get("action_ref") or "?",
             status=row.get("status") or "?",
             reason=row.get("reason"),
             changes=stored.get("changes") or [],
+            log=[tuple(line) for line in logged if isinstance(line, (list, tuple))],
             run_id=row.get("id"),
             can_roll_back=bool(inverse),
         ))

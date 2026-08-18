@@ -21,8 +21,8 @@ differently is worse than either.
 """
 from PySide6.QtCore import QAbstractTableModel, QSize, Qt, Signal
 from PySide6.QtWidgets import (
-    QAbstractItemView, QFrame, QHBoxLayout, QHeaderView, QLabel, QMenu, QScrollArea,
-    QTableView, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
+    QAbstractItemView, QFrame, QHBoxLayout, QHeaderView, QLabel, QMenu, QPlainTextEdit,
+    QScrollArea, QTableView, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
 from packsmith.core.job_runner import describe_summary
@@ -200,6 +200,7 @@ class RunReportTab(QWidget):
         self._build_tags()
         self._build_blueprints()
         self._build_files()
+        self._build_log()
         self._body.addStretch(1)
 
     # --- heading ------------------------------------------------------------
@@ -365,6 +366,40 @@ class RunReportTab(QWidget):
         self._body.addWidget(tree)
 
     # --- layout helpers ------------------------------------------------------
+
+    def _build_log(self):
+        """Everything the run said, kept with the run that said it.
+
+        The same lines stream into the Logs strip while a job runs (§4.1), but that is a
+        live tail shared with the whole application — it scrolls away, it mixes with
+        whatever else logged since, and it is gone next session. A run's own output belongs
+        to the run: this is the only place it survives, because `step_runs.log_output`
+        persists it and `reports.from_history` reads it back.
+
+        Last rather than first, deliberately. The counted sections above answer *what
+        happened*; the log answers *why*, which is the question you only have once the
+        first one has surprised you. Fixed height and scrollable for the same reason the
+        change tables are capped — a chatty action must not push everything else off the
+        page.
+        """
+        lines = self.report.log_lines()
+        if not lines:
+            return
+        self._section_title(f"Log · {len(lines):,}")
+        view = QPlainTextEdit()
+        view.setReadOnly(True)
+        # Undo history on a read-only view of a finished run is pure memory, and the run
+        # can be tens of thousands of lines on a real removal job.
+        view.setUndoRedoEnabled(False)
+        view.setLineWrapMode(QPlainTextEdit.NoWrap)
+        view.setPlainText("\n".join(f"[{level}] {message}" for level, message in lines))
+        view.setFixedHeight(_MAX_TABLE_HEIGHT)
+        view.setStyleSheet(
+            f"QPlainTextEdit {{ background: {style.BG_PANEL}; color: {style.TEXT_MUTED};"
+            f" border: 1px solid {style.BORDER}; border-radius: 3px;"
+            f" font-family: {style.MONO_FAMILY}; font-size: 12px; padding: 6px;"
+            f" margin-top: 8px; }}")
+        self._body.addWidget(view)
 
     def _section_title(self, text):
         label = QLabel(text.upper())

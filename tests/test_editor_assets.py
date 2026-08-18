@@ -24,6 +24,11 @@ VS = EDITOR / "vendor" / "monaco" / "vs"
 # grammar in basic-languages, so they need checking a different way.
 _RICH_LANGUAGES = {"json", "css", "html", "typescript", "javascript"}
 
+# Monaco ships nothing for JSON5, so the host page registers it — grammar and all. It is
+# therefore the one mapped language that cannot be found on disk, and the test below has to
+# look for it in the page instead of in `basic-languages/`.
+_OURS = {"json5"}
+
 
 def test_monaco_is_vendored():
     assert VS.is_dir(), "run tools/vendor_monaco.py"
@@ -58,16 +63,29 @@ def test_workers_get_an_absolute_url():
 def test_every_mapped_language_actually_exists(language):
     if language == "plaintext" or language in _RICH_LANGUAGES:
         return
+    if language in _OURS:
+        # Registered by our own JavaScript rather than shipped by Monaco, so it is found in
+        # the page or in a script the page loads — the grammar lives in its own file
+        # precisely because escaping a wall of regex literals through anything is how one
+        # silently stops compiling.
+        ours = "\n".join(f.read_text(encoding="utf-8")
+                         for f in [HOST_HTML, *sorted(EDITOR.glob("*.js"))])
+        assert f"id: '{language}'" in ours, (
+            f"'{language}' is ours to register and nothing registers it — "
+            f"an unregistered language silently renders as plaintext")
+        assert f"setMonarchTokensProvider('{language}'" in ours, (
+            f"'{language}' is registered with no grammar — it would render unhighlighted")
+        return
     assert (VS / "basic-languages" / language).is_dir(), (
         f"nothing maps to '{language}' in Monaco — it will silently render as plaintext")
 
 
 @pytest.mark.parametrize("path,expected", [
     ("action.star", "python"),          # Starlark is a Python dialect
-    ("manifest.toml", "ini"),           # Monaco ships no TOML grammar; ini is the shape
+    ("manifest.json5", "json5"),        # our own language — Monaco ships no JSON5
     ("server_scripts/recipes.js", "javascript"),   # KubeJS
     ("types/kubejs.d.ts", "typescript"),
-    ("config/thing.json5", "json"),
+    ("config/thing.json5", "json5"),
     ("scripts/thing.zs", "javascript"),  # ZenScript / CraftTweaker
     ("pack.mcmeta", "json"),
     ("mystery.wat", "plaintext"),

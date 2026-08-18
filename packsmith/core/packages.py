@@ -1,6 +1,6 @@
 """On-disk action packages and the manifest → callable seam (design 3.3.1, 7.x).
 
-A package is a folder with a ``manifest.toml`` declaring one or more actions, plus the
+A package is a folder with a ``manifest.json5`` declaring one or more actions, plus the
 ``.star`` files their entry points live in. The manifest is the durable, language-agnostic
 part: it describes the action without caring what its body is written in.
 
@@ -10,12 +10,15 @@ indexing, ref resolution, the runner) never learns what language actions are wri
 which is exactly what let the Python-callable stand-in be swapped out for real Starlark
 without touching a line of the runner.
 """
+import json
 import re
 import shutil
-import tomllib
+
+import json5
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from packsmith.common.logging import log
 from packsmith.core.shapes import parse_shape
 from packsmith.core.starlark_runtime import PackageLoader, run_starlark
 
@@ -94,14 +97,19 @@ class Package:
 
 
 def load_package(package_dir) -> Package:
-    """Parse a package's ``manifest.toml`` into a Package."""
+    """Parse a package's ``manifest.json5`` into a Package."""
     package_dir = Path(package_dir)
-    manifest_path = package_dir / "manifest.toml"
+    manifest_path = package_dir / MANIFEST_NAME
     if not manifest_path.is_file():
-        raise FileNotFoundError(f"No manifest.toml in package: {package_dir}")
+        raise FileNotFoundError(f"No {MANIFEST_NAME} in package: {package_dir}")
 
-    with open(manifest_path, "rb") as f:
-        data = tomllib.load(f)
+    # JSON5 rather than JSON: a manifest is hand-edited (3.3.1 — "they are just files on
+    # disk"), and comments are most of what makes one readable. The reader tolerates
+    # comments, trailing commas and unquoted keys; the writer emits strict quoted JSON.
+    # Same split §6.3 already applies to Minecraft's own commented config files.
+    data = json5.loads(manifest_path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError(f"{manifest_path} is not a JSON5 object")
 
     meta = data.get("package", {})
     name = meta.get("name")
@@ -143,6 +151,7 @@ class PackageIndex:
     def __init__(self, packages_dir=None):
         self._packages = {}   # package_name -> Package
         self._actions = {}    # action_ref  -> ActionManifest
+        self._errors = {}     # package folder name -> why it did not load
         self._dir = None
         if packages_dir is not None:
             self.scan(packages_dir)
@@ -152,30 +161,59 @@ class PackageIndex:
         """The packages directory this index was scanned from."""
         return self._dir
 
+    @property
+    def errors(self) -> dict:
+        """Packages on disk that would not parse: folder name -> why.
+
+        Recorded rather than raised, for two reasons that both cost a user their session
+        otherwise. One malformed manifest must not stop the *other* packages loading, and
+        it must not stop the profile opening at all — a manifest is hand-editable text
+        (3.3.1: "they are just files on disk"), so a half-typed one is a normal state to
+        find on disk, not an exceptional one.
+
+        A package in here is **absent** from the index rather than stale. That is the
+        deliberate half: a manifest that cannot be read declares no actions, and keeping the
+        last good declaration around would mean running a manifest that no longer exists —
+        which is precisely the failure this class's `reload` exists to prevent.
+        """
+        return dict(self._errors)
+
     def reload(self):
         """Re-read everything from disk. Needed after a package or action is created or a
         manifest is edited — action *sources* are re-read on every run, but manifests are
         only parsed here."""
         if self._dir is None:
             return
-        self._packages.clear()
-        self._actions.clear()
         self.scan(self._dir)
 
     def scan(self, packages_dir):
-        packages_dir = Path(packages_dir)
-        self._dir = packages_dir
-        if not packages_dir.is_dir():
-            return
-        for child in sorted(packages_dir.iterdir()):
-            if child.is_dir() and (child / "manifest.toml").is_file():
-                self.add_package(child)
+        """Parse every package under ``packages_dir``, replacing whatever is held now.
 
-    def add_package(self, package_dir):
-        pkg = load_package(package_dir)
-        self._packages[pkg.name] = pkg
-        for action in pkg.actions:
-            self._actions[action.ref] = action
+        Everything is built into fresh maps and swapped in at the end, so a failure partway
+        through cannot leave the index holding half a profile's packages — which is worse
+        than holding stale ones, because it looks like the missing packages were deleted.
+        """
+        packages_dir = Path(packages_dir)
+        packages, actions, errors = {}, {}, {}
+        if packages_dir.is_dir():
+            for child in sorted(packages_dir.iterdir()):
+                if not (child.is_dir() and (child / MANIFEST_NAME).is_file()):
+                    continue
+                try:
+                    pkg = load_package(child)
+                except (OSError, ValueError, KeyError, TypeError) as e:
+                    # The realistic set for hand-edited JSON5: json5's decode error and
+                    # our own validation are ValueError, a missing required field is
+                    # KeyError, a table where a string belongs is TypeError, an unreadable
+                    # file is OSError.
+                    errors[child.name] = str(e)
+                    log.warning("Package '%s' did not load: %s", child.name, e)
+                    continue
+                packages[pkg.name] = pkg
+                for action in pkg.actions:
+                    actions[action.ref] = action
+        self._dir = packages_dir
+        self._packages, self._actions, self._errors = packages, actions, errors
 
     @property
     def actions(self) -> dict:
@@ -239,7 +277,7 @@ PACK_KINDS = ("datapacks", "resourcepacks")
 # 3.3: `one` is a single-select picker, `many` is "zero or more" and a multi-select list.
 CARDINALITIES = ("one", "many")
 
-MANIFEST_NAME = "manifest.toml"
+MANIFEST_NAME = "manifest.json5"
 SOURCE_SUFFIX = ".star"
 
 # Package and action names become part of a public identifier (`package:action_id`) and a
@@ -348,7 +386,7 @@ def check_file_path(path, *, entry_point: bool = False) -> str:
             f"File name '{name}' is invalid — start with a letter, digit or underscore, "
             f"and use no path separators"
             if name != MANIFEST_NAME else
-            "manifest.toml is the package definition and can't be created by hand")
+            f"{MANIFEST_NAME} is the package definition and can't be created by hand")
     return "/".join(parts[:-1] + [name])
 
 
@@ -372,13 +410,20 @@ def create_package(packages_dir, name: str, *, description: str = "",
     if root.exists():
         raise ValueError(f"A package named '{name}' already exists")
     root.mkdir(parents=True)
-    lines = ["[package]", f'name = "{name}"', f'version = "{version}"']
+    meta = {"name": name, "version": version}
     if author:
-        lines.append(f'author = "{author}"')
+        meta["author"] = author
     if description:
-        lines.append(f'description = "{description}"')
-    lines.append("")
-    (root / "manifest.toml").write_text("\n".join(lines), encoding="utf-8")
+        meta["description"] = description
+    # `actions` is written empty rather than omitted: `_insert_action` splices into the
+    # array, so a package with nowhere to splice would refuse its first action.
+    body = "\n".join(f'    {json.dumps(k)}: {json.dumps(v)},' for k, v in meta.items())
+    (root / MANIFEST_NAME).write_text(
+        "{\n"
+        '  "package": {\n' + body + "\n  },\n"
+        "\n"
+        '  "actions": [\n  ],\n'
+        "}\n", encoding="utf-8")
     return load_package(root)
 
 
@@ -391,9 +436,9 @@ def add_action(package: Package, action_id: str, *, file: str = None, name: str 
     at all. Defaulting ``file`` to ``<action_id>.star`` is a convenience for the common
     case, not a rule the rest of the system knows about.
 
-    The manifest is **appended to as text**, never regenerated through a TOML writer. The
-    file belongs to the user — they may have comments and formatting in it — and rewriting
-    it wholesale would quietly destroy that. Same round-tripping concern that governs mod
+    The manifest is **spliced as text**, never regenerated through a JSON writer. The file
+    belongs to the user — they may have comments and formatting in it — and rewriting it
+    wholesale would quietly destroy that. Same round-tripping concern that governs mod
     configs, applied to our own file format.
     """
     _check_name("Action", action_id)
@@ -408,17 +453,15 @@ def add_action(package: Package, action_id: str, *, file: str = None, name: str 
     if clash is not None:
         raise ValueError(f"'{clash.action_id}' already points at {file_name}:{function}()")
 
-    entry = ["", "[[actions]]", f'id = "{action_id}"', f'file = "{file_name}"',
-             f'function = "{function}"']
+    fields = {"id": action_id, "file": file_name, "function": function}
     if name:
-        entry.append(f'name = "{name}"')
+        fields["name"] = name
     if description:
-        entry.append(f'description = "{description}"')
-    entry.append("")
+        fields["description"] = description
 
     manifest = package.root / MANIFEST_NAME
-    existing = manifest.read_text(encoding="utf-8").rstrip("\n")
-    manifest.write_text(existing + "\n" + "\n".join(entry), encoding="utf-8")
+    manifest.write_text(
+        _insert_action(manifest.read_text(encoding="utf-8"), fields), encoding="utf-8")
 
     ref = f"{package.name}:{action_id}"
     source = package.root / file_name
@@ -444,7 +487,7 @@ def remove_action(package: Package, action_id: str):
     """
     _require_authored(package)
     manifest = package.root / MANIFEST_NAME
-    updated = _strip_action_block(manifest.read_text(encoding="utf-8"), action_id)
+    updated = _strip_action_object(manifest.read_text(encoding="utf-8"), action_id)
     if updated is None:
         raise ValueError(f"'{package.name}' declares no action '{action_id}'")
     manifest.write_text(updated, encoding="utf-8")
@@ -604,13 +647,20 @@ def _declared_under(package: Package, path: str, *, exact: bool = False) -> list
 
 
 def _retarget(package: Package, pattern: str, replace):
-    """Rewrite ``file = "…"`` lines in place. Everything else in the manifest — comments,
-    spacing, key order — is byte-identical afterwards."""
+    """Rewrite the value of every ``file`` key in place. Everything else in the manifest —
+    comments, spacing, key order — is byte-identical afterwards.
+
+    Deliberately still a line regex rather than a splice through `_actions_layout`: a
+    rename changes a *value*, not the structure, so there is nothing to find a bracket
+    for. The key may be quoted or bare, which is the one thing JSON5 adds here.
+    """
     manifest = package.root / MANIFEST_NAME
     text = manifest.read_text(encoding="utf-8")
-    line = re.compile(r'^(?P<lead>\s*file\s*=\s*)"' + pattern + r'"[ \t]*$', re.M)
+    line = re.compile(r'^(?P<lead>\s*"?file"?\s*:\s*)"' + pattern + r'"(?P<tail>,?[ \t]*)$',
+                      re.M)
     manifest.write_text(
-        line.sub(lambda m: f'{m.group("lead")}"{replace(m)}"', text), encoding="utf-8")
+        line.sub(lambda m: f'{m.group("lead")}"{replace(m)}"{m.group("tail")}', text),
+        encoding="utf-8")
 
 
 def _defines(source: str, function: str) -> bool:
@@ -646,46 +696,196 @@ def function_source(package: Package, file_name: str, function: str) -> str | No
     return "\n".join(lines[start:end])
 
 
-def _manifest_blocks(text: str) -> list[list[str]]:
-    """Split a manifest into chunks, each starting at a table header. Trailing blank lines
-    stay with the block above them, which is what makes block removal leave tidy text."""
-    blocks, current = [], []
-    for line in text.splitlines():
-        if line.lstrip().startswith("[") and current:
-            blocks.append(current)
-            current = [line]
-        else:
-            current.append(line)
-    if current:
-        blocks.append(current)
-    return blocks
+# --- editing a manifest as TEXT (design 3.3.1) ---------------------------------------
+#
+# A manifest is hand-editable — "they are just files on disk" — so the app must never
+# parse-and-redump one. That would reformat the user's file and silently eat their
+# comments every time they used the New Action dialog.
+#
+# TOML made this easy in exactly one way: a new `[[actions]]` block could be appended at
+# the end of the file. JSON5 has no append — an action object has to go *inside* the
+# `actions` array, before its closing bracket — so locating that bracket is the price of
+# the format, and this is it. Everything outside the spliced region comes through
+# byte-identical, comments included.
 
 
-_ID_LINE = re.compile(r'^\s*id\s*=\s*"([^"]*)"')
+def _next_code(text: str, i: int):
+    """Index of the next character that is real syntax, skipping whitespace and comments.
 
-
-def _strip_action_block(text: str, action_id: str):
-    """Remove one ``[[actions]]`` block and its ``[actions.*]`` sub-tables, as text.
-
-    Returns None when nothing matched. Same reasoning as :func:`add_action`: everything
-    outside the removed block — comments, spacing, key order — comes through untouched.
+    Both JSON5 comment styles, because a manifest is a file people annotate and the comma
+    this looks for is routinely on the far side of a `//` line.
     """
-    kept, removed, dropping = [], False, False
-    for block in _manifest_blocks(text):
-        header = block[0].lstrip()
-        if header.startswith("[[actions]]"):
-            dropping = any((m := _ID_LINE.match(line)) and m.group(1) == action_id
-                           for line in block)
-        elif dropping and not header.startswith("[actions."):
-            dropping = False
-        if dropping:
-            removed = True
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch.isspace():
+            i += 1
+        elif ch == "/" and i + 1 < n and text[i + 1] == "/":
+            nl = text.find("\n", i)
+            if nl < 0:
+                return None
+            i = nl + 1
+        elif ch == "/" and i + 1 < n and text[i + 1] == "*":
+            closed = text.find("*/", i + 2)
+            if closed < 0:
+                return None
+            i = closed + 2
+        else:
+            return i
+    return None
+
+
+def _actions_layout(text: str):
+    """Where the ``actions`` array is, and where each action object in it starts and ends.
+
+    Returns ``(open_bracket, close_bracket, [(start, end), ...])`` or None. Indices are
+    into ``text``, so callers splice rather than rewrite.
+
+    A scanner rather than a regex because every character that matters here — braces,
+    brackets, commas — also occurs inside strings and comments, and a manifest is full of
+    both. It reads forward for the same reason the editor's signature-help scanner does:
+    quote state is only unambiguous in the direction it was written.
+    """
+    i, n, depth = 0, len(text), 0
+    key = None                      # the most recent `key:` token seen
+    array_open = array_depth = None
+    children, child_start = [], None
+    while i < n:
+        ch = text[i]
+        if ch == "/" and i + 1 < n and text[i + 1] == "/":
+            nl = text.find("\n", i)
+            i = n if nl < 0 else nl + 1
             continue
-        kept.append(block)
-    if not removed:
+        if ch == "/" and i + 1 < n and text[i + 1] == "*":
+            closed = text.find("*/", i + 2)
+            i = n if closed < 0 else closed + 2
+            continue
+        if ch in ("\"", "'"):
+            j, buf = i + 1, []
+            while j < n:
+                if text[j] == "\\":
+                    buf.append(text[j + 1] if j + 1 < n else "")
+                    j += 2
+                    continue
+                if text[j] == ch:
+                    break
+                buf.append(text[j])
+                j += 1
+            token, i = "".join(buf), j + 1
+            after = _next_code(text, i)
+            if after is not None and text[after] == ":":
+                key = token
+            continue
+        if ch.isalpha() or ch in "_$":
+            j = i
+            while j < n and (text[j].isalnum() or text[j] in "_$"):
+                j += 1
+            token, i = text[i:j], j
+            after = _next_code(text, i)
+            if after is not None and text[after] == ":":
+                key = token
+            continue
+        if ch == "[":
+            if array_open is None and key == "actions":
+                array_open, array_depth = i, depth
+            depth += 1
+        elif ch == "{":
+            if array_open is not None and depth == array_depth + 1 and child_start is None:
+                child_start = i
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if (array_open is not None and depth == array_depth + 1
+                    and child_start is not None):
+                children.append((child_start, i + 1))
+                child_start = None
+        elif ch == "]":
+            depth -= 1
+            if array_open is not None and depth == array_depth:
+                return array_open, i, children
+        i += 1
+    return None
+
+
+def _object_text(fields: dict, indent: str) -> str:
+    """One action, as JSON5 the app wrote — quoted keys and a trailing comma.
+
+    Quoted deliberately, though JSON5 does not require it: `json5.dumps` quotes only
+    JavaScript *reserved words*, which leaves `"function"` quoted and `id` bare in the same
+    object. Writes emit strict, reads tolerate — the rule §6.3 already applies to
+    Minecraft's own commented JSON, pointed at our own format.
+    """
+    inner = indent + "  "
+    body = "\n".join(f"{inner}{json.dumps(k)}: {json.dumps(v)}," for k, v in fields.items())
+    return "{\n" + body + "\n" + indent + "}"
+
+
+def _insert_action(text: str, fields: dict) -> str:
+    """Splice one action object in before the array's closing bracket."""
+    layout = _actions_layout(text)
+    if layout is None:
+        raise ValueError(f"{MANIFEST_NAME} has no 'actions' array to add to")
+    open_i, close_i, children = layout
+
+    # Match the siblings' indentation; two levels in for an empty array.
+    if children:
+        line_start = text.rfind("\n", 0, children[-1][0]) + 1
+        lead = text[line_start:children[-1][0]]
+        indent = lead if not lead.strip() else "    "
+    else:
+        line_start = text.rfind("\n", 0, open_i) + 1
+        lead = text[line_start:open_i]
+        indent = (lead if not lead.strip() else "  ") + "  "
+
+    tail_start = children[-1][1] if children else open_i + 1
+    head = text[:tail_start]
+    if children:
+        following = _next_code(text, tail_start)
+        if following is None or text[following] != ",":
+            head += ","             # the previous entry had no trailing comma
+
+    between = text[tail_start:close_i]       # whitespace, commas, and any comments
+    if "\n" in between:
+        close_indent = between[between.rfind("\n") + 1:]
+        between = between[:between.rfind("\n") + 1]
+    else:
+        close_indent = ""
+        between = between + "\n"
+    return (head + between + indent + _object_text(fields, indent) + ",\n"
+            + close_indent + text[close_i:])
+
+
+def _strip_action_object(text: str, action_id: str):
+    """Remove one action object, plus the comma and the line it occupied. None if absent.
+
+    Identified by *parsing the slice* rather than by matching an `id` line: an id can
+    appear as a value elsewhere, and a hand-written manifest formats itself however its
+    author likes.
+    """
+    layout = _actions_layout(text)
+    if layout is None:
         return None
-    lines = [line for block in kept for line in block]
-    return "\n".join(lines).rstrip("\n") + "\n"
+    _open_i, close_i, children = layout
+    for start, end in children:
+        try:
+            entry = json5.loads(text[start:end])
+        except ValueError:
+            continue
+        if not isinstance(entry, dict) or entry.get("id") != action_id:
+            continue
+        cut_start, cut_end = start, end
+        following = _next_code(text, end)
+        if following is not None and following < close_i and text[following] == ",":
+            cut_end = following + 1
+        line_start = text.rfind("\n", 0, start) + 1
+        if not text[line_start:start].strip():
+            cut_start = line_start
+        while cut_end < len(text) and text[cut_end] in " \t":
+            cut_end += 1
+        if cut_end < len(text) and text[cut_end] == "\n":
+            cut_end += 1
+        return text[:cut_start] + text[cut_end:]
+    return None
 
 
 def _parse_mappings(raw: dict) -> dict:

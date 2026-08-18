@@ -21,6 +21,16 @@ it is *assembled inside Starlark* out of three ingredients:
 
 The host-side ``Pack`` is unchanged and remains the real implementation; this module is
 only the bridge.
+
+**Anything added to ``Pack`` must be added here too, or actions cannot reach it.** The two
+are separate artifacts with nothing linking them, and the failure is silent in the worst
+direction: the Python object works, its tests pass, the GUI wires it up, and the capability
+simply does not exist for the only language that writes actions. That is not hypothetical —
+``pack.datapacks``, ``pack.resourcepacks`` and ``pack.capabilities`` were all built,
+covered and unreachable for nine commits, because the tests that exercised them handed the
+runner a plain Python callable (§1.1's MVP language seam) rather than crossing this bridge.
+``tests/test_pack_surface.py`` now derives the expected surface from ``Pack`` by
+introspection and fails until the prelude carries it.
 """
 import json
 from pathlib import Path
@@ -233,6 +243,21 @@ def _resolve(path):
         ownership = partial(_fs_ownership, path),
     )
 
+# The provider-routed resolvers (7.3). The host does the routing — it asks the active
+# loader where `<pack>/data/<namespace>/<path>` lands and hands back an instance-relative
+# path — and the handle is then the SAME `_resolve` struct a filesystem handle gets. That
+# uniformity is 7.3's promise ("regardless of which resolver produced it"), and building
+# it here rather than a second time is what keeps it true.
+#
+# The first parameter is named `pack` because that is the keyword 3.3 and 7.3 both write:
+# `pack.datapacks.resolve(pack=step.mappings["output_pack"], ...)`. It shadows the global
+# `pack` struct inside these two functions, which is harmless — neither body wants it.
+def _datapack_resolve(pack, namespace, path):
+    return _resolve(_dp_target(pack, namespace, path))
+
+def _resourcepack_resolve(pack, namespace, path):
+    return _resolve(_rp_target(pack, namespace, path))
+
 pack = struct(
     action_ref = {_literal(pack.action_ref)},
     log = _log,
@@ -264,6 +289,12 @@ pack = struct(
         unbind = _bp_unbind,
     ),
     filesystem = struct(resolve = _resolve),
+    datapacks = struct(resolve = _datapack_resolve),
+    resourcepacks = struct(resolve = _resourcepack_resolve),
+    capabilities = struct(
+        has = _cap_has,
+        version = _cap_version,
+    ),
     step = struct(
         mappings = {_literal(pack.step.mappings)},
         config = {_literal(pack.step.config)},
@@ -315,6 +346,16 @@ def _inject(module: Module, pack):
                 obj, file_must_exist=file_must_exist),
         "_fs_exists": lambda path: pack.filesystem.resolve(path).exists(),
         "_fs_ownership": lambda path: pack.filesystem.resolve(path).ownership(),
+        # Provider-routed resolvers hand back the routed PATH, not a handle: the prelude
+        # rebuilds the handle with `_resolve` so every resolver produces one shape (7.3).
+        # A missing loader or an unknown pack raises here, on the host side, with the
+        # message §8.1 wants — which is why the routing is not reimplemented in Starlark.
+        "_dp_target": lambda pack_name, namespace, path:
+            pack.datapacks.resolve(pack_name, namespace, path).path,
+        "_rp_target": lambda pack_name, namespace, path:
+            pack.resourcepacks.resolve(pack_name, namespace, path).path,
+        "_cap_has": pack.capabilities.has,
+        "_cap_version": pack.capabilities.version,
         # §7.6: "print could be redirected to pack.log("debug", ...) for author-convenience
         # during development." It lands in the run log with everything else the action
         # said, so debugging output is visible where the author is already looking.

@@ -12,7 +12,7 @@ durable while the body is Starlark today. This page is where the two are shown t
 without either being edited.
 
 **Read-only, deliberately.** An action is a declaration; editing it means editing
-`manifest.toml`, which has its own surface. A page you can half-edit would raise the
+`manifest.json5`, which has its own surface. A page you can half-edit would raise the
 question of what Save means for a downloaded package, which §3.3.1 answers with
 provenance rather than with a disabled button.
 
@@ -20,6 +20,8 @@ The one thing here that is neither manifest nor source: **which of your jobs use
 That is the question with a real consequence — it is the blast radius of touching the
 action — and it can only be answered by looking at Layer 2 from Layer 3's page.
 """
+import json
+
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QColor, QFont
 from PySide6.QtWidgets import (
@@ -284,7 +286,7 @@ class ActionPageTab(QWidget):
             if param.required:
                 chips.append(("required", True))
             if param.default is not None:
-                chips.append((f"default {_as_toml(param.default)}", False))
+                chips.append((f"default {_as_json5(param.default)}", False))
             column.addWidget(_heading_row(name, chips))
             if param.description:
                 column.addWidget(self._muted(param.description, italic=False))
@@ -440,9 +442,9 @@ class ActionPageTab(QWidget):
         """
         param = self._manifest.config[name]
         if name in step.config:
-            return (_as_toml(step.config[name]), None)
+            return (_as_json5(step.config[name]), None)
         if param.default is not None:
-            return (f"{_as_toml(param.default)}  (default)", style.TEXT_MUTED)
+            return (f"{_as_json5(param.default)}  (default)", style.TEXT_MUTED)
         if param.required:
             return ("unset — required", style.ERROR)
         return ("unset", style.TEXT_FAINT)
@@ -676,16 +678,14 @@ def _on_error_cell(job, step):
     return (f"{policy}  (job)", style.TEXT_MUTED)
 
 
-def _as_toml(value) -> str:
+def _as_json5(value) -> str:
     """A default, spelled the way the manifest spells it.
 
-    Python's `repr` gives `False`, and the manifest this page is describing says `false`.
-    A reference that renders a value in a different language from the file it documents
-    invites someone to copy it back in and be told the TOML is invalid.
+    Python's `repr` gives `False` and `'text'`, and the manifest this page describes says
+    `false` and `"text"`. A reference that renders a value in a different language from the
+    file it documents invites someone to copy it back in and be told the JSON is invalid.
     """
-    if isinstance(value, bool):
-        return "true" if value else "false"
-    return repr(value)
+    return json.dumps(value)
 
 
 def _describe_mapping(slot) -> str:

@@ -7,33 +7,35 @@ from packsmith.core.bindings import resolve_step, best_guess_bindings
 from packsmith.core.runner import run_action
 
 MANIFEST = """
-[package]
-name = "demo_suite"
-version = "0.1.0"
-author = "test"
-description = "a demo package"
-
-[[actions]]
-id = "mark_queued"
-file = "actions.star"
-function = "mark_queued"
-name = "Mark Queued"
-description = "marks remove items as queued"
-
-[actions.mappings.source]
-kind = "tag"
-tag_type = "bool"
-registry_type = "minecraft:item"
-likely_name = "remove"
-
-[actions.mappings.target]
-kind = "tag"
-tag_type = "bool"
-registry_type = "minecraft:item"
-
-[actions.configuration.registry_type]
-type = "string"
-default = "minecraft:item"
+{
+  "package": {
+    "name": "demo_suite",
+    "version": "0.1.0",
+    "author": "test",
+    "description": "a demo package",
+  },
+  "actions": [
+    {
+      "id": "mark_queued",
+      "file": "actions.star",
+      "function": "mark_queued",
+      "name": "Mark Queued",
+      "description": "marks remove items as queued",
+      "mappings": {
+        "source": {
+          "kind": "tag", "tag_type": "bool",
+          "registry_type": "minecraft:item", "likely_name": "remove",
+        },
+        "target": {
+          "kind": "tag", "tag_type": "bool", "registry_type": "minecraft:item",
+        },
+      },
+      "configuration": {
+        "registry_type": { "type": "string", "default": "minecraft:item" },
+      },
+    },
+  ],
+}
 """
 
 ACTION_STAR = '''
@@ -57,7 +59,7 @@ def package_root(tmp_path):
     """A packages/ dir containing one demo_suite package."""
     pkg = tmp_path / "packages" / "demo_suite"
     pkg.mkdir(parents=True)
-    (pkg / "manifest.toml").write_text(MANIFEST, encoding="utf-8")
+    (pkg / "manifest.json5").write_text(MANIFEST, encoding="utf-8")
     (pkg / "actions.star").write_text(ACTION_STAR, encoding="utf-8")
     return tmp_path / "packages"
 
@@ -145,7 +147,7 @@ def test_unknown_action_ref_raises(package_root):
 
 def test_scan_ignores_non_package_dirs(tmp_path):
     (tmp_path / "packages").mkdir()
-    (tmp_path / "packages" / "not_a_package").mkdir()          # no manifest.toml
+    (tmp_path / "packages" / "not_a_package").mkdir()          # no manifest.json5
     (tmp_path / "packages" / "loose.txt").write_text("x", encoding="utf-8")
     index = PackageIndex(tmp_path / "packages")
     assert index.actions == {}
@@ -164,16 +166,16 @@ def test_packages_are_authored_unless_they_say_otherwise(package_root):
 def test_downloaded_provenance_is_parsed(tmp_path):
     pkg = tmp_path / "vendored"
     pkg.mkdir()
-    (pkg / "manifest.toml").write_text(
-        '[package]\nname = "vendored"\nprovenance = "downloaded"\n', encoding="utf-8")
+    (pkg / "manifest.json5").write_text(
+        '{"package": {"name": "vendored", "provenance": "downloaded"}}', encoding="utf-8")
     assert load_package(pkg).provenance == "downloaded"
 
 
 def test_unknown_provenance_is_rejected(tmp_path):
     pkg = tmp_path / "weird"
     pkg.mkdir()
-    (pkg / "manifest.toml").write_text(
-        '[package]\nname = "weird"\nprovenance = "borrowed"\n', encoding="utf-8")
+    (pkg / "manifest.json5").write_text(
+        '{"package": {"name": "weird", "provenance": "borrowed"}}', encoding="utf-8")
     with pytest.raises(ValueError, match="provenance"):
         load_package(pkg)
 
@@ -191,7 +193,7 @@ def test_create_package_writes_a_loadable_manifest(tmp_path):
     from packsmith.core.packages import create_package
     pkg = create_package(tmp_path, "my_pack", description="mine")
     assert pkg.name == "my_pack" and pkg.provenance == "authored"
-    assert (tmp_path / "my_pack" / "manifest.toml").is_file()
+    assert (tmp_path / "my_pack" / "manifest.json5").is_file()
     assert load_package(tmp_path / "my_pack").description == "mine"
 
 
@@ -224,16 +226,16 @@ def test_add_action_appends_and_writes_a_stub(tmp_path):
 
 
 def test_add_action_preserves_handwritten_manifest_content(tmp_path):
-    """The manifest is appended to as text, never regenerated — a TOML round-trip would
+    """The manifest is spliced as text, never regenerated — a JSON round-trip would
     silently eat the user's comments."""
     from packsmith.core.packages import create_package, add_action
     pkg = create_package(tmp_path, "mine")
-    manifest = pkg.root / "manifest.toml"
+    manifest = pkg.root / "manifest.json5"
     manifest.write_text(manifest.read_text(encoding="utf-8")
-                        + "\n# a comment the user wrote\n", encoding="utf-8")
+                        + "\n// a comment the user wrote\n", encoding="utf-8")
     add_action(pkg, "thing")
     after = manifest.read_text(encoding="utf-8")
-    assert "# a comment the user wrote" in after
+    assert "// a comment the user wrote" in after
     assert load_package(pkg.root).actions[0].action_id == "thing"
 
 
@@ -248,8 +250,8 @@ def test_add_action_rejects_duplicate_ids(tmp_path):
 def test_cannot_add_an_action_to_a_downloaded_package(tmp_path):
     from packsmith.core.packages import add_action
     root = tmp_path / "vendored"; root.mkdir()
-    (root / "manifest.toml").write_text(
-        '[package]\nname = "vendored"\nprovenance = "downloaded"\n', encoding="utf-8")
+    (root / "manifest.json5").write_text(
+        '{"package": {"name": "vendored", "provenance": "downloaded"}}', encoding="utf-8")
     with pytest.raises(ValueError, match="downloaded"):
         add_action(load_package(root), "thing")
 
@@ -322,7 +324,7 @@ def test_create_file_declares_nothing(tmp_path):
     assert created.is_file()
     reloaded = load_package(pkg.root)
     assert reloaded.actions == []
-    assert source_files(reloaded) == ["manifest.toml", "helpers.star"]
+    assert source_files(reloaded) == ["manifest.json5", "helpers.star"]
 
 
 def test_create_file_rejects_bad_names(tmp_path):
@@ -336,7 +338,7 @@ def test_create_file_rejects_bad_names(tmp_path):
     from packsmith.core.packages import create_package, create_file
     pkg = create_package(tmp_path, "mine")
     for bad in ("", "   ", "../escape.star", "..\\escape.star", "lib/../../out.star",
-                "manifest.toml"):
+                "manifest.json5"):
         with pytest.raises(ValueError):
             create_file(pkg, bad)
 
@@ -348,7 +350,7 @@ def test_a_package_may_hold_files_that_are_not_starlark(tmp_path):
     for name in ("ids.json", "README.md", "data/table.csv", "Notes.txt"):
         create_file(pkg, name)
     assert set(source_files(load_package(pkg.root))) == {
-        "manifest.toml", "ids.json", "README.md", "data/table.csv", "Notes.txt"}
+        "manifest.json5", "ids.json", "README.md", "data/table.csv", "Notes.txt"}
 
 
 def test_only_starlark_files_get_the_starlark_stub(tmp_path):
@@ -410,31 +412,31 @@ def test_remove_action_takes_its_subtables_and_spares_the_rest(tmp_path):
     and touch nothing else in the file."""
     from packsmith.core.packages import remove_action
     root = tmp_path / "mine"; root.mkdir()
-    (root / "manifest.toml").write_text('''# top comment
-[package]
-name = "mine"
-
-[[actions]]
-id = "doomed"
-file = "a.star"
-function = "run"
-
-[actions.mappings.target]
-tag_type = "bool"
-registry_type = "minecraft:item"
-
-[[actions]]
-id = "kept"
-file = "b.star"
-function = "run"
-
-[actions.mappings.other]
-tag_type = "string"
+    (root / "manifest.json5").write_text('''// top comment
+{
+  "package": { "name": "mine" },
+  "actions": [
+    {
+      "id": "doomed",
+      "file": "a.star",
+      "function": "run",
+      "mappings": {
+        "target": { "tag_type": "bool", "registry_type": "minecraft:item" },
+      },
+    },
+    {
+      "id": "kept",
+      "file": "b.star",
+      "function": "run",
+      "mappings": { "other": { "tag_type": "string" } },
+    },
+  ],
+}
 ''', encoding="utf-8")
     remove_action(load_package(root), "doomed")
 
-    text = (root / "manifest.toml").read_text(encoding="utf-8")
-    assert "# top comment" in text
+    text = (root / "manifest.json5").read_text(encoding="utf-8")
+    assert "// top comment" in text
     assert "doomed" not in text and "minecraft:item" not in text
     kept = load_package(root)
     assert [a.action_id for a in kept.actions] == ["kept"]
@@ -471,14 +473,14 @@ def test_delete_file_refuses_the_manifest(tmp_path):
     from packsmith.core.packages import create_package, delete_file
     pkg = create_package(tmp_path, "mine")
     with pytest.raises(ValueError):
-        delete_file(pkg, "manifest.toml")
+        delete_file(pkg, "manifest.json5")
 
 
 def test_rename_file_retargets_declarations_and_spares_the_manifest(tmp_path):
     from packsmith.core.packages import create_package, add_action, rename_file
     pkg = create_package(tmp_path, "mine")
-    manifest = pkg.root / "manifest.toml"
-    manifest.write_text(manifest.read_text(encoding="utf-8") + "\n# keep me\n",
+    manifest = pkg.root / "manifest.json5"
+    manifest.write_text(manifest.read_text(encoding="utf-8") + "\n// keep me\n",
                         encoding="utf-8")
     add_action(pkg, "alpha", file="toolbox.star", function="alpha")
     add_action(load_package(pkg.root), "beta", file="toolbox.star", function="beta")
@@ -486,7 +488,7 @@ def test_rename_file_retargets_declarations_and_spares_the_manifest(tmp_path):
     rename_file(load_package(pkg.root), "toolbox.star", "kit.star")
     assert (pkg.root / "kit.star").is_file()
     assert not (pkg.root / "toolbox.star").exists()
-    assert "# keep me" in manifest.read_text(encoding="utf-8")
+    assert "// keep me" in manifest.read_text(encoding="utf-8")
     assert {a.file for a in load_package(pkg.root).actions} == {"kit.star"}
 
 
@@ -586,7 +588,7 @@ def test_delete_folder_takes_undeclared_contents(tmp_path):
     create_file(pkg, "lib/a.star")
     create_file(pkg, "lib/deep/b.star")
     delete_folder(load_package(pkg.root), "lib")
-    assert source_files(load_package(pkg.root)) == ["manifest.toml"]
+    assert source_files(load_package(pkg.root)) == ["manifest.json5"]
 
 
 # --- cutting one function out of a file (the action reference page) -----------------------
@@ -657,8 +659,8 @@ def test_a_function_the_file_does_not_define_reports_itself(two_functions):
 def test_file_operations_refuse_downloaded_packages(tmp_path):
     from packsmith.core.packages import create_file, delete_file, remove_action
     root = tmp_path / "vendored"; root.mkdir()
-    (root / "manifest.toml").write_text(
-        '[package]\nname = "vendored"\nprovenance = "downloaded"\n', encoding="utf-8")
+    (root / "manifest.json5").write_text(
+        '{"package": {"name": "vendored", "provenance": "downloaded"}}', encoding="utf-8")
     pkg = load_package(root)
     for call in (lambda: create_file(pkg, "x.star"),
                  lambda: delete_file(pkg, "x.star"),

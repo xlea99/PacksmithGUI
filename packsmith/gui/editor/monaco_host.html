@@ -30,6 +30,12 @@
 
 <script src="qrc:///qtwebchannel/qwebchannel.js"></script>
 <script src="./vendor/monaco/vs/loader.js"></script>
+<!-- Pure text analysis for .star completions, in its own file so it can be unit
+     tested outside a browser. See starlark_lang.js. -->
+<script src="./starlark_lang.js"></script>
+<!-- Monaco ships no JSON5; this registers one. Same reasoning as above — a wall of
+     regex literals has no business being escaped through anything. -->
+<script src="./json5_lang.js"></script>
 <script>
     // Monaco is vendored (tools/vendor_monaco.py), so this page is fully offline. That
     // matters beyond convenience: a CDN dependency meant no internet = no editor at all,
@@ -75,6 +81,7 @@
     initBridge(function () {
         require(['vs/editor/editor.main'], function () {
             document.getElementById('loading').style.display = 'none';
+            registerJson5();
             editor = monaco.editor.create(document.getElementById('editor'), {
                 value: '', theme: 'vs-dark', automaticLayout: true,
                 minimap: { enabled: true }, fontSize: 14, lineNumbers: 'on',
@@ -91,6 +98,10 @@
                     if (current) bridgeCall('readOnlyEditAttempted', current);
                 });
             }
+            // Registered before the catalog arrives, deliberately: a provider reads
+            // `starlarkApi` when it is *called*, so there is no ordering to get wrong
+            // between this and Python's `setStarlarkApi`.
+            registerStarlarkProviders();
             bridgeCall('editorReady');
         });
     });
@@ -105,10 +116,20 @@
         }
     }
 
+    // A model's URI is the only thing a language provider is given to identify the buffer
+    // it was asked about. Without one Monaco assigns `inmemory://model/1`, so a completion
+    // provider could not tell a `.star` action from an ordinary `.py` file — both open as
+    // `python`, because Monaco ships no Starlark grammar. Keys are unique by construction
+    // ("<source>:<path>"), so they make a sound URI once escaped.
+    function modelUri(key) {
+        return monaco.Uri.parse('packsmith:///' + encodeURIComponent(key));
+    }
+
     function openModel(key, text, language, readOnly) {
         if (!editor) return false;
         if (!models[key]) {
-            const model = monaco.editor.createModel(text, language || 'plaintext');
+            const model = monaco.editor.createModel(text, language || 'plaintext',
+                                                    modelUri(key));
             const entry = { model: model, baseline: model.getAlternativeVersionId(),
                             wasDirty: false, readOnly: !!readOnly, viewState: null };
             models[key] = entry;
@@ -222,6 +243,135 @@
     }
 
     function openKeys() { return Object.keys(models).join(','); }
+
+    // --- the Packsmith action API (design 6.3's language services) --------------------
+    //
+    // Monaco has no Starlark grammar, so `.star` files are highlighted as Python and get
+    // no completions of their own — the box is empty, and this fills it with the one thing
+    // an action author actually needs: the `pack` capability object.
+    //
+    // The catalog is pushed once from Python (`gui/editor/starlark_api.catalog()`), where
+    // it is INTROSPECTED from the real `Pack` rather than written down. Nothing here knows
+    // any capability names; adding one to `pack.py` makes it appear with no edit to this
+    // file. It is static because the `pack` surface is the same in every profile — no
+    // round trip, no per-keystroke bridge traffic.
+
+    let starlarkApi = null;            // providers stay silent until Python sends it
+
+    function setStarlarkApi(payload) {
+        starlarkApi = payload;
+        return true;
+    }
+
+    // `pathIsStarlark`, `membersFor`, `memberAt` and `openCall` come from
+    // ./starlark_lang.js — pure text analysis, kept out of this file so it can be unit
+    // tested without a browser (tests/test_starlark_completions.py).
+    function isStarlark(model) {
+        if (!model || !model.uri) return false;
+        try { return pathIsStarlark(decodeURIComponent(model.uri.path)); }
+        catch (e) { return false; }
+    }
+
+    function lineBefore(model, position) {
+        return model.getValueInRange({
+            startLineNumber: position.lineNumber, startColumn: 1,
+            endLineNumber: position.lineNumber, endColumn: position.column,
+        });
+    }
+
+    function completionKind(member) {
+        const K = monaco.languages.CompletionItemKind;
+        if (member.kind === 'function') return K.Method;
+        if (member.kind === 'namespace') return K.Module;
+        return K.Property;
+    }
+
+    function registerStarlarkProviders() {
+        monaco.languages.registerCompletionItemProvider('python', {
+            triggerCharacters: ['.'],
+            provideCompletionItems: function (model, position) {
+                if (!isStarlark(model)) return { suggestions: [] };
+                const members = membersFor(starlarkApi, lineBefore(model, position));
+                if (!members) return { suggestions: [] };
+                const word = model.getWordUntilPosition(position);
+                const range = {
+                    startLineNumber: position.lineNumber, endLineNumber: position.lineNumber,
+                    startColumn: word.startColumn, endColumn: word.endColumn,
+                };
+                return {
+                    suggestions: members.map(function (member) {
+                        const isFn = member.kind === 'function';
+                        const snippet = member.params.length
+                            ? member.name + '($0)' : member.name + '()$0';
+                        return {
+                            label: member.name,
+                            kind: completionKind(member),
+                            detail: member.detail,
+                            documentation: { value: member.doc || '' },
+                            insertText: isFn ? snippet : member.name,
+                            insertTextRules: isFn
+                                ? monaco.languages.CompletionItemInsertTextRule.InsertAsSnippet
+                                : undefined,
+                            // Monaco's own word-based suggestions (every word in the buffer)
+                            // are still on, and are useful elsewhere. Sorting ours ahead of
+                            // them keeps `pack.` from being a lucky dip.
+                            sortText: '0' + member.name,
+                            range: range,
+                        };
+                    }),
+                };
+            },
+        });
+
+        monaco.languages.registerSignatureHelpProvider('python', {
+            signatureHelpTriggerCharacters: ['(', ','],
+            signatureHelpRetriggerCharacters: [',', ')'],
+            provideSignatureHelp: function (model, position) {
+                if (!isStarlark(model)) return null;
+                const call = openCall(lineBefore(model, position));
+                if (!call) return null;
+                const member = memberAt(starlarkApi, call.before);
+                if (!member || member.kind !== 'function') return null;
+                return {
+                    value: {
+                        signatures: [{
+                            label: member.name + member.detail,
+                            documentation: { value: member.doc || '' },
+                            parameters: member.params.map(function (p) {
+                                return { label: p };
+                            }),
+                        }],
+                        activeSignature: 0,
+                        activeParameter: Math.min(call.argIndex,
+                                                  Math.max(member.params.length - 1, 0)),
+                    },
+                    dispose: function () {},
+                };
+            },
+        });
+
+        monaco.languages.registerHoverProvider('python', {
+            provideHover: function (model, position) {
+                if (!isStarlark(model)) return null;
+                const word = model.getWordAtPosition(position);
+                if (!word) return null;
+                const upto = model.getLineContent(position.lineNumber)
+                                  .slice(0, word.endColumn - 1);
+                const member = memberAt(starlarkApi, upto);
+                if (!member) return null;
+                const head = member.kind === 'function'
+                    ? '```python\n' + member.name + member.detail + '\n```'
+                    : '**' + member.name + '**'
+                      + (member.detail ? ' — `' + member.detail + '`' : '');
+                const body = member.doc ? '\n\n' + member.doc : '';
+                return {
+                    range: new monaco.Range(position.lineNumber, word.startColumn,
+                                            position.lineNumber, word.endColumn),
+                    contents: [{ value: head + body }],
+                };
+            },
+        });
+    }
 </script>
 </body>
 </html>

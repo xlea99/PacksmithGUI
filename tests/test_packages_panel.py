@@ -24,8 +24,8 @@ def installed(root, name):
     """A downloaded package — structurally identical, provenance apart (§3.3.1)."""
     package = root / name
     package.mkdir(parents=True)
-    (package / "manifest.toml").write_text(
-        f'[package]\nname = "{name}"\nprovenance = "downloaded"\n', encoding="utf-8")
+    (package / "manifest.json5").write_text(
+        f'{{"package": {{"name": "{name}", "provenance": "downloaded"}}}}', encoding="utf-8")
 
 
 def panel_over(root):

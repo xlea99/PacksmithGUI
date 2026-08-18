@@ -9,6 +9,11 @@ BG_PANEL = "#252525"     # panel + header backgrounds
 BG_CHROME = "#2d2d2d"    # buttons, tabs, inactive chrome
 BG_HOVER = "#383838"     # chrome under the pointer — one step up from BG_CHROME
 BORDER = "#3a3a3a"
+# Log output and anything else where column alignment carries meaning. A constant rather
+# than an inline string because it is now used by both the Logs strip and the Run Report's
+# log panel, and those two showing the same lines in different fonts would read as two
+# different kinds of output.
+MONO_FAMILY = "Consolas, monospace"
 # A separator you are meant to SEE, as opposed to a border you are meant to stop at.
 # Deliberately lighter than BORDER: a border has a filled shape on at least one side of it
 # doing half the work, while a divider inside a menu has the same background above and

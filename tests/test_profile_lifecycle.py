@@ -188,7 +188,7 @@ def test_deleting_a_profile_takes_its_whole_directory(userdata, instance):
     """Tags, views, jobs, history, authored packages, packdump snapshots — all of it."""
     profile = make("doomed", instance)
     (profile.root / "packages" / "mine").mkdir(parents=True, exist_ok=True)
-    (profile.root / "packages" / "mine" / "manifest.toml").write_text(
+    (profile.root / "packages" / "mine" / "manifest.json5").write_text(
         '[package]\nname = "mine"\n', encoding="utf-8")
     UserDB(profile.root / "profile.db").close()
     root = profile.root

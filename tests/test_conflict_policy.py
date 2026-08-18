@@ -124,25 +124,26 @@ def test_conflict_with_another_action_uses_the_same_rules(env):
 # --- manifests must declare it ---------------------------------------------
 
 _MANIFEST = """
-[package]
-name = "demo"
-
-[[actions]]
-id = "act"
-file = "a.py"
-function = "run"
-
-[actions.mappings.target]
-kind = "tag"
-tag_type = "bool"
-registry_type = "minecraft:item"
-access = "%s"
-%s
+{
+  "package": { "name": "demo" },
+  "actions": [
+    {
+      "id": "act", "file": "a.py", "function": "run",
+      "mappings": {
+        "target": {
+          "kind": "tag", "tag_type": "bool", "registry_type": "minecraft:item",
+          "access": "%s",
+          %s
+        },
+      },
+    },
+  ],
+}
 """
 
 
 def _write_package(tmp_path, access, policy_line):
-    (tmp_path / "manifest.toml").write_text(_MANIFEST % (access, policy_line), encoding="utf-8")
+    (tmp_path / "manifest.json5").write_text(_MANIFEST % (access, policy_line), encoding="utf-8")
     return tmp_path
 
 
@@ -158,11 +159,11 @@ def test_read_mapping_needs_no_policy(tmp_path):
 
 def test_invalid_policy_is_rejected_at_load(tmp_path):
     with pytest.raises(ValueError, match="invalid conflict_policy"):
-        load_package(_write_package(tmp_path, "write", 'conflict_policy = "maybe"'))
+        load_package(_write_package(tmp_path, "write", '"conflict_policy": "maybe",'))
 
 
 def test_declared_policy_maps_onto_the_bound_tag(tmp_path):
-    package = load_package(_write_package(tmp_path, "write", 'conflict_policy = "skip"'))
+    package = load_package(_write_package(tmp_path, "write", '"conflict_policy": "skip",'))
     manifest = package.actions[0]
     assert conflict_policies_for(manifest, {"target": "queued"}) == {policy_key("tag", REG, "queued"): "skip"}
 
