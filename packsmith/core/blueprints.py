@@ -164,6 +164,12 @@ class BlueprintStore:
         self._db = db
         self._dump = packdump
 
+    @property
+    def db_path(self):
+        """Where the profile database lives, so a schema-change dialog can name the
+        snapshot folder beside it (design 9.3.3). The editor holds a store, not a db."""
+        return self._db.path
+
     def set_packdump(self, packdump):
         """Point at a newly adopted dump (design 3.1).
 
@@ -1060,6 +1066,23 @@ class BlueprintStore:
             "UPDATE instance_bindings SET owner = 'user', action_ref = NULL "
             "WHERE instance_id = ? AND slot_id = ?", (row.id, slot.id))
         return Binding(slot_path=path, value=binding.value, owner="user", action_ref=None)
+
+    def binding(self, blueprint: str, instance: str, path: str):
+        """One cell's whole state — value *and* owner — or None when nothing is bound.
+
+        Distinct from `value_of`, which answers "what does this hold". Anything that has to
+        *restore* a cell later needs the owner too (§9.3.3): rebinding the value alone
+        launders an action's data into a user decision, and an unbound slot is a different
+        state from one bound to the empty string.
+
+        Tolerant of a missing instance or slot, unlike its neighbours: an undo entry can
+        outlive the thing it names, and "not there" is the honest answer rather than an
+        error the caller would only translate back into None.
+        """
+        try:
+            return self.bindings(blueprint, instance).get(path)
+        except BlueprintError:
+            return None
 
     def bindings(self, blueprint: str, instance: str) -> dict:
         """``{slot_path: Binding}`` for everything currently bound."""

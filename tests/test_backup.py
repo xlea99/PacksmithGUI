@@ -279,3 +279,94 @@ def test_restoring_keeps_a_way_back_from_the_restore(tmp_path):
     replaced = next(b for b in backup.list_backups(path) if b["reason"] == "before-restore")
     superseded = sqlite3.connect(str(replaced["path"]))
     assert "hide" in [r[0] for r in superseded.execute("SELECT name FROM tag_definitions")]
+
+
+# --- the promise and the behaviour have to stay coupled (design 9.3.3) ----------------
+#
+# The confirmation for a schema change says it cannot be undone and names the folder that
+# can recover it. That sentence is a claim about what the STORE does, made by the GUI, and
+# nothing structural keeps the two together — a destructive op added later, or one that
+# stops snapshotting, leaves a dialog quietly promising a copy that does not exist. Which
+# is worse than saying nothing: it is the reassurance that makes someone click Delete.
+
+def test_the_note_names_this_profiles_own_backup_folder(tmp_path):
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from packsmith.gui.confirm import recovery_note
+
+    db = UserDB(tmp_path / "profile.db")
+    note = recovery_note(db.path)
+
+    assert str(backup.backups_dir(db.path)) in note
+    assert "undoable" in note.lower()
+
+
+def test_cancel_is_the_default_button(tmp_path):
+    """Enter on a destructive dialog must not destroy. This one hides: the dialog looks
+    right, and only someone who habitually confirms by keyboard ever finds out."""
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication, QMessageBox
+    QApplication.instance() or QApplication([])
+    import packsmith.gui.confirm as confirm
+
+    seen = {}
+
+    class Spy(QMessageBox):
+        def exec(self):
+            seen["default"] = self.defaultButton().text()
+            seen["informative"] = self.informativeText()
+            return 0
+
+    original, confirm.QMessageBox = confirm.QMessageBox, Spy
+    try:
+        db = UserDB(tmp_path / "profile.db")
+        assert confirm.confirm_destructive(None, "t", "b", db.path) is False
+    finally:
+        confirm.QMessageBox = original
+
+    assert seen["default"] == "Cancel"
+    assert str(backup.backups_dir(tmp_path / "profile.db")) in seen["informative"]
+
+
+def test_a_destructive_slot_change_really_does_snapshot(tmp_path):
+    """`_remove_slot` promises recovery only when the impact is destructive, and the store
+    snapshots only then. Two independent conditions that have to agree."""
+    db = UserDB(tmp_path / "profile.db")
+    store = _blueprints(db)
+    store.define("StoneType")
+    store.add_slot("StoneType", "base", "registry", registry_type="minecraft:block")
+    store.add_slot("StoneType", "spare", "registry", registry_type="minecraft:block")
+    store.create_instance("StoneType", "granite")
+    store.bind("StoneType", "granite", "base", "minecraft:granite")
+    for old in backup.list_backups(db.path):
+        old["path"].unlink()
+
+    # nothing bound here, so 3.2.2 removes it silently — and the dialog promises nothing
+    assert store.preview_remove_slot("StoneType", "spare").destructive is False
+    store.remove_slot("StoneType", "spare")
+    assert db.backups() == [], "a snapshot nobody was promised is churn"
+
+    # bound, so the dialog says "not undoable, recoverable from here" — it had better be
+    assert store.preview_remove_slot("StoneType", "base").destructive is True
+    store.remove_slot("StoneType", "base")
+    assert [b["reason"] for b in db.backups()] == ["before-remove-slot"]
+
+
+def test_a_destructive_retype_really_does_snapshot(tmp_path):
+    db = UserDB(tmp_path / "profile.db")
+    store = _blueprints(db)
+    store.define("StoneType")
+    store.add_slot("StoneType", "base", "registry", registry_type="minecraft:block")
+    store.create_instance("StoneType", "granite")
+    store.bind("StoneType", "granite", "base", "minecraft:granite")
+    for old in backup.list_backups(db.path):
+        old["path"].unlink()
+
+    assert store.preview_retype_slot("StoneType", "base", "string").destructive is True
+    store.retype_slot("StoneType", "base", "string")
+
+    saved = db.backups()
+    assert [b["reason"] for b in saved] == ["before-retype-slot"]
+    copy = sqlite3.connect(str(saved[0]["path"]))
+    assert copy.execute("SELECT value FROM instance_bindings").fetchone()[0] ==         "minecraft:granite"

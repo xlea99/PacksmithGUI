@@ -30,6 +30,8 @@ from packsmith.core.query.template import (
     UnresolvedParam, candidate_query, context_for, resolve,
 )
 from packsmith.core.revalidate import project_removal, project_rename, project_retype
+from packsmith.core.undo import Batch, BindingEngine, Edit, UndoStack
+from packsmith.gui.confirm import confirm_destructive, recovery_note
 from packsmith.gui.shell import style
 from packsmith.gui.shell.picker import PickerPopup
 from packsmith.gui.shell.tree import PanelTree
@@ -451,6 +453,8 @@ class BlueprintEditorTab(QWidget):
         self._sticky = {}              # the last slot's type/registry, for the next one
         self._tree_items = {}          # slot path -> its row in the schema tree
         self._picker = None            # the open suggestion popup, kept alive
+        # Per tab, per §9.3.3 — global undo would reverse something you cannot see.
+        self._undo = UndoStack(store._db, [BindingEngine(store)])
         self._picker_cell = None       # (row, column) it is attached to, if any
         # Candidate templates (design 5.3) live in the View's renderer_config — a
         # recommendation is a knob on the renderer, never part of the blueprint (§5.3 Part
@@ -1151,6 +1155,11 @@ class BlueprintEditorTab(QWidget):
             return
         instance = self._instances[row].name
         slot = self._slots[column]
+        key = (self.blueprint_name, instance, slot.path)
+        # Read before writing: the cell's whole prior STATE, owner included, is what undo
+        # has to put back (design 9.3.3). Recorded only after the store accepts the write,
+        # so a refused bind never leaves a phantom entry on the stack.
+        prior = self._undo.capture("binding", key)
         try:
             if text:
                 self._store.bind(self.blueprint_name, instance, slot.path, text,
@@ -1159,9 +1168,45 @@ class BlueprintEditorTab(QWidget):
                 self._store.unbind(self.blueprint_name, instance, slot.path)
         except BlueprintError as e:
             QMessageBox.warning(self, "Can't bind", str(e))
+        else:
+            after = self._undo.capture("binding", key)
+            if after != prior:
+                self._undo.push(Batch(f"{instance}.{slot.path}",
+                                      [Edit("binding", key, prior, after)]))
         self.reload()
         self.changed.emit()
         self._keep_cell(row, column)
+
+    # --- undo (design 9.3.3) -----------------------------------------------
+    #
+    # The tab owns the stack, which is what "per tab" means: Ctrl+Z here reverses what was
+    # typed here. `MainWindow._move_history` finds these by duck-typing the focused tab, so
+    # the registry table and this one answer the same two method names without either
+    # knowing about the other.
+
+    def undo(self):
+        self._after_move(self._undo.undo())
+
+    def redo(self):
+        self._after_move(self._undo.redo())
+
+    def _after_move(self, batch):
+        if batch is None:
+            return
+        self.reload()
+        self.changed.emit()
+        # Put the cursor on what just changed. An undo you cannot see is indistinguishable
+        # from one that did nothing, which is how the whole feature gets mistrusted.
+        first = batch.edits[0]
+        self.focus_cell(first.key[1], first.key[2])
+
+    def focus_cell(self, instance, slot_path) -> bool:
+        rows = {name.name: i for i, name in enumerate(self._instances)}
+        columns = {slot.path: i for i, slot in enumerate(self._slots)}
+        if instance not in rows or slot_path not in columns:
+            return False
+        self._grid.setCurrentCell(rows[instance], columns[slot_path])
+        return True
 
     def _forget_picker(self, picker):
         """Drop the tab's reference when a picker retires, so nothing later asks a dead
@@ -1387,10 +1432,18 @@ class BlueprintEditorTab(QWidget):
                          f"{', '.join(impact.bound[:8])}.\n\nEvery one of them becomes "
                          f"ORPHANED and locked out of actions until you resolve it in the "
                          f"Errors panel. Their data is kept until then.\n\n")
-            answer = QMessageBox.question(
-                self, "Remove slot", f"Remove '{path}'?\n\n{body}{breakage}",
-                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
-            if answer != QMessageBox.Yes:
+            # Only the destructive case gets the recovery note. A slot nothing is bound to
+            # is removed silently by 3.2.2 and takes no snapshot, so promising one would be
+            # a lie — and warning about data loss where there is none trains people to
+            # click through the warning that matters.
+            if impact.destructive:
+                if not confirm_destructive(
+                        self, "Remove slot", f"Remove '{path}'?\n\n{body}{breakage}",
+                        self._store.db_path, ok="Remove slot"):
+                    return
+            elif QMessageBox.question(
+                    self, "Remove slot", f"Remove '{path}'?\n\n{body}{breakage}",
+                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
                 return
         self._guarded(lambda: self._store.remove_slot(self.blueprint_name, path))
 
@@ -1447,6 +1500,10 @@ class BlueprintEditorTab(QWidget):
                 coerce_button = None
             orphan_button = box.addButton("Retype && Orphan", QMessageBox.DestructiveRole)
             box.addButton(QMessageBox.Cancel)
+            # Three outcomes, so `confirm_destructive` does not fit — but the standing note
+            # is the same, and it applies to the auto-coerce branch too: converting cleanly
+            # still rewrites every binding, and undo does not reach schema (9.3.3).
+            box.setInformativeText(recovery_note(self._store.db_path))
             box.exec()
             clicked = box.clickedButton()
             if clicked is None or clicked not in (coerce_button, orphan_button):
@@ -1514,10 +1571,11 @@ class BlueprintEditorTab(QWidget):
                                                           name))
 
     def _delete_instance(self, instance):
-        if QMessageBox.question(
+        bound = len(self._store.bindings(self.blueprint_name, instance))
+        if not confirm_destructive(
                 self, "Delete instance",
-                f"Delete '{self.blueprint_name}:{instance}' and all its bindings?",
-                QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
+                f"Delete '{self.blueprint_name}:{instance}' and its {bound} binding(s)?",
+                self._store.db_path, ok="Delete instance"):
             return
         self._guarded(lambda: self._store.delete_instance(self.blueprint_name, instance))
 

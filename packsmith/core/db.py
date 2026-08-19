@@ -92,6 +92,12 @@ class UserDB:
     def backups(self) -> list[dict]:
         return backup.list_backups(self._path)
 
+    @property
+    def path(self) -> Path:
+        """Where this database lives. Read-only, and public because the GUI has to name the
+        backups folder beside it when warning that something is not undoable (design 9.3.3)."""
+        return self._path
+
     def _has_data(self) -> bool:
         """Whether losing this database would lose anything. Cheap on purpose: `EXISTS`
         stops at the first row rather than counting a registry's worth of them."""

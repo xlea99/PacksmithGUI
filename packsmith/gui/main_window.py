@@ -64,6 +64,7 @@ from packsmith.gui.queries import blueprint_query, browse_query, tag_query
 from packsmith.gui.query_constructor import QueryConstructorDialog
 from packsmith.core import reports
 from packsmith.core.history import rollback_step
+from packsmith.gui.confirm import confirm_destructive
 from packsmith.gui.action_page import ActionPageTab
 from packsmith.gui.run_report import RunReportTab
 from packsmith.gui.encyclopedia import EncyclopediaTab
@@ -801,11 +802,11 @@ class MainWindow(QMainWindow):
 
     def _delete_blueprint(self, name):
         instances = len(self._blueprints.instances(name))
-        if QMessageBox.question(
+        if not confirm_destructive(
                 self, "Delete blueprint",
                 f"Delete the blueprint '{name}'?\n\nThis removes its shape and all "
                 f"{instances} instance(s) with their bindings.",
-                QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
+                self._db.path, ok="Delete blueprint"):
             return
         views = [v for v in self._views.all()
                  if isinstance(getattr(v.query, "scope", None), QueryBlueprint)
@@ -845,10 +846,11 @@ class MainWindow(QMainWindow):
             lambda: self._blueprints.rename_instance(blueprint, instance, name.strip()))
 
     def _delete_instance(self, blueprint, instance):
-        if QMessageBox.question(
+        bound = len(self._blueprints.bindings(blueprint, instance))
+        if not confirm_destructive(
                 self, "Delete instance",
-                f"Delete '{blueprint}:{instance}' and all its bindings?",
-                QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
+                f"Delete '{blueprint}:{instance}' and its {bound} binding(s)?",
+                self._db.path, ok="Delete instance"):
             return
         self._blueprint_op(
             lambda: self._blueprints.delete_instance(blueprint, instance))
@@ -2957,11 +2959,10 @@ class MainWindow(QMainWindow):
             registry_type, filters=[{"tag": tag_name, "op": "exists"}])
         detail = (f"\n\n{len(assigned)} assignment(s) will be permanently deleted."
                   if assigned else "\n\nIt has no assignments.")
-        confirm = QMessageBox.question(
-            self, "Delete Tag",
-            f"Delete the tag '{tag_name}' on {registry_type}?{detail}",
-            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
-        if confirm != QMessageBox.Yes:
+        if not confirm_destructive(
+                self, "Delete Tag",
+                f"Delete the tag '{tag_name}' on {registry_type}?{detail}",
+                self._db.path, ok="Delete tag"):
             return
         self._tags.undefine(registry_type, tag_name)
         self._tags_panel.refresh()
@@ -2973,6 +2974,19 @@ class MainWindow(QMainWindow):
 
     def _active_model(self):
         return self._tab_models.get(self._workspace.current_widget())
+
+    def _active_history(self):
+        """Whatever the focused tab undoes into (design 9.3.3's per-tab scope).
+
+        A registry tab keeps its stack on the model behind it; a blueprint tab owns one
+        directly. Duck-typed rather than registered, because the contract is two method
+        names and a registry would be a second place to forget to add a tab to.
+        """
+        model = self._active_model()
+        if model is not None:
+            return model
+        current = self._workspace.current_widget()
+        return current if hasattr(current, "undo") and hasattr(current, "redo") else None
 
     def _undo(self):
         self._move_history("undo")
@@ -2989,11 +3003,11 @@ class MainWindow(QMainWindow):
         the user. The stack survives a refusal, so saying why is enough: fix the cause and
         the edit is still there to undo.
         """
-        model = self._active_model()
-        if model is None:
+        target = self._active_history()
+        if target is None:
             return
         try:
-            getattr(model, direction)()
+            getattr(target, direction)()
         except UndoBlocked as blocked:
             self._set_status(f"Can't {direction}: {blocked.reason}")
             log.warning("%s refused: %s", direction, blocked.reason)

@@ -1,11 +1,34 @@
+"""The registry table's edit commands, over the shared undo core (design 9.3.3).
+
+This file used to *be* the undo system — a stack, a staleness story, and bulk-write
+grouping, all tag-specific. §5.1 specified it that way and §9.3.3 superseded that: an undo
+stack living inside one view implies a second one inside the next view, and with it a second
+reversal and a second chance to omit the staleness check.
+
+So the machinery moved to `packsmith.core.undo` and what remains here is the adapter: the
+command objects the table already speaks in, translated into engine-agnostic `Edit`s. The
+behaviour this file fought for is preserved, and now applies to blueprints too:
+
+* `prior` is the cell's whole prior **state**, never just its value (§3.2.1's pristine vs.
+  explicit-default distinction, and ownership).
+* A refused move leaves both stacks untouched.
+* A batch is one transaction, so a refusal cannot half-revert a selection.
+
+What is genuinely new is that a move now refuses when something *else* has written the cell
+since, rather than silently overwriting it.
+"""
 from dataclasses import dataclass, field
+
+from packsmith.core.undo import (       # noqa: F401  (re-exported for existing importers)
+    Batch, Edit, TagEngine, UndoBlocked, UndoStack, state_of,
+)
 
 
 @dataclass
 class TagEditCommand:
     """A single tag edit that can be done and undone.
 
-    ``prior`` is the cell's whole previous **state** — a ``tags.Assignment`` or None for
+    ``prior`` is the cell's whole previous state — a ``tags.Assignment`` or None for
     pristine — not just its previous value. Two reasons, both learned the hard way:
 
     * A pristine cell on a defaulted tag reads back as the default through ``get_tag``, so
@@ -16,9 +39,6 @@ class TagEditCommand:
       to give it back to that action, `action_ref` and all; restoring the value alone
       quietly launders it into a user decision and changes what conflict policy will do on
       the next run.
-
-    This mirrors what ``L2Staging.inverse`` already captures for action rollback — the
-    runner had it right; the edit stack didn't.
     """
     registry_type: str
     entry_id: str
@@ -26,144 +46,73 @@ class TagEditCommand:
     prior: object      # tags.Assignment, or None when the cell was pristine
     new_value: object  # None means "unset it"
 
-    def apply(self, tag_store):
-        if self.new_value is None:
-            tag_store.unassign(self.registry_type, self.entry_id, self.tag_name)
-        else:
-            # A GUI edit is the user speaking, so it lands user-owned — taking the cell from
-            # an action if one held it, which is the "loud transfer" 3.2.1 describes.
-            tag_store.assign(self.registry_type, self.entry_id, self.tag_name,
-                             self.new_value, owner="user")
+    @property
+    def key(self):
+        return (self.registry_type, self.entry_id, self.tag_name)
 
-    def undo(self, tag_store):
-        if self.prior is None:
-            tag_store.unassign(self.registry_type, self.entry_id, self.tag_name)
-        else:
-            tag_store.assign(self.registry_type, self.entry_id, self.tag_name,
-                             self.prior.value, owner=self.prior.owner,
-                             owner_action_ref=self.prior.action_ref)
+    def edits(self):
+        # A GUI edit is the user speaking, so it lands user-owned — taking the cell from an
+        # action if one held it, which is the "loud transfer" 3.2.1 describes.
+        after = None if self.new_value is None else (self.new_value, "user", None)
+        return [Edit("tag", self.key, state_of(self.prior), after)]
+
+    @property
+    def label(self):
+        return f"{self.entry_id} · {self.tag_name}"
 
 
 @dataclass
 class BatchEditCommand:
     """A group of edits applied and undone as one atomic action."""
     label: str
-    edits: list[TagEditCommand] = field(default_factory=list)
+    edits_: list[TagEditCommand] = field(default_factory=list)
 
-    def apply(self, tag_store):
-        self._apply_bulk(tag_store, forward=True)
+    def __init__(self, label, edits=()):
+        self.label = label
+        self.edits_ = list(edits)
 
-    def undo(self, tag_store):
-        self._apply_bulk(tag_store, forward=False)
-
-    def _apply_bulk(self, tag_store, forward: bool):
-        """Bulk assign/unassign, grouped by everything that has to match.
-
-        Undo groups by **owner too**, not just value: a selection can span cells the user
-        owned and cells an action owned, and collapsing those into one `assign` would hand
-        the whole batch to whichever owner happened to sort first.
-        """
-        assigns = {}   # (registry_type, tag_name, value, owner, action_ref) -> [entry_id]
-        unassigns = {}  # (registry_type, tag_name) -> [entry_id, ...]
-
-        for edit in self.edits:
-            if forward:
-                value, owner, action_ref = edit.new_value, "user", None
-            elif edit.prior is None:
-                unassigns.setdefault((edit.registry_type, edit.tag_name), []).append(
-                    edit.entry_id)
-                continue
-            else:
-                value = edit.prior.value
-                owner, action_ref = edit.prior.owner, edit.prior.action_ref
-
-            if value is None:
-                unassigns.setdefault((edit.registry_type, edit.tag_name), []).append(
-                    edit.entry_id)
-            else:
-                key = (edit.registry_type, edit.tag_name, value, owner, action_ref)
-                assigns.setdefault(key, []).append(edit.entry_id)
-
-        for (reg, tag, val, owner, action_ref), ids in assigns.items():
-            tag_store.assign(reg, ids, tag, val, owner=owner,
-                             owner_action_ref=action_ref)
-        for (reg, tag), ids in unassigns.items():
-            tag_store.unassign(reg, ids, tag)
-
-
-class UndoBlocked(Exception):
-    """An undo (or redo) could not be applied, and the stack was left untouched.
-
-    The world moves under a stack: a tag gets undefined, an enum value is dropped from a
-    definition, and suddenly the state an old edit wants to restore is one the store will
-    refuse. That is not a bug to swallow — it is a real refusal with a real reason, and the
-    user can often fix the cause and try again. Carries `reason` for saying so out loud.
-    """
-
-    def __init__(self, reason, command):
-        super().__init__(reason)
-        self.reason = reason
-        self.command = command
+    def edits(self):
+        return [edit for command in self.edits_ for edit in command.edits()]
 
 
 class EditStack:
-    """Undo/redo stack for tag edits.
+    """Undo/redo for the registry table. A thin façade over `core.undo.UndoStack`.
 
-    Two invariants, both of which cost real data before they were invariants:
-
-    * **A command is never dropped by a failed move.** The stack is mutated only after the
-      store accepts the change. Popping first meant a refusal deleted the command from the
-      undo stack without ever landing it in redo — the edit became both un-undoable and
-      un-redoable, and the exception went on to escape into Qt's shortcut handler.
-    * **A move is all-or-nothing.** A batch is several writes; a refusal partway through
-      used to leave half the selection reverted and half not, with no record of which. One
-      transaction makes "it didn't work" mean the store is exactly as it was.
+    Kept as a distinct name because the table speaks in commands and the core speaks in
+    batches, and because `execute` *applies* an edit where the core only records one — the
+    table builds its commands before writing, the blueprint editor writes first and records
+    after. Both are legitimate; the difference is one method, not one system.
     """
 
     def __init__(self, tag_store):
         self._tag_store = tag_store
-        self._undo_stack: list[TagEditCommand | BatchEditCommand] = []
-        self._redo_stack: list[TagEditCommand | BatchEditCommand] = []
+        self._engine = TagEngine(tag_store)
+        self._stack = UndoStack(tag_store._db, [self._engine])
 
-    def execute(self, command: TagEditCommand | BatchEditCommand):
-        self._attempt(command.apply, command)
-        self._undo_stack.append(command)
-        self._redo_stack.clear()
+    def execute(self, command):
+        batch = Batch(command.label, command.edits())
+        # Written through the same path a reversal takes, so "apply" and "undo" cannot
+        # disagree about what a state means — and so a bulk edit gets the grouped writes.
+        self._apply(batch, "after")
+        self._stack.push(batch)
 
     def undo(self) -> bool:
-        if not self._undo_stack:
-            return False
-        command = self._undo_stack[-1]
-        self._attempt(command.undo, command)
-        self._undo_stack.pop()
-        self._redo_stack.append(command)
-        return True
+        return self._stack.undo() is not None
 
     def redo(self) -> bool:
-        if not self._redo_stack:
-            return False
-        command = self._redo_stack[-1]
-        self._attempt(command.apply, command)
-        self._redo_stack.pop()
-        self._undo_stack.append(command)
-        return True
+        return self._stack.redo() is not None
 
-    def _attempt(self, move, command):
-        """Run one move inside a transaction, or leave the store and the stack alone."""
+    def _apply(self, batch, target):
         try:
             with self._tag_store._db.transaction():
-                move(self._tag_store)
-        except UndoBlocked:
-            raise
+                self._engine.restore([(e.key, getattr(e, target)) for e in batch.edits])
         except (ValueError, KeyError) as e:
-            # What the tag store raises when the world no longer permits the write: the
-            # tag was undefined, or the value is no longer one the definition allows.
-            raise UndoBlocked(str(e), command) from e
+            raise UndoBlocked(str(e), batch) from e
 
     @property
     def can_undo(self) -> bool:
-        return len(self._undo_stack) > 0
+        return self._stack.can_undo
 
     @property
     def can_redo(self) -> bool:
-        return len(self._redo_stack) > 0
+        return self._stack.can_redo
