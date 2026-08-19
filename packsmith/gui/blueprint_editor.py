@@ -136,10 +136,23 @@ class _TemplateBar(QWidget):
         lay.setContentsMargins(8, 0, 8, 5)
         lay.setSpacing(6)
 
-        label = QLabel("Suggest")
-        label.setStyleSheet(f"color: {style.TEXT_MUTED}; font-size: 11px;")
-        label.setToolTip("What to offer when filling an empty cell")
-        lay.addWidget(label)
+        # A checkbox rather than a label, because the template is the thing being switched
+        # off. Some genuine answers no template can find — `stoneworks:alexc_galena_cut_brick`
+        # is galena's cut-brick and nothing about its id says so — and §5.3's whole premise
+        # is that the human decides. Narrowing that a human cannot escape is a worse tool
+        # than one that suggests nothing.
+        self.enabled = QCheckBox("Suggest")
+        self.enabled.setChecked(True)
+        self.enabled.setStyleSheet(
+            f"QCheckBox {{ color: {style.TEXT_MUTED}; font-size: 11px; }}")
+        self.enabled.setToolTip(
+            "What to offer when filling an empty cell.\n\n"
+            "Uncheck to offer the whole registry instead, for the rare cell whose real "
+            "answer no template can reach. Not saved with the view — it is an escape "
+            "hatch, not a setting.")
+        self.enabled.toggled.connect(self._input_enabled)
+        self.enabled.toggled.connect(lambda _on: self.changed.emit())
+        lay.addWidget(self.enabled)
 
         self._input = QLineEdit()
         self._input.setPlaceholderText("@b:base_block @slot")
@@ -168,6 +181,14 @@ class _TemplateBar(QWidget):
         self._status.setStyleSheet(f"color: {style.TEXT_FAINT}; font-size: 11px;")
         self._status.setMinimumWidth(190)
         lay.addWidget(self._status)
+
+    def _input_enabled(self, on):
+        """Grey the template out when it is inert, so an unchecked box cannot be mistaken
+        for a template that has stopped working."""
+        self._input.setEnabled(on)
+
+    def suggesting(self) -> bool:
+        return self.enabled.isChecked()
 
     def text(self) -> str:
         return self._input.text().strip()
@@ -473,12 +494,15 @@ class BlueprintEditorTab(QWidget):
         # 21 columns; being able to fold away the three cuts you aren't working on is the
         # difference between a usable table and a horizontal scroll marathon.
         self._follow_tree = QCheckBox("Hide collapsed groups")
+        # Restored before it is wired, so setting it does not immediately write it back.
+        self._follow_tree.setChecked(bool(config.get("follow_tree", False)))
         self._follow_tree.setToolTip(
             "Columns follow the tree: collapse a group on the left and its slots leave "
             "the grid.")
         self._follow_tree.setStyleSheet(
             f"QCheckBox {{ color: {style.TEXT_MUTED}; font-size: 11px; }}")
         self._follow_tree.toggled.connect(self._apply_column_visibility)
+        self._follow_tree.toggled.connect(lambda *_: self.save_config())
         bar_lay.addSpacing(8)
         bar_lay.addWidget(self._follow_tree)
 
@@ -538,6 +562,16 @@ class BlueprintEditorTab(QWidget):
         split.addWidget(self._tree)
 
         self._grid = _InstanceGrid(self)
+        # Dragging a column is the user arranging the view, and it has to outlive
+        # the tab. Widths were only ever captured during a REBUILD, so a drag with
+        # no subsequent edit was lost — and coalesced through a timer because a
+        # drag emits one signal per pixel.
+        self._width_timer = QTimer(self)
+        self._width_timer.setSingleShot(True)
+        self._width_timer.setInterval(400)
+        self._width_timer.timeout.connect(self._remember_widths)
+        self._grid.horizontalHeader().sectionResized.connect(
+            lambda *_: None if self._loading else self._width_timer.start())
         # LIST_QSS only targets QTreeWidget/QListWidget, so a table styled with it falls
         # back to the app palette and drifts from the panels beside it. Spell it out.
         self._grid.setStyleSheet(f"""
@@ -552,6 +586,12 @@ class BlueprintEditorTab(QWidget):
         self._grid.setSelectionMode(QAbstractItemView.SingleSelection)
         self._grid.setContextMenuPolicy(Qt.CustomContextMenu)
         self._grid.customContextMenuRequested.connect(self._on_instance_menu)
+        # The instance names are the vertical HEADER, which is its own widget — the grid's
+        # policy above stops at the viewport, so right-clicking the name (the obvious place
+        # to act on an instance) reached nothing at all.
+        row_names = self._grid.verticalHeader()
+        row_names.setContextMenuPolicy(Qt.CustomContextMenu)
+        row_names.customContextMenuRequested.connect(self._on_row_menu)
         self._grid.setItemDelegate(_SlotDelegate(self))
         self._grid.currentCellChanged.connect(self._on_cell_changed)
         self._grid.cellDoubleClicked.connect(self._maybe_claim)
@@ -718,6 +758,8 @@ class BlueprintEditorTab(QWidget):
         in the pack while looking like it worked.
         """
         everything = self.registry_entries(slot.registry_type)
+        if not self._template_bar.suggesting():
+            return everything, f"suggestions off — all {len(everything):,} in {slot.registry_type}"
         text = self.template_for(slot.path)
         if not text or self._dump is None or row >= len(self._instances):
             return everything, f"{len(everything):,} in {slot.registry_type}"
@@ -771,6 +813,11 @@ class BlueprintEditorTab(QWidget):
         slot = self.slot_for_column(column)
         if slot is None or row < 0:
             return
+        if not self._template_bar.suggesting() and slot.type == "registry":
+            # Checked before the template, or a column that opted out would report "suggests
+            # everything (opted out)" while the box above it is what is actually doing that.
+            self._template_bar.report(self.candidates_for(row, slot)[1])
+            return
         text = self.template_for(slot.path)
         if not text:
             self._template_bar.report(
@@ -808,6 +855,18 @@ class BlueprintEditorTab(QWidget):
                 return True
         return False
 
+    def _remember_widths(self):
+        """Capture what the header currently shows, then persist it.
+
+        Keyed by slot PATH rather than column index, so a width survives slots being added,
+        removed or reordered — the same reason `_build_grid` carries them across a rebuild.
+        """
+        for column in range(self._grid.columnCount()):
+            header = self._grid.horizontalHeaderItem(column)
+            if header is not None and not self._grid.isColumnHidden(column):
+                self._column_widths[header.text()] = self._grid.columnWidth(column)
+        self.save_config()
+
     def renderer_config(self) -> dict:
         """Everything about *how this view is rendered*, as opposed to what it selects.
 
@@ -824,6 +883,11 @@ class BlueprintEditorTab(QWidget):
             config["collapsed"] = sorted(self._collapsed)
         if self._column_widths:
             config["column_widths"] = dict(self._column_widths)
+        # Written even when False, unlike everything above it: the others are absent-means-
+        # nothing, but a checkbox the user deliberately turned OFF has to survive as off,
+        # and `config.get("follow_tree", False)` cannot tell "never set" from "unset by me"
+        # if the key is omitted.
+        config["follow_tree"] = self._follow_tree.isChecked()
         return config
 
     def save_config(self):
@@ -952,10 +1016,12 @@ class BlueprintEditorTab(QWidget):
         self._grid.setVerticalHeaderLabels([i.name for i in self._instances])
 
         gap_brush = style.qt_colour(style.GAP)
+        # The whole rectangle in one query, rather than one lookup per row — each of
+        # which used to rebuild the blueprint's slot tree. See `all_bindings`.
+        every = self._store.all_bindings(self.blueprint_name)
         for row, instance in enumerate(self._instances):
             orphaned = instance.name in self._orphans
-            bound = {} if orphaned else self._store.bindings(
-                self.blueprint_name, instance.name)
+            bound = {} if orphaned else every.get(instance.name, {})
             for column, slot in enumerate(self._slots):
                 binding = bound.get(slot.path)
                 item = QTableWidgetItem(binding.value if binding else "")
@@ -990,7 +1056,7 @@ class BlueprintEditorTab(QWidget):
         self._grid.verticalHeader().setMinimumWidth(90)
 
         total = len(self._slots) * len(self._instances)
-        filled = sum(len(self._store.bindings(self.blueprint_name, i.name))
+        filled = sum(len(every.get(i.name, {}))
                      for i in self._instances if i.name not in self._orphans)
         instances = len(self._instances)
         self._summary.setText(
@@ -1402,17 +1468,43 @@ class BlueprintEditorTab(QWidget):
         row = self._grid.rowAt(pos.y())
         if row < 0 or row >= len(self._instances):
             return
-        instance = self._instances[row].name
-        menu = QMenu(self)
         column = self._grid.columnAt(pos.x())
         slot = self.slot_for_column(column)
-        if slot is not None and slot.type == "registry":
-            menu.addAction("Suggestions…",
-                           lambda: self.show_suggestions(row, column))
+        cell = (row, column) if slot is not None and slot.type == "registry" else None
+        self._popup(self._instance_menu(row, cell),
+                    self._grid.viewport().mapToGlobal(pos))
+
+    def _on_row_menu(self, pos):
+        """The same menu, off the instance's own name.
+
+        Selecting the row first: acting on a row you did not visibly select is how you
+        delete the wrong one, and a header click alone does not move the grid's selection.
+        """
+        header = self._grid.verticalHeader()
+        row = header.logicalIndexAt(pos)
+        if row < 0 or row >= len(self._instances):
+            return
+        # `selectRow` selects nothing on a SingleSelection/SelectItems grid, so move the
+        # current cell instead — that is what actually highlights.
+        self._grid.setCurrentCell(row, max(self._grid.currentColumn(), 0))
+        self._popup(self._instance_menu(row), header.mapToGlobal(pos))
+
+    def _popup(self, menu, where):
+        """The blocking call, alone in a method — everything worth testing about a context
+        menu happens before it, and `exec` never returns until someone clicks."""
+        menu.exec(where)
+
+    def _instance_menu(self, row, cell=None) -> QMenu:
+        """Everything you can do to one instance. `cell` adds the per-cell entry, which the
+        name column has no meaningful answer for."""
+        instance = self._instances[row].name
+        menu = QMenu(self)
+        if cell is not None:
+            menu.addAction("Suggestions…", lambda: self.show_suggestions(*cell))
             menu.addSeparator()
         menu.addAction("Rename instance…", lambda: self._rename_instance(instance))
         menu.addAction("Delete instance…", lambda: self._delete_instance(instance))
-        menu.exec(self._grid.mapToGlobal(pos))
+        return menu
 
     def _rename_instance(self, instance):
         name, ok = _ask(self, "Rename Instance", "New name", instance)

@@ -125,3 +125,148 @@ def test_a_many_binding_keeps_its_stored_order(world):
     bound = [binding_id(slot, f"StoneType:{n}", blueprint_store=bps)
              for n in ("granite", "andesite")]          # NOT alphabetical
     assert _round_trip(_manifest(stones=slot), {"stones": bound}, tags, bps)["stones"] == bound
+
+
+# --- a suggestion is not a selection --------------------------------------------------
+#
+# A combo box always has a current row; there is no empty state. So a picker the user has
+# never touched looks exactly like a deliberate choice — and the step it belongs to reads
+# as bound when its binding is empty. Two halves: say so visually, and let the obvious
+# gesture commit it.
+
+def _pack_combo(qapp, stored=None):
+    from packsmith.core.packages import ActionManifest, MappingSlot
+    from packsmith.gui.job_editor import StepForm
+    from packsmith.core.jobs import JobStep
+
+    slot = MappingSlot(name="out", kind="pack", pack_kind="resourcepacks", access="write")
+    manifest = ActionManifest(package_name="p", action_id="a", file="a.star",
+                              function="run", mappings={"out": slot})
+
+    class Targets:
+        def available(self, kind):
+            return ["auto_lang_overrides", "tweaks_bakery"]
+
+    step = JobStep(id=1, job_id=1, position=0, kind="action", action_ref="p:a",
+                   bindings={"out": stored} if stored else {})
+    form = StepForm(manifest, None, step, packdump=None, pack_targets=Targets())
+    return form, form._mapping_widgets["out"]
+
+
+def test_an_unchosen_picker_shows_its_suggestion_dimmed(qapp):
+    """It still shows a row — a combo has no empty state — but says it is a recommendation
+    rather than a decision."""
+    _form, combo = _pack_combo(qapp)
+    assert combo.currentText() == "auto_lang_overrides"
+    assert combo.property("unconfirmed") is True
+
+
+def test_a_stored_binding_is_not_dimmed(qapp):
+    _form, combo = _pack_combo(qapp, stored="tweaks_bakery")
+    assert combo.currentText() == "tweaks_bakery"
+    assert combo.property("unconfirmed") is False
+
+
+def test_choosing_the_row_already_shown_still_commits(qapp):
+    """The reported jank. `currentIndexChanged` never fires for the row that is already
+    current, so picking the very item the app suggested — the one you most want — emitted
+    nothing, and you had to select something else and come back."""
+    form, combo = _pack_combo(qapp)
+    commits = []
+    form.committed.connect(lambda: commits.append(True))   # a Signal, so connect to it
+
+    combo.activated.emit(combo.currentIndex())      # what clicking that row does
+
+    assert commits, "picking the already-current row has to write the binding through"
+    assert combo.property("unconfirmed") is False
+    assert form.read()[0]["out"] == "auto_lang_overrides"
+
+
+def test_the_index_changing_still_commits_as_before(qapp):
+    """Guards the addition: `activated` is an extra door, not a replacement. Choosing a
+    different row must not have quietly stopped working."""
+    form, combo = _pack_combo(qapp)
+    commits = []
+    form.committed.connect(lambda: commits.append(True))
+
+    combo.setCurrentIndex(1)
+
+    assert commits
+
+
+# --- required vs optional, said out loud ----------------------------------------------
+#
+# Optionality was only ever visible when a step refused to run. Required-and-unbound now
+# wears a red asterisk; optional says so in italic. The asterisk clears the moment the slot
+# is satisfied, because a form that shouts at a finished field shouts at nothing.
+
+def _form_with(qapp, required_bound=None):
+    from packsmith.core.jobs import JobStep
+    from packsmith.core.packages import ActionManifest, MappingSlot
+    from packsmith.gui.job_editor import StepForm
+
+    class Tags:
+        def definitions_for(self, registry_type):
+            return {"remove": {"type": "bool"}, "queued": {"type": "bool"}}
+        def definition(self, registry_type, name):
+            return {"id": 1, "type": "bool"}
+
+    manifest = ActionManifest(
+        package_name="p", action_id="a", file="a.star", function="run",
+        mappings={
+            "must": MappingSlot(name="must", kind="tag", tag_type="bool",
+                                registry_type="minecraft:item", required=True),
+            "may": MappingSlot(name="may", kind="tag", tag_type="bool",
+                               registry_type="minecraft:item", required=False),
+        })
+    step = JobStep(id=1, job_id=1, position=0, kind="action", action_ref="p:a",
+                   bindings={"must": required_bound} if required_bound else {})
+    return StepForm(manifest, Tags(), step, packdump=None)
+
+
+def _label_text(form, name):
+    return form._labels[name][0].text()
+
+
+def test_an_unbound_required_slot_wears_a_red_asterisk(qapp):
+    form = _form_with(qapp)
+    assert "*" in _label_text(form, "must")
+    assert "color:" in _label_text(form, "must"), "and it is coloured, not just punctuation"
+
+
+def test_an_optional_slot_says_so_quietly(qapp):
+    form = _form_with(qapp)
+    text = _label_text(form, "may")
+    assert "(optional)" in text and "<i>" in text
+    assert "*" not in text
+
+
+def test_the_asterisk_clears_once_the_slot_is_satisfied(qapp):
+    """Otherwise the form keeps demanding something you already gave it."""
+    form = _form_with(qapp)
+    assert "*" in _label_text(form, "must")
+
+    combo = form._mapping_widgets["must"]
+    # Driven the way a user does: Qt emits `activated` for any pick, which is what marks
+    # the value as chosen rather than suggested. A programmatic index change deliberately
+    # does NOT, or restoring a form would count as choosing.
+    combo.setCurrentIndex(combo.count() - 1)
+    combo.activated.emit(combo.currentIndex())
+
+    assert "*" not in _label_text(form, "must")
+
+
+def test_the_refusal_says_what_would_satisfy_it(qapp):
+    """`required mapping 'x' is unbound` reaches the user as the Jobs panel's "won't run"
+    and as the pre-flight refusal, where it has to stand alone."""
+    from packsmith.core.bindings import resolve_step
+    from packsmith.core.packages import ActionManifest, MappingSlot
+
+    slot = MappingSlot(name="must", kind="tag", tag_type="bool",
+                       registry_type="minecraft:item", required=True)
+    manifest = ActionManifest(package_name="p", action_id="a", file="a.star",
+                              function="run", mappings={"must": slot})
+    with pytest.raises(ValueError) as caught:
+        resolve_step(manifest, bindings={}, config={}, tag_store=None)
+
+    assert "bool tag on minecraft:item" in str(caught.value)

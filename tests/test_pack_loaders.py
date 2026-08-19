@@ -20,7 +20,7 @@ import os
 import pytest
 
 from packsmith.core.capabilities import (
-    DATAPACKS_ORDERING, DATAPACKS_READ, DATAPACKS_WRITE, CapabilityError,
+    DATAPACKS_ORDERING, DATAPACKS_READ, DATAPACKS_WRITE, CapabilityError, PackTargets,
     RESOURCEPACKS_ORDERING, RESOURCEPACKS_WRITE, resolve)
 from packsmith.integrations import PACK_LOADERS
 from packsmith.integrations.globalpacks import GlobalPacksProvider
@@ -325,3 +325,106 @@ def test_a_loader_switched_off_does_not_win_on_breadth(tmp_path):
     table = resolve(Dump("moonlight", "openloader"), loaders=PACK_LOADERS,
                     instance_root=tmp_path)
     assert table.entries[DATAPACKS_WRITE].provider == "Open Loader"
+
+
+class _Dump:
+    """Every supported loader present, as far as detection is concerned."""
+    mods = {"paxi": {}, "openloader": {}, "moonlight": {}, "globalpacks": {}}
+    registry = {}
+
+    def attribute(self, *a):
+        return None
+
+
+# --- enabled / disabled packs (design 8.1) --------------------------------------------
+#
+# Minecraft decides whether a folder is a pack by whether it holds a `pack.mcmeta`, and a
+# folder without one is not loaded *and not complained about*. That makes the file a
+# switch — and it made a hole: `packs()` listed any directory, so a pack with its manifest
+# renamed away still passed the write guard, and an action wrote into a folder the game
+# does not read. The run reported success and nothing happened in game.
+
+@pytest.mark.parametrize("kind", ["datapacks", "resourcepacks"])
+def test_a_pack_with_no_manifest_is_not_enabled(tmp_path, kind):
+    paxi = PaxiProvider()
+    paxi.create_pack(tmp_path, "live", kind=kind)
+    assert paxi.is_enabled(tmp_path, "live", kind)
+
+    paxi.disable(tmp_path, "live", kind)
+    assert not paxi.is_enabled(tmp_path, "live", kind)
+
+    paxi.enable(tmp_path, "live", kind)
+    assert paxi.is_enabled(tmp_path, "live", kind)
+
+
+def test_disabling_leaves_the_folder_name_alone(tmp_path):
+    """The whole reason it is the MANIFEST that gets renamed. A pack's identity is its
+    directory name (§3.3 — the one binding that stores a name rather than an id), so
+    renaming the folder would break every job step bound to it."""
+    paxi = PaxiProvider()
+    folder = paxi.create_pack(tmp_path, "tweaks", kind="datapacks")
+    (folder / "data" / "minecraft").mkdir(parents=True)
+
+    paxi.disable(tmp_path, "tweaks", "datapacks")
+
+    assert folder.is_dir(), "the pack itself must not move"
+    assert (folder / "data" / "minecraft").is_dir(), "and neither must its contents"
+    assert (folder / "pack.mcmeta.DISABLED").is_file()
+    assert "tweaks" in paxi.packs(tmp_path, "datapacks"), "still installed, just off"
+
+
+def test_disabling_twice_is_harmless(tmp_path):
+    paxi = PaxiProvider()
+    paxi.create_pack(tmp_path, "tweaks")
+    paxi.disable(tmp_path, "tweaks")
+    paxi.disable(tmp_path, "tweaks")
+    assert not paxi.is_enabled(tmp_path, "tweaks")
+    paxi.enable(tmp_path, "tweaks")
+    paxi.enable(tmp_path, "tweaks")
+    assert paxi.is_enabled(tmp_path, "tweaks")
+
+
+def test_a_zip_pack_refuses_rather_than_renaming_the_archive(tmp_path):
+    """Renaming the archive WOULD switch it off — and would change the pack's name, which
+    is its identity. Refusing names the reason instead."""
+    paxi = PaxiProvider()
+    root = paxi.datapack_root(tmp_path)
+    root.mkdir(parents=True)
+    (root / "vendored.zip").write_bytes(b"PK\x03\x04")
+
+    assert paxi.is_enabled(tmp_path, "vendored.zip"), "a zip carries its manifest inside"
+    with pytest.raises(CapabilityError, match="zip"):
+        paxi.disable(tmp_path, "vendored.zip")
+
+
+def test_disabling_something_that_is_not_there_says_so(tmp_path):
+    paxi = PaxiProvider()
+    paxi.datapack_root(tmp_path).mkdir(parents=True)
+    with pytest.raises(CapabilityError, match="no pack called"):
+        paxi.disable(tmp_path, "imaginary")
+
+
+@pytest.mark.parametrize("loader", [PaxiProvider, OpenLoaderProvider, MoonlightProvider,
+                                    GlobalPacksProvider])
+def test_every_loader_can_switch_a_pack_off(tmp_path, loader):
+    """The lever lives on the base class because it is identical for all four — only the
+    directory differs."""
+    provider = loader()
+    provider.create_pack(tmp_path, "tweaks")
+    provider.disable(tmp_path, "tweaks")
+    assert not provider.is_enabled(tmp_path, "tweaks")
+
+
+def test_a_disabled_pack_is_installed_but_not_available(tmp_path):
+    """The distinction the pickers and the write guard both rest on: `available` is what
+    may be BOUND, `installed` is what a browser should show — hiding a disabled pack would
+    make switching it back on impossible."""
+    paxi = PaxiProvider()
+    for name in ("live", "spare"):
+        paxi.create_pack(tmp_path, name)
+    paxi.disable(tmp_path, "spare")
+    targets = PackTargets(resolve(_Dump(), loaders=(paxi,)), tmp_path)
+
+    assert targets.available("datapacks") == ["live"]
+    assert sorted(targets.installed("datapacks")) == ["live", "spare"]
+    assert targets.is_enabled("datapacks", "spare") is False

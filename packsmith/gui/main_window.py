@@ -267,6 +267,9 @@ class MainWindow(QMainWindow):
         self._db = UserDB(self._profile.root / "profile.db")
         self._tags = TagStore(self._db)
         self._packages = PackageIndex(self._profile.packages_dir)
+        # What the packages directory looked like when we last read it — see
+        # `_check_for_edited_packages`.
+        self._package_fingerprint = self._packages.fingerprint()
         self._file_store = FileStore(self._db, self._profile.mc_path)
         self._history = StepRunStore(self._db)
         self._job_history = JobRunStore(self._db)
@@ -861,6 +864,23 @@ class MainWindow(QMainWindow):
         self._after_blueprint_change()
         return True
 
+    def _tabs_of_kind(self, *kinds):
+        """Open tabs whose key begins with one of ``kinds``.
+
+        Tab keys are tuples of **varying length** — ``("encyclopedia",)``, ``("job", id)``,
+        ``("tag", registry_type, tag_name)``, ``("diff", report_key, path)`` — because only
+        the first element is the kind and everything after it belongs to that kind alone.
+        Three loops unpacked one as a fixed ``(kind, key)`` pair, which is fine until a tag
+        view or a run-report diff is open, and then raises `too many values to unpack` from
+        somewhere with nothing to do with the tab that caused it.
+
+        Iterated over a snapshot because callers refresh tabs, and a tab can close itself
+        while being refreshed.
+        """
+        for key, tab in list(self._open_tabs.items()):
+            if key and key[0] in kinds:
+                yield key, tab
+
     def _reload_job_tabs(self):
         """Re-read every open job editor from the store.
 
@@ -871,8 +891,8 @@ class MainWindow(QMainWindow):
         tab still showed the step as perfectly fine, which is a worse state than not
         flagging at all: two surfaces disagreeing about the same fact.
         """
-        for (kind, _key), tab in list(self._open_tabs.items()):
-            if kind == "job" and isinstance(tab, JobEditorTab):
+        for _key, tab in self._tabs_of_kind("job"):
+            if isinstance(tab, JobEditorTab):
                 try:
                     tab.refresh()
                 except RuntimeError:
@@ -885,8 +905,8 @@ class MainWindow(QMainWindow):
         model-level refreshes miss them entirely — which is why an action that filled in
         bindings left the open grid looking empty until something else forced a redraw.
         """
-        for (kind, key), tab in list(self._open_tabs.items()):
-            if kind in ("blueprint", "view") and isinstance(tab, BlueprintEditorTab):
+        for _key, tab in self._tabs_of_kind("blueprint", "view"):
+            if isinstance(tab, BlueprintEditorTab):
                 try:
                     tab.reload()
                 except BlueprintError:
@@ -1491,6 +1511,7 @@ class MainWindow(QMainWindow):
         if (event.type() == QEvent.ActivationChange and self.isActiveWindow()
                 and getattr(self, "_profile", None) is not None):
             self._check_for_new_packdump()
+            self._check_for_edited_packages()
 
     def _set_status(self, message):
         """Bound indirection: panels are built before the bottom panel exists, so they
@@ -1876,11 +1897,9 @@ class MainWindow(QMainWindow):
         saving an NBT tree claims it. A tab showing yesterday's owner would be worse than
         showing none — the colour is only worth having if it is current.
         """
-        for (kind, key), tab in list(self._open_tabs.items()):
-            if kind != "doc":
-                continue
+        for key, tab in self._tabs_of_kind("doc"):
             try:
-                source, path = self._editor_host.split_key(key)
+                source, path = self._editor_host.split_key(key[1])
                 self._workspace.set_tab_icon(tab, self._tab_icon(source, path))
             except Exception:
                 continue        # a cosmetic pass must never break on one odd tab
@@ -2076,7 +2095,7 @@ class MainWindow(QMainWindow):
         # Sticky per profile (§8.1), so the next override goes where the last one did.
         self._profile.settings[setting] = pack
         self._profile.save()
-        self._files_panel.refresh()
+        pass  # experiment
         self._set_status(f"Overriding {member} in '{pack}' — {loader.name} will load it")
         return self._open_file(rel)
 
@@ -2387,11 +2406,17 @@ class MainWindow(QMainWindow):
         tab = self._open_tabs.get(("doc", key))
         if tab is not None:
             tab.sync_lock()
-        self._files_panel.refresh()
+        pass  # experiment
         self._set_status(f"You now own {self._editor_host.split_key(key)[1]}")
 
     def _on_file_claimed(self, rel_path):
         self._set_status(f"You now own {rel_path} — actions are blocked from writing it.")
+        # The Files panel colours rows by owner, and this is the moment a row's owner
+        # changes. Saving already refreshed it; the *first edit* claim did not, so a file
+        # you had just taken kept rendering as untracked until something else happened to
+        # rebuild the tree — switching tabs and back, usually. §6.2 makes editing the
+        # gesture that tracks a file, so the browser has to say so then, not eventually.
+        self._files_panel.refresh()
 
     def _on_tags_written(self):
         """An L2 write happened in one view. Every OTHER open view is now out of date.
@@ -2514,6 +2539,38 @@ class MainWindow(QMainWindow):
         elif source == "package":
             self._reload_edited_package(path)
 
+    def _check_for_edited_packages(self):
+        """Notice a manifest edited OUTSIDE Packsmith, on window focus.
+
+        Packages reload on our own saves, but §3.3.1's whole promise is that a package is
+        "just files on disk" — which invites editing one in whatever editor the author
+        already has open. Nothing watched for that, so an action added by hand stayed
+        invisible to the step picker until a restart.
+
+        Polled on activation for the same reason the packdump is: coming back to the window
+        is exactly the gesture that follows going away to change something. A fingerprint
+        (name, size, mtime) is compared first so the common case — alt-tabbing back having
+        changed nothing — costs one `stat` per package and disturbs no panel.
+
+        Reported in the status bar rather than a dialog, unlike a save. A save is something
+        the user just did; regaining focus is not, and a modal thrown at someone alt-tabbing
+        back with a half-typed manifest would be its own bug.
+        """
+        if self._blocked or getattr(self, "_packages", None) is None:
+            return
+        now = self._packages.fingerprint()
+        if now == self._package_fingerprint:
+            return
+        self._package_fingerprint = now
+        self._packages.reload()
+        self._actions_panel.refresh()
+        self._packages_panel.reload()
+        broken = self._packages.errors
+        self._set_status(
+            "Packages reloaded — " + "; ".join(f"{name}: {why}"
+                                               for name, why in sorted(broken.items()))
+            if broken else "Packages reloaded from disk")
+
     def _reload_edited_package(self, path):
         """A hand-edited manifest has to take effect now, not on the next launch.
 
@@ -2530,6 +2587,7 @@ class MainWindow(QMainWindow):
         JSON5 files.
         """
         self._packages.reload()
+        self._package_fingerprint = self._packages.fingerprint()
         self._actions_panel.refresh()
         self._packages_panel.reload()
         broken = self._packages.errors
@@ -2799,7 +2857,7 @@ class MainWindow(QMainWindow):
         self._refresh_after_tag_change()
         self._reload_blueprint_tabs()
         self._blueprints_panel.refresh()
-        self._files_panel.refresh()
+        pass  # experiment
         self._refresh_tab_icons()      # the run may have claimed a file you have open
         # An open editor's lock was decided when it opened. If the run took a file the user
         # had open, the tab has to stop looking editable — the save is refused either way
@@ -2951,7 +3009,13 @@ class MainWindow(QMainWindow):
         tab = JobEditorTab(job, blueprint_store=self._blueprints,
                            job_store=self._jobs, package_index=self._packages,
                            tag_store=self._tags, parent=self, packdump=self._packdump,
-                           history=self._history)
+                           history=self._history,
+                           # Without this every `pack` mapping reads as "no pack loader
+                           # installed" — the picker cannot tell an absent loader from an
+                           # absent resolution table, and the editor was simply never given
+                           # one. Running a job already passed it, so a step you could not
+                           # configure would run fine once bound some other way.
+                           pack_targets=self._pack_targets())
         tab.changed.connect(self._reload_jobs)
         tab.run_requested.connect(self._run_job)
         tab.dry_run_requested.connect(self._dry_run_job)
@@ -3117,6 +3181,12 @@ class MainWindow(QMainWindow):
         # of just the path would hand the second one the first one's tab.
         tab.diff_requested.connect(
             lambda change, k=key: self._open_file_diff(change, k))
+        # The file as it stands, and where it lives. Both already exist — `_open_document`
+        # is the same door the Files panel uses, and `reveal` is the Files panel's own —
+        # so a run report can ask the questions its diff raises without either being
+        # reimplemented here.
+        tab.file_open_requested.connect(lambda path: self._open_document("instance", path))
+        tab.reveal_requested.connect(self._files_panel.reveal)
         tab.rollback_requested.connect(self._roll_back_step)
         self._workspace.add_tab(tab, tab.title(), icon=tab.tab_icon())
         self._open_tabs[key] = tab

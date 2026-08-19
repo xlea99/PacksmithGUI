@@ -213,6 +213,20 @@ def entry_exists(registry_type, entry_id, packdump) -> bool:
     return bool(registry) and entry_id in registry.get("values", ())
 
 
+def _wants(slot) -> str:
+    """What a slot needs, as a noun phrase — for a message that has to stand alone."""
+    if slot.kind == "pack":
+        return f"one of your {slot.pack_kind or 'packs'}"
+    if slot.kind in ("blueprint", "blueprint_instance"):
+        noun = "blueprint" if slot.kind == "blueprint" else "blueprint instance"
+        return f"a {noun}"
+    if slot.kind == "registry_entry":
+        return f"a {slot.registry_type or 'registry'} entry"
+    parts = [p for p in (slot.tag_type, "tag") if p]
+    wants = " ".join(parts)
+    return f"a {wants} on {slot.registry_type}" if slot.registry_type else f"a {wants}"
+
+
 def resolve_step(manifest, *, bindings: dict, config: dict, tag_store,
                  blueprint_store=None, packdump=None, pack_targets=None):
     """Validate a step's bindings + config against the manifest and return the
@@ -232,7 +246,12 @@ def resolve_step(manifest, *, bindings: dict, config: dict, tag_store,
         # 3.3 says required mappings block execution when unbound.
         if not chosen:
             if slot.required:
-                raise ValueError(f"required mapping '{name}' is unbound")
+                # Named, because this reaches the user twice — as the Jobs panel's "this
+                # won't run" and as the pre-flight refusal — and "unbound" alone does not
+                # say what would satisfy it.
+                raise ValueError(
+                    f"required mapping '{name}' is unbound — bind {_wants(slot)} to it "
+                    f"in the step editor")
             resolved_mappings[name] = [] if slot.cardinality == "many" else None
             continue
         if slot.cardinality == "one" and len(chosen) > 1:

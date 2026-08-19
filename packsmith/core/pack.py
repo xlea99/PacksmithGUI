@@ -12,7 +12,7 @@ point as its single argument.
 import json
 
 from packsmith.core.bindings import policy_key
-from packsmith.core.capabilities import CapabilityError
+from packsmith.core.capabilities import CapabilityError, PACK_MANIFEST
 
 try:
     import json5 as _json5
@@ -481,6 +481,36 @@ class _PackNamespace:
     def _noun(self):
         return "datapack" if self._kind == "datapacks" else "resource pack"
 
+    def owned(self, pack):
+        """Paths this action owns inside one pack — what it wrote on previous runs.
+
+        The answer to *"what did I write last time"*, which actions keep needing and which
+        Packsmith already records: `file_ownership` stamps every action write with its
+        `package:action_id`. Derived rather than remembered, for the reason §3.2.1 gives
+        for orphans and stale bindings — a record kept beside the truth goes stale, and a
+        derived one cannot.
+
+        **Scoped to a pack on purpose.** Ownership is per ACTION and cannot be otherwise
+        (see `FileStore.owned_by`), so an unscoped listing would hand a step every file the
+        same action wrote in *other* steps — and an action clearing "everything I own that
+        I did not write this run" would blank another step's output, silently. The pack is
+        what tells those steps apart, so it is a required argument rather than a filter the
+        author is trusted to remember.
+        """
+        if self._staging is None:
+            raise CapabilityError(
+                f"{self._kind} capability is not available for this step (no file store)")
+        return list(self._staging.owned_by(self._action_ref, under=self._pack_root(pack)))
+
+    def _pack_root(self, pack) -> str:
+        provider = self._targets.provider_for(self._kind) if self._targets else None
+        if provider is None:
+            raise CapabilityError(
+                f"nothing in this profile provides '{self._kind}.write' — install a global "
+                f"pack loader such as Paxi (design 8.1)")
+        folder = provider.pack_path(self._targets.root, pack, self._kind)
+        return folder.relative_to(self._targets.root).as_posix()
+
     def resolve(self, pack, namespace, path):
         """A handle on a file inside one of the user's packs, routed by the active loader.
 
@@ -501,6 +531,17 @@ class _PackNamespace:
                 f"rather than naming it in the action (design 3.3)")
         available = self._targets.available(self._kind) or []
         if pack not in available:
+            # Two different refusals, because they need two different fixes. The guard used
+            # to check only that the DIRECTORY was there, so a pack whose manifest had been
+            # renamed away passed it — and the write landed in a folder the game does not
+            # read, reporting success. That is exactly the silent no-op this message warns
+            # about, arriving through the guard meant to prevent it.
+            installed = self._targets.installed(self._kind) or []
+            if pack in installed:
+                raise CapabilityError(
+                    f"the {self._noun} '{pack}' is disabled — its {PACK_MANIFEST} is "
+                    f"renamed aside, so the game does not read it. Enable it, or bind this "
+                    f"step to a {self._noun} that loads.")
             raise CapabilityError(
                 f"there is no {self._noun} called '{pack}' — writing into it would produce "
                 f"a folder the game silently ignores")

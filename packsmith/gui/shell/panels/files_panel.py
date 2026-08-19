@@ -25,7 +25,8 @@ from PySide6.QtWidgets import (
     QMessageBox, QAbstractItemView, QInputDialog,
 )
 
-from packsmith.core.capabilities import DATAPACKS_WRITE, RESOURCEPACKS_WRITE
+from packsmith.core.capabilities import (
+    CapabilityError, DATAPACKS_WRITE, RESOURCEPACKS_WRITE)
 from packsmith.core.files import FileStore
 from packsmith.gui.shell import icons, style
 from packsmith.gui.shell.tree import PanelTree
@@ -60,6 +61,7 @@ _ROLE_PATH = Qt.UserRole        # relative path (posix-style)
 _ROLE_IS_DIR = Qt.UserRole + 1
 _ROLE_LOADED = Qt.UserRole + 2
 _ROLE_CATEGORY = Qt.UserRole + 3   # 'datapacks' / 'resourcepacks' in Smart Mode
+_ROLE_PACK = Qt.UserRole + 5       # (kind, name) on a pack's own row in Smart Mode
 
 
 def _parent_of(rel: str) -> str:
@@ -244,6 +246,7 @@ class FilesPanel(Panel):
                 rel = f"{rel_root}/{name}"
                 item = QTreeWidgetItem([name])
                 item.setData(0, _ROLE_PATH, rel)
+                item.setData(0, _ROLE_PACK, (kind, name))
                 is_dir = (self._files.root / rel).is_dir()
                 item.setData(0, _ROLE_IS_DIR, is_dir)
                 if is_dir:
@@ -253,6 +256,15 @@ class FilesPanel(Panel):
                     # A zipped pack: real, listed, and not something to browse into here.
                     self._style_file(item, rel)
                     item.setToolTip(0, f"{rel} — a zipped pack")
+                # A pack the game will not read is still listed — hiding it would make it
+                # unreachable, and switching one back on means finding it first — but it
+                # says so, because "my datapack isn't doing anything" is otherwise a long
+                # afternoon (§8.1).
+                if not self._loader.is_enabled(self._files.root, name, kind):
+                    item.setText(0, f"{name}  (disabled)")
+                    item.setForeground(0, QColor(style.TEXT_FAINT))
+                    item.setToolTip(0, f"{rel} — its pack.mcmeta is renamed aside, so the "
+                                       f"game does not load it")
                 category.addChild(item)
             if not packs:
                 empty = QTreeWidgetItem(["(none yet — right-click to create one)"])
@@ -446,10 +458,17 @@ class FilesPanel(Panel):
             menu.addAction(f"New {noun}…", lambda: self._new_pack(category))
             if rel:
                 menu.addSeparator()
-                menu.addAction("Reveal in Explorer", lambda: self._reveal(rel))
+                menu.addAction("Reveal in Explorer", lambda: self.reveal(rel))
             return menu
 
         menu = QMenu(self)
+        # A pack IS a folder you manage — only the category is special — so switching it
+        # off is one more entry on the ordinary menu rather than a menu of its own. First,
+        # because it is the reason you right-clicked a pack rather than a folder.
+        pack = item.data(0, _ROLE_PACK) if item is not None else None
+        if pack is not None:
+            self._add_pack_actions(menu, rel, *pack)
+            menu.addSeparator()
         if not is_dir:
             ownership = self._owners.get(_norm(rel))
             kind = ownership.get("kind") if ownership else None
@@ -470,8 +489,46 @@ class FilesPanel(Panel):
             menu.addAction("Rename…", lambda: self._rename(rel, is_dir))
             menu.addAction("Delete…", lambda: self._delete(rel, is_dir))
         menu.addSeparator()
-        menu.addAction("Reveal in Explorer", lambda: self._reveal(rel))
+        menu.addAction("Reveal in Explorer", lambda: self.reveal(rel))
         return menu
+
+    def _add_pack_actions(self, menu, rel, kind, name):
+        """Switch one pack off, or back on.
+
+        Disabling renames `pack.mcmeta` aside rather than touching the folder, because the
+        folder's NAME is the pack's identity — the one binding that stores a name rather
+        than an id (§3.3) — so renaming it would break every job step pointing at it. This
+        changes only whether the game reads the pack.
+        """
+        enabled = self._loader.is_enabled(self._files.root, name, kind)
+        noun = "datapack" if kind == "datapacks" else "resource pack"
+        if enabled:
+            action = menu.addAction("Disable", lambda: self._set_pack_enabled(
+                kind, name, False, f"Disabled {noun} '{name}' — the game will not load it."))
+        else:
+            action = menu.addAction("Enable", lambda: self._set_pack_enabled(
+                kind, name, True, f"Enabled {noun} '{name}'."))
+        if not (self._files.root / rel).is_dir():
+            # A zip keeps its manifest inside the archive, so there is nothing to rename
+            # without rewriting the file — and renaming the archive would change the pack's
+            # name, which is exactly what this avoids.
+            action.setEnabled(False)
+            action.setToolTip("a zipped pack cannot be switched off from here")
+
+    def _set_pack_enabled(self, kind, name, enabled, message):
+        try:
+            if enabled:
+                self._loader.enable(self._files.root, name, kind)
+            else:
+                self._loader.disable(self._files.root, name, kind)
+        except (CapabilityError, OSError, ValueError) as e:
+            QMessageBox.warning(self, "Couldn't change that pack", str(e))
+            return
+        self.refresh()
+        # Announced through the same signal ownership changes use: a pack going dark is a
+        # fact about what will happen on the next launch, and the status bar is where this
+        # panel says such things.
+        self.ownership_changed.emit(message)
 
     # --- filesystem actions (design 6.2) ------------------------------------
 
@@ -618,6 +675,11 @@ class FilesPanel(Panel):
         self.refresh()
         self.ownership_changed.emit(message)
 
-    def _reveal(self, rel):
+    def reveal(self, rel):
+        """Open the containing folder in the OS file manager.
+
+        Public because the Run Report borrows it: "where is this file" is one question
+        however you arrived at it, and a second implementation would be a second answer.
+        """
         target = (self._files.root / rel).parent
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(target)))

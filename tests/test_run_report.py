@@ -254,3 +254,78 @@ def test_the_filter_searches_every_column(qapp):
                          change(entry_id="b", tag="remove")], TAG_COLUMNS)
     model.set_filter("claimed")
     assert model.shown == 1
+
+
+# --- the file table's context menu ----------------------------------------------------
+#
+# A diff answers "what changed"; it raises two more — what does the file look like NOW,
+# and where is it. Both already existed elsewhere in the app, so this is wiring.
+
+def file_change(path="config/emi.json", kind="changed", after="new"):
+    return {"engine": "file", "kind": kind, "path": path,
+            "before": {"value": "old", "owner": "user", "action_ref": None},
+            "after": None if after is None else
+                     {"value": after, "owner": "action", "action_ref": "p:a"}}
+
+
+def _file_view(qapp, change):
+    from PySide6.QtWidgets import QTableView
+    from packsmith.gui.run_report import RunReportTab
+
+    class Step:
+        action_ref, status, reason, run_id, log_lines = "p:a", "success", None, 1, ()
+        changes = [change]
+
+    class Result:
+        job_name, status, dry_run, not_run = "Removal", "success", False, 0
+        step_results = [Step()]
+
+    tab = RunReportTab(reports.from_result(Result()))
+    return tab, tab.findChildren(QTableView)[-1]
+
+
+def _menu_labels(tab, change):
+    """The menu for one row, built rather than shown — `exec` spins its own event loop.
+
+    The menu comes back with the actions and callers hold it: dropping it deletes the C++
+    object, and its QActions go with it.
+    """
+    menu = tab.file_menu(change)
+    return menu, {a.text(): a for a in menu.actions() if a.text()}
+
+
+def test_the_file_menu_offers_all_three(qapp):
+    change = file_change()
+    tab, _view = _file_view(qapp, change)
+    menu, actions = _menu_labels(tab, change)
+    assert set(actions) == {"Show what changed", "Open file", "Reveal in File Explorer"}
+
+
+def test_each_entry_asks_for_the_row_that_was_clicked(qapp):
+    change = file_change(path="config/quark-common.toml")
+    tab, _view = _file_view(qapp, change)
+    menu, actions = _menu_labels(tab, change)
+    opened, revealed, diffed = [], [], []
+    tab.file_open_requested.connect(opened.append)
+    tab.reveal_requested.connect(revealed.append)
+    tab.diff_requested.connect(diffed.append)
+
+    for label in ("Open file", "Reveal in File Explorer", "Show what changed"):
+        actions[label].trigger()
+
+    assert opened == ["config/quark-common.toml"]
+    assert revealed == ["config/quark-common.toml"]
+    assert diffed[0]["path"] == "config/quark-common.toml"
+
+
+def test_a_deleted_file_cannot_be_opened_or_revealed(qapp):
+    """`after` is None for absence (§3.3's change record), so the record itself says the
+    file is gone — no disk check needed. Greyed rather than hidden: a menu that changes
+    shape row to row is harder to use than one that explains itself."""
+    change = file_change(kind="removed", after=None)
+    tab, _view = _file_view(qapp, change)
+    menu, actions = _menu_labels(tab, change)
+
+    assert actions["Show what changed"].isEnabled()
+    assert not actions["Open file"].isEnabled()
+    assert not actions["Reveal in File Explorer"].isEnabled()

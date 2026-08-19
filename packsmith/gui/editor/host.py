@@ -19,7 +19,7 @@ section argues against.
 """
 from pathlib import Path
 
-from PySide6.QtCore import QUrl, QObject, Slot, Signal, Qt
+from PySide6.QtCore import QUrl, QObject, QTimer, Slot, Signal, Qt
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton
 from PySide6.QtWebEngineWidgets import QWebEngineView
@@ -99,6 +99,14 @@ class EditorHost(QObject):
         self._pending = []          # calls queued until Monaco finishes loading
         self._locked = set()
         self._opened = set()        # keys Monaco holds a model for, so rebind can drop them
+
+        # Focus is handed to the view a turn AFTER a tab activates — see `focus_editor`.
+        # Parented to self so it dies with the host rather than firing into a deleted C++
+        # object during teardown, which is the shape of every Qt crash this project has had.
+        self._focus_timer = QTimer(self)
+        self._focus_timer.setSingleShot(True)
+        self._focus_timer.setInterval(0)
+        self._focus_timer.timeout.connect(self._take_focus)
 
         self._bridge = _Bridge()
         self._bridge.ready.connect(self._on_ready)
@@ -305,6 +313,29 @@ class EditorHost(QObject):
         finally:
             placeholder.setUpdatesEnabled(True)
 
+    def focus_editor(self):
+        """Put the keyboard in the editor when its tab comes forward.
+
+        `showModel` already calls Monaco's own `editor.focus()`, but that only decides
+        where the caret goes *inside* the page. The page still has to be the widget Qt is
+        sending key events to, and switching tabs gives focus to the tab — not to the
+        native child that was just reparented into it. The result looked like a focused
+        editor that ignored the keyboard until you clicked the text once.
+
+        Deferred by a turn because the view has only just been reparented and shown;
+        focusing mid-move is dropped when the widget is re-shown at its new home.
+        """
+        self._focus_timer.start()
+
+    def _take_focus(self):
+        if not self.view.isVisible():
+            return          # parked, or the tab moved on before the timer fired
+        self.view.setFocus(Qt.OtherFocusReason)
+        # Qt focus decides which widget gets the keys; this decides where they land in the
+        # page. Both are needed, and the JS half is re-asserted here because `showModel`
+        # ran before the widget could accept focus at all.
+        self._js("if (typeof editor !== 'undefined' && editor) editor.focus();")
+
     def _park(self):
         self.view.setParent(self._container)
         self.view.hide()
@@ -409,6 +440,7 @@ class EditorTab(QWidget):
     def activate(self):
         self._host.attach_to(self.slot)
         self._host.show_document(self.key)
+        self._host.focus_editor()
 
     def detach(self):
         """Give the shared view back before this tab is destroyed."""

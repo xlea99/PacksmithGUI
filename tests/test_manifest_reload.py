@@ -264,3 +264,97 @@ def test_saving_a_broken_manifest_says_so_in_the_same_moment(window, monkeypatch
     assert len(warnings) == 1
     assert "deep_end" in warnings[0]
     assert window._packages.actions == {}
+
+
+# --- edits made OUTSIDE Packsmith ----------------------------------------------------
+#
+# Reported from real use: an action added to `manifest.json5` in another editor did not
+# appear in the job editor's step picker until a restart. The in-app save path reloads
+# correctly (above) — nothing was watching for an edit Packsmith never saw. §3.3.1 invites
+# exactly that, since a package is "just files on disk".
+
+def test_the_fingerprint_notices_an_outside_edit(packages):
+    index = PackageIndex(packages)
+    before = index.fingerprint()
+
+    (packages / "deep_end" / "manifest.json5").write_text(
+        manifest("helper", action="renamed"), encoding="utf-8")
+
+    assert index.fingerprint() != before
+
+
+def test_the_fingerprint_notices_a_whole_new_package(packages):
+    """Globbed from disk rather than taken from what is already indexed, so a package added
+    while Packsmith was in the background counts."""
+    index = PackageIndex(packages)
+    before = index.fingerprint()
+
+    new = packages / "late_arrival"
+    new.mkdir()
+    (new / "manifest.json5").write_text(
+        manifest("helper", name="late_arrival", action="thing"), encoding="utf-8")
+
+    assert index.fingerprint() != before
+
+
+def test_an_untouched_directory_looks_untouched(packages):
+    """The common case is alt-tabbing back having changed nothing, and it runs on every
+    window activation — so it has to be quiet, and cost one stat per package."""
+    index = PackageIndex(packages)
+    assert index.fingerprint() == index.fingerprint()
+
+
+def test_focus_picks_up_an_action_added_by_hand(window, packages):
+    """End to end, through the signal the window actually reacts to."""
+    from PySide6.QtCore import QEvent
+    from PySide6.QtGui import QWindowStateChangeEvent
+
+    assert "deep_end:removal" in window._packages.actions
+    assert "deep_end:second" not in window._packages.actions
+
+    text = (window._profile.packages_dir / "deep_end" / "manifest.json5").read_text(
+        encoding="utf-8")
+    text = text.replace('  ],', '    { "id": "second", "file": "removal_and_hide.star",\n'
+                                '      "function": "helper" },\n  ],')
+    (window._profile.packages_dir / "deep_end" / "manifest.json5").write_text(
+        text, encoding="utf-8")
+
+    window._check_for_edited_packages()
+
+    assert "deep_end:second" in window._packages.actions
+
+
+def test_regaining_focus_with_nothing_changed_reloads_nothing(window, monkeypatch):
+    """Otherwise every alt-tab rebuilds the Actions and Packages panels, losing whatever
+    was selected in them."""
+    calls = []
+    monkeypatch.setattr(window._packages, "reload", lambda: calls.append(1))
+
+    window._check_for_edited_packages()
+    window._check_for_edited_packages()
+
+    assert calls == []
+
+
+def test_focus_drops_an_action_deleted_by_hand(window, packages):
+    """The other direction, which is the one that misleads: a picker still offering an
+    action nobody declares any more lets you build a step that cannot run."""
+    assert "deep_end:removal" in window._packages.actions
+
+    (window._profile.packages_dir / "deep_end" / "manifest.json5").write_text(
+        '{ "package": { "name": "deep_end" }, "actions": [] }', encoding="utf-8")
+    window._check_for_edited_packages()
+
+    assert window._packages.actions == {}
+
+
+def test_saving_a_deletion_in_the_editor_drops_it_immediately(window):
+    """And through the in-app path, which does not wait for focus to leave and come back."""
+    from packsmith.gui.editor.host import EditorHost
+
+    (window._profile.packages_dir / "deep_end" / "manifest.json5").write_text(
+        '{ "package": { "name": "deep_end" }, "actions": [] }', encoding="utf-8")
+    window._editor_host.file_saved.emit(
+        EditorHost.key_for("package", "deep_end/manifest.json5"))
+
+    assert window._packages.actions == {}

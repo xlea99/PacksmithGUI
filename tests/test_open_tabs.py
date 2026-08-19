@@ -249,3 +249,54 @@ def test_transient_tabs_are_not_recorded(window, profile, qapp):
 
     stored = load_ui_state(profile.name)["open_tabs"]
     assert [tuple(key) for key in stored] == [("browse", "minecraft:item")]
+
+
+# --- tab keys are not all the same shape ----------------------------------------------
+#
+# Reported as a crash after a job run: `too many values to unpack (expected 2)`, from
+# `_reload_job_tabs`. Three loops unpacked every key as a fixed `(kind, key)` pair, which
+# holds right up until a tag view, the encyclopedia, or a run-report diff is open — because
+# only the FIRST element of a key is the kind, and everything after it belongs to that kind.
+# The traceback pointed at job tabs and the cause was an open tag view.
+
+# Every shape the app builds, shortest to longest. Kept explicit rather than derived: the
+# point is that the lengths differ, which a clever derivation would hide.
+KEY_SHAPES = [
+    ("encyclopedia",),
+    ("job", 1),
+    ("view", 1),
+    ("browse", "minecraft:item"),
+    ("action", "p:a"),
+    ("report", 1),
+    ("packdump-diff", "latest"),
+    ("doc", "instance:config/x.json"),
+    ("blueprint", "StoneType"),
+    ("tag", "minecraft:item", "remove"),
+    ("diff", ("report", 1), "config/x.json"),
+]
+
+
+@pytest.mark.parametrize("key", KEY_SHAPES, ids=[k[0] for k in KEY_SHAPES])
+def test_refreshing_survives_every_kind_of_open_tab(window, key, qapp):
+    """Each refresher walks every open tab, so one unfamiliar key shape takes down a pass
+    that had nothing to do with it."""
+    window._open_tabs[key] = object()
+    try:
+        window._reload_job_tabs()
+        window._reload_blueprint_tabs()
+        window._refresh_tab_icons()
+    finally:
+        window._open_tabs.pop(key, None)
+
+
+def test_the_kind_filter_reads_only_the_first_element(window, qapp):
+    window._open_tabs.clear()
+    window._open_tabs[("tag", "minecraft:item", "remove")] = "tag tab"
+    window._open_tabs[("job", 7)] = "job tab"
+    window._open_tabs[("encyclopedia",)] = "encyclopedia tab"
+
+    assert [tab for _key, tab in window._tabs_of_kind("job")] == ["job tab"]
+    assert [tab for _key, tab in window._tabs_of_kind("tag")] == ["tag tab"]
+    assert [tab for _key, tab in window._tabs_of_kind("encyclopedia")] == \
+        ["encyclopedia tab"]
+    assert list(window._tabs_of_kind("nothing")) == []

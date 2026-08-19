@@ -59,6 +59,13 @@ class Resolution:
         return bool(self.alternatives)
 
 
+# What makes a folder a pack, and what it becomes when switched off. The suffix is
+# deliberately shouty: this is a file a person may meet in a directory listing with no
+# Packsmith running, and it should read as a state rather than as damage.
+PACK_MANIFEST = "pack.mcmeta"
+DISABLED_MANIFEST = PACK_MANIFEST + ".DISABLED"
+
+
 class PackLoaderProvider:
     """What a global pack loader must be able to answer.
 
@@ -102,6 +109,70 @@ class PackLoaderProvider:
 
     def resourcepack_root(self, instance_root):
         raise NotImplementedError
+
+    def pack_root(self, instance_root, kind="datapacks"):
+        """The directory this loader reads packs of ``kind`` from."""
+        if kind == "datapacks":
+            return self.datapack_root(instance_root)
+        if kind == "resourcepacks":
+            return self.resourcepack_root(instance_root)
+        raise ValueError(f"unknown pack kind: {kind}")
+
+    def pack_path(self, instance_root, pack_name: str, kind="datapacks"):
+        if not pack_name or "/" in pack_name or "\\" in pack_name:
+            raise ValueError(f"invalid pack name: {pack_name!r}")
+        return self.pack_root(instance_root, kind) / pack_name
+
+    # --- enabled / disabled -------------------------------------------------
+    #
+    # Minecraft decides whether a folder is a pack by whether it holds a `pack.mcmeta`, and
+    # a folder without one is not loaded *and not complained about* — the files are there,
+    # the folder is there, and nothing happens. That makes the file a switch: rename it and
+    # the pack goes dark; rename it back and it returns.
+    #
+    # Renaming the *manifest* rather than the folder is the whole point. A pack's identity
+    # IS its directory name (§3.3 — the one binding that stores a name rather than an id),
+    # so renaming the folder would break every job step bound to it. This leaves identity
+    # untouched and changes only whether the game reads it.
+
+    def is_enabled(self, instance_root, pack_name: str, kind="datapacks") -> bool:
+        """Would the game load this pack?
+
+        A `.zip` pack answers True: its manifest is inside the archive, so there is nothing
+        to rename without rewriting the file — see `disable`.
+        """
+        target = self.pack_path(instance_root, pack_name, kind)
+        if not target.is_dir():
+            return target.exists()          # a zip, or nothing at all
+        return (target / PACK_MANIFEST).is_file()
+
+    def disable(self, instance_root, pack_name: str, kind="datapacks") -> None:
+        """Switch a pack off by renaming its manifest aside."""
+        target = self._folder_pack(instance_root, pack_name, kind, "disabled")
+        manifest = target / PACK_MANIFEST
+        if not manifest.is_file():
+            return                                   # already off; nothing to do
+        manifest.rename(target / DISABLED_MANIFEST)
+
+    def enable(self, instance_root, pack_name: str, kind="datapacks") -> None:
+        target = self._folder_pack(instance_root, pack_name, kind, "enabled")
+        disabled = target / DISABLED_MANIFEST
+        if not disabled.is_file():
+            return
+        disabled.rename(target / PACK_MANIFEST)
+
+    def _folder_pack(self, instance_root, pack_name, kind, verb):
+        target = self.pack_path(instance_root, pack_name, kind)
+        if not target.exists():
+            raise CapabilityError(f"there is no pack called '{pack_name}'")
+        if not target.is_dir():
+            # Renaming the archive itself would work, but the archive's NAME is the pack's
+            # identity, so it would break every binding that points at it — the exact thing
+            # renaming the manifest exists to avoid.
+            raise CapabilityError(
+                f"'{pack_name}' is a zip and cannot be {verb} this way — its manifest is "
+                f"inside the archive. Move it out of the folder instead.")
+        return target
 
     def load_order(self, instance_root, kind="datapacks") -> list:
         """Pack names in load order, or [] when the loader has no such notion."""
@@ -185,15 +256,37 @@ class PackTargets:
         return self._table.provider_for(WRITE_CAPABILITY.get(pack_kind, ""))
 
     def available(self, pack_kind: str):
-        """Pack names in LOAD ORDER, or None when no loader provides this kind at all.
+        """Packs that would actually LOAD, in load order, or None when no loader provides
+        this kind at all.
 
         None and [] are different answers and the caller needs both: "there is no loader
         installed" points at §8.1, "you have no packs yet" points at making one.
+
+        Disabled packs are excluded, and that is the point of the distinction. This is what
+        the step editor offers and what the write guard checks, and binding a step to a pack
+        the game does not read produces a run that reports success and changes nothing —
+        the most confusing failure available. Use `installed` to show them anyway.
+        """
+        provider = self.provider_for(pack_kind)
+        if provider is None:
+            return None
+        return [name for name in provider.packs(self._root, pack_kind)
+                if provider.is_enabled(self._root, name, pack_kind)]
+
+    def installed(self, pack_kind: str):
+        """Every pack on disk, enabled or not — what a *browser* should show.
+
+        Hiding a disabled pack would make it unreachable: switching one back on means
+        finding it first.
         """
         provider = self.provider_for(pack_kind)
         if provider is None:
             return None
         return list(provider.packs(self._root, pack_kind))
+
+    def is_enabled(self, pack_kind: str, pack_name: str) -> bool:
+        provider = self.provider_for(pack_kind)
+        return bool(provider and provider.is_enabled(self._root, pack_name, pack_kind))
 
 
 def resolve(packdump, *, loaders=(), preferred=None, instance_root=None) -> ResolutionTable:

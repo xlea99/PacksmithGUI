@@ -15,6 +15,7 @@ consequences of that are what most of this file pins down: the binding stores a 
 (there is no id to store — Packsmith does not own the directory), and `conflict_policy` does
 not apply (files hard-block, §6.1, rather than negotiating).
 """
+import inspect
 import json
 import os
 
@@ -452,3 +453,176 @@ def test_no_loader_and_no_packs_are_different_messages(world, no_loader, qapp):
     assert "no datapacks yet" in empty.itemText(0)
     assert "no pack loader" in missing.itemText(0)
     assert not empty.isEnabled() and not missing.isEnabled()
+
+
+# --- the two bugs configuring a pack step exposed -----------------------------------
+
+def _editor(world, user_db, mappings):
+    from packsmith.core.jobs import JobStore
+    from packsmith.core.tags import TagStore
+    from packsmith.gui.job_editor import JobEditorTab
+
+    _files, _paxi, targets = world
+    tags = TagStore(user_db)
+    tags.define("minecraft:item", "remove", "bool")      # exactly one candidate
+    jobs = JobStore(user_db)
+    job = jobs.create("removal")
+
+    class Index:
+        actions = {"p:a": manifest(**mappings)}
+        def get(self, ref):
+            return self.actions[ref]
+
+    tab = JobEditorTab(jobs.get(job.id), job_store=jobs, package_index=Index(),
+                       tag_store=tags, packdump=Dump(), pack_targets=targets)
+    tab._picking = "action"          # what the picker sets before it opens
+    tab._on_picked("p:a")
+    return jobs.steps_of(job.id)[0]
+
+
+def test_a_new_step_is_created_already_bound(world, qapp, user_db):
+    """3.3's best-guess fill "pre-selects" a candidate, and the form duly showed one — but
+    nothing wrote it. A step's bindings stayed empty until a widget emitted a *change*, so
+    opening the dropdown and clicking the single tag already highlighted committed nothing:
+    the index never moved, so no signal fired. The only way to make it stick was to edit
+    some unrelated field, which is a strange thing to have to discover.
+    """
+    tag = MappingSlot(name="target", kind="tag", tag_type="bool",
+                      registry_type="minecraft:item")
+    step = _editor(world, user_db, {"target": tag})
+
+    assert step.bindings.get("target") is not None,         "the suggestion the form displays has to be the one the step stores"
+    assert step.bound_names.get("target") == "remove",         "and its name is recorded, or a later rename cannot be detected as stale"
+
+
+def test_a_pack_slot_is_bound_when_the_hint_names_a_real_pack(world, qapp, user_db):
+    """The `pack` half of the same fill. `likely_name` wins when the user actually has a
+    pack by that name."""
+    step = _editor(world, user_db, {"out": slot(likely_name="tweaks")})
+    assert step.bindings.get("out") == "tweaks"
+
+
+def test_several_packs_are_left_for_the_user_to_choose(world, qapp, user_db):
+    """Deliberately NOT guessed. Which pack an override lands in decides load order and
+    therefore which override wins — guessing that is worse than asking."""
+    step = _editor(world, user_db, {"out": slot()})
+    assert "out" not in step.bindings
+
+
+def test_the_job_editor_can_see_the_pack_loader(world, qapp, user_db):
+    """Reported: every `pack` mapping read "no pack loader installed" while the Files
+    panel's smart mode listed Paxi's folders happily. The picker cannot tell an absent
+    loader from an absent resolution table, and the editor was simply never handed one —
+    so a step you could not configure would have run fine once bound another way.
+    """
+    from packsmith.gui.main_window import MainWindow
+
+    source = inspect.getsource(MainWindow._open_job_editor)
+    assert "pack_targets=" in source, \
+        "the job editor builds every mapping picker, including the pack one"
+
+
+def test_writing_into_a_disabled_pack_is_refused(world):
+    """The hole the disable feature exposed, and the reason it had to be built into the
+    capability rather than bolted on: the guard checked only that the DIRECTORY was there,
+    so a pack whose manifest had been renamed aside passed it. The write landed on disk,
+    the run reported success, and the game read none of it — the exact silent no-op the
+    guard's own message warns about.
+    """
+    files, paxi, targets = world
+    paxi.disable(files.root, "tweaks", "datapacks")
+
+    def body(pack):
+        pack.datapacks.resolve(pack="tweaks", namespace="minecraft", path=LOOT).write("{}")
+
+    result = run_with(files, targets, body)
+    assert not result.ok
+    assert "disabled" in result.reason
+    assert not (paxi.datapack_root(files.root) / "tweaks" / "data" / "minecraft"
+                / LOOT).exists()
+
+
+def test_a_disabled_pack_is_not_offered_in_the_picker(world, qapp):
+    """It cannot be bound, for the same reason it cannot be written: a step pointing at a
+    pack the game does not read is a run that succeeds and changes nothing."""
+    files, paxi, targets = world
+    paxi.disable(files.root, "tweaks", "datapacks")
+
+    dialog = dialog_for(targets)          # held: dropping it deletes the C++ widget
+    combo = dialog._mapping_widgets["out"]
+    assert [combo.itemText(i) for i in range(combo.count())] == ["base"]
+
+
+# --- what did I write last time? (design 6.1's ownership, read back) -------------------
+#
+# Actions keep needing this — a pack that is a projection of a tag has to clear what the
+# tag no longer says. The answer is DERIVED from `file_ownership` rather than remembered in
+# a sidecar, for the reason §3.2.1 gives for orphans: a record kept beside the truth goes
+# stale, and a derived one cannot.
+
+def test_an_action_can_ask_what_it_owns_in_a_pack(world):
+    files, paxi, targets = world
+
+    def write(pack):
+        pack.datapacks.resolve(pack="tweaks", namespace="minecraft",
+                               path=LOOT).write("{}")
+
+    assert run_with(files, targets, write).ok
+
+    landed = paxi.datapack_root(files.root) / "tweaks" / "data" / "minecraft" / LOOT
+    expected = landed.relative_to(files.root).as_posix()
+
+    assert _returned(files, targets, lambda pack: pack.datapacks.owned("tweaks")) == [expected]
+
+
+def _returned(files, targets, body):
+    """`run_action` reports status, not the callable's return value — so capture it."""
+    captured = []
+    def wrapper(pack):
+        captured.append(body(pack))
+    run_with(files, targets, wrapper)
+    return captured[0]
+
+
+def test_owning_is_scoped_to_the_pack_that_was_asked_for(world):
+    """The footgun this signature exists to close. Ownership is per ACTION — it must be,
+    or two steps of one action would permanently steal files from each other — so an
+    unscoped listing would hand a step every file the same action wrote in OTHER steps.
+    An action clearing "everything I own that I didn't write this run" would then blank a
+    sibling step's output, silently.
+    """
+    files, _paxi, targets = world
+
+    def write_both(pack):
+        pack.datapacks.resolve(pack="tweaks", namespace="minecraft", path=LOOT).write("{}")
+        pack.datapacks.resolve(pack="base", namespace="minecraft", path=LOOT).write("{}")
+
+    assert run_with(files, targets, write_both).ok
+
+    mine = _returned(files, targets, lambda pack: pack.datapacks.owned("tweaks"))
+    assert all("/tweaks/" in path for path in mine), mine
+    assert mine, "the pack it asked about should not be empty"
+
+
+def test_another_actions_files_are_not_mine(world):
+    files, _paxi, targets = world
+
+    def write(pack):
+        pack.datapacks.resolve(pack="tweaks", namespace="minecraft", path=LOOT).write("{}")
+
+    run_action(write, tag_store=_NoTags(), packdump=Dump(), action_ref="somebody:else",
+               file_store=files, mappings={}, pack_targets=targets)
+
+    assert _returned(files, targets, lambda pack: pack.datapacks.owned("tweaks")) == []
+
+
+def test_a_file_staged_this_step_counts_as_owned(world):
+    """§7.4: every read on `pack` is staged-first, with no exceptions for the awkward ones.
+    An action that writes a file and then asks what it owns must see it."""
+    files, _paxi, targets = world
+
+    def write_then_ask(pack):
+        pack.datapacks.resolve(pack="tweaks", namespace="minecraft", path=LOOT).write("{}")
+        return pack.datapacks.owned("tweaks")
+
+    assert _returned(files, targets, write_then_ask), "a staged write was invisible"

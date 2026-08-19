@@ -155,6 +155,24 @@ class FileStore:
     # through an explicit claim". These are that explicit path: they move a file between
     # untouched / user-owned / action-owned without touching its bytes.
 
+    def owned_by(self, action_ref: str, *, under: str = "") -> list:
+        """Instance-relative paths this action owns, optionally under a prefix.
+
+        Ownership is recorded per **action**, never per step — `FileStaging.write` decides
+        whether a write is a takeover by comparing `owner_action_ref`, so two steps of one
+        action must look like one owner or each would permanently steal from the other.
+        Callers that need to tell two steps apart scope by path instead; see
+        `_PackNamespace.owned`.
+        """
+        prefix = str(under or "").replace("\\", "/").strip("/")
+        rows = self._db.fetch_all(
+            "SELECT path FROM file_ownership WHERE owner_kind = 'action' "
+            "AND owner_action_ref = ?", (action_ref,))
+        found = [row["path"] for row in rows]
+        if prefix:
+            found = [p for p in found if p == prefix or p.startswith(prefix + "/")]
+        return sorted(found)
+
     def claim(self, rel_path: str, *, owner: str = "user", owner_action_ref: str = None):
         """Record ownership of a file without modifying it."""
         if owner not in ("user", "action"):
@@ -384,6 +402,24 @@ class FileStaging:
         if staged is not None:
             return {"kind": staged["owner"], "action_ref": staged["owner_action_ref"]}
         return self._store.ownership(rel_path)
+
+    def owned_by(self, action_ref: str, *, under: str = "") -> list:
+        """Committed ownership, plus what this step has staged — §7.4's rule that every
+        read on `pack` is staged-first, with no exceptions for the awkward ones.
+
+        A file the action staged this step counts as owned; one it staged for somebody else
+        does not, which cannot happen today but would be a silent lie if it ever did.
+        """
+        found = set(self._store.owned_by(action_ref, under=under))
+        prefix = str(under or "").replace("\\", "/").strip("/")
+        for staged in self._pending.values():
+            path = staged["path"]
+            if staged.get("owner") != "action" or staged.get("owner_action_ref") != action_ref:
+                found.discard(path)
+                continue
+            if not prefix or path == prefix or path.startswith(prefix + "/"):
+                found.add(path)
+        return sorted(found)
 
     @property
     def has_pending(self) -> bool:

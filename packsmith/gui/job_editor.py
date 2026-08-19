@@ -20,8 +20,8 @@ from PySide6.QtWidgets import (
 )
 
 from packsmith.core.bindings import (
-    binding_id, binding_name, mapping_mismatches, record_names, stale_bindings,
-    step_problems)
+    best_guess_bindings, binding_id, binding_name, mapping_mismatches, record_names,
+    stale_bindings, step_problems)
 from packsmith.core.shapes import describe_shape
 from packsmith.gui.shell import icons, style
 from packsmith.gui.shell.picker import Choice, PickerPopup, _token_match
@@ -102,12 +102,31 @@ def _select_stored(combo, stored):
     `findData` alone missed every legacy name-binding and fell through to index 0 — which
     is not "nothing selected", it is *the alphabetically first artifact*, so pressing OK
     retargeted the step to whatever happened to sort first.
+
+    When nothing matches, the combo is marked **unconfirmed**: it still shows a row, because
+    a combo box has no empty state, but it renders dimmed and its value is not the step's
+    binding. See `_mark_unconfirmed`.
     """
     for i in range(combo.count()):
         if _refers_to(stored, combo.itemData(i), combo.itemText(i)):
             combo.setCurrentIndex(i)
+            _mark_unconfirmed(combo, False)
             return
     combo.setCurrentIndex(0)
+    # Only a value the user could mistake for a choice needs the treatment: an explicit
+    # "(unbound)" row, or an empty picker, already says what it is.
+    _mark_unconfirmed(combo, combo.currentData() is not None)
+
+
+def _mark_unconfirmed(combo, unconfirmed: bool):
+    """Dim a suggestion the user has not accepted, and undim it once they have."""
+    if combo.property("unconfirmed") == bool(unconfirmed):
+        return
+    combo.setProperty("unconfirmed", bool(unconfirmed))
+    # A dynamic property already set when the stylesheet was applied needs the widget
+    # repolished, or Qt keeps painting the old rule.
+    combo.style().unpolish(combo)
+    combo.style().polish(combo)
 
 
 class _EntryField(QWidget):
@@ -249,6 +268,7 @@ class StepForm(QWidget):
         self._tags = tag_store
         self._blueprints = blueprint_store
         self._mapping_widgets = {}
+        self._labels = {}       # slot or config name -> (QLabel, name, description, required)
         self._config_widgets = {}
 
         root = QVBoxLayout(self)
@@ -266,13 +286,17 @@ class StepForm(QWidget):
         for name, slot in manifest.mappings.items():
             widget = self._mapping_widget(name, slot, step.bindings.get(name))
             self._mapping_widgets[name] = widget
-            form.addRow(self._label_for(name, slot.description, slot.required), widget)
+            label = self._label_for(name, slot.description, slot.required)
+            self._labels[name] = (label, name, slot.description, slot.required)
+            form.addRow(label, widget)
 
         for name, param in manifest.config.items():
             current = step.config.get(name, param.default)
             widget = self._config_widget(param, current)
             self._config_widgets[name] = (widget, param)
-            form.addRow(self._label_for(name, param.description, param.required), widget)
+            label = self._label_for(name, param.description, param.required)
+            self._labels[name] = (label, name, param.description, param.required)
+            form.addRow(label, widget)
 
         if not manifest.mappings and not manifest.config:
             nothing = QLabel("This action needs nothing configured.")
@@ -293,6 +317,8 @@ class StepForm(QWidget):
         root.addWidget(self._on_error)
 
         self._wire_commits()
+        self.committed.connect(self._refresh_labels)
+        self._refresh_labels()
 
     def _wire_commits(self):
         """Every field reports when it settles, so the panel can write it through.
@@ -306,6 +332,13 @@ class StepForm(QWidget):
         for widget in widgets:
             if isinstance(widget, QComboBox):
                 widget.currentIndexChanged.connect(self.committed)
+                # `activated` fires for any user pick, INCLUDING re-picking the row that is
+                # already current — which `currentIndexChanged` does not, because the index
+                # did not move. That is the whole of the "I clicked the recommendation and
+                # nothing happened" bug: the one row you most want to choose is the one row
+                # that emitted nothing.
+                widget.activated.connect(
+                    lambda _index, w=widget: (_mark_unconfirmed(w, False), self.committed.emit()))
             elif isinstance(widget, QCheckBox):
                 widget.toggled.connect(self.committed)
             elif isinstance(widget, QLineEdit):
@@ -313,12 +346,52 @@ class StepForm(QWidget):
             elif isinstance(widget, (_EntryField, _MultiSelect)):
                 widget.changed.connect(self.committed)
 
-    @staticmethod
-    def _label_for(name, description, required):
-        label = QLabel(name + ("" if required else "  (optional)"))
-        if description:
-            label.setToolTip(description)
+    def _label_for(self, name, description, required, unbound=True):
+        """What this slot is called, and whether it still needs you.
+
+        Optionality used to be visible only when a step refused to run. A **required** slot
+        with nothing bound wears a red asterisk; once satisfied the asterisk goes, because
+        a form that shouts at every required field shouts at a finished one too. An
+        **optional** one says so quietly, in italic, because "you may skip this" is
+        permission rather than an instruction.
+        """
+        label = QLabel()
+        label.setTextFormat(Qt.RichText)
+        self._paint_label(label, name, description, required, unbound)
         return label
+
+    @staticmethod
+    def _paint_label(label, name, description, required, unbound):
+        if required:
+            mark = (f' <span style="color: {style.ERROR};">*</span>') if unbound else ""
+            label.setText(f"{name}{mark}")
+            label.setToolTip((description + "\n\n" if description else "")
+                             + ("Required — this step cannot run until it is bound."
+                                if unbound else "Required."))
+            return
+        label.setText(
+            f'{name} <span style="color: {style.TEXT_FAINT};"><i>(optional)</i></span>')
+        label.setToolTip((description + "\n\n" if description else "")
+                         + "Optional — the action handles it being left unbound.")
+
+    def _refresh_labels(self):
+        """Re-mark the labels after a commit, so an asterisk clears the moment its slot is
+        satisfied rather than at the next time the panel is rebuilt."""
+        try:
+            bindings, config, _on_error = self.read()
+        except ValueError:
+            return              # a field is mid-edit and invalid; its label can wait
+        for key, (label, name, description, required) in self._labels.items():
+            widget = self._mapping_widgets.get(key)
+            value = bindings.get(key) if widget is not None else config.get(key)
+            unbound = value is None or value == [] or value == ""
+            # A picker showing a value the user has not accepted is NOT bound — `read()`
+            # reports what is displayed, and the step stores nothing until it is chosen.
+            # The two marks then say the same thing from opposite ends: the value is dimmed
+            # because it is a suggestion, and the asterisk stays because nothing is bound.
+            if widget is not None and widget.property("unconfirmed"):
+                unbound = True
+            self._paint_label(label, name, description, required, unbound)
 
     def _mapping_widget(self, name, slot, current):
         """An artifact picker: the user's own artifacts of the kind this slot asks for."""
@@ -1270,11 +1343,41 @@ class JobEditorTab(QWidget):
         self._pending_select = self._panel.step_id
         self._rebuild_timer.start(0)
 
+    def _opening_bindings(self, action_ref) -> dict:
+        """The best guess, PERSISTED at creation rather than merely displayed.
+
+        3.3's fill pre-selects a candidate — "if exactly one compatible artifact exists,
+        pre-select it" — and the form duly showed it. Nothing wrote it. A new step's
+        bindings stayed empty until a widget emitted a *change*, so opening the dropdown
+        and clicking the one tag already highlighted committed nothing: the index never
+        moved, so no signal fired. The only way to make the suggestion stick was to go and
+        edit some unrelated field, which is a strange thing to have to learn.
+
+        Writing it here makes the shown value the stored value from the first instant —
+        which is also what `_seed_jobs` already does for the jobs a fresh profile starts
+        with, so the two paths now agree.
+        """
+        try:
+            manifest = self._packages.get(action_ref)
+        except KeyError:
+            return {}
+        guessed = best_guess_bindings(manifest, self._tags,
+                                      blueprint_store=self._blueprints,
+                                      packdump=self._dump,
+                                      pack_targets=self._pack_targets)
+        # A slot it declined to guess stays genuinely unbound: an empty entry would read as
+        # "bound to nothing" to `step_problems`, which is a different claim.
+        bindings = {name: value for name, value in guessed.items()
+                    if value is not None and value != []}
+        return {"bindings": bindings,
+                "bound_names": record_names(manifest, bindings, tag_store=self._tags)}
+
     def _on_picked(self, value):
         kind, self._picking = self._picking, None
         self._ghost = None
         if kind == "action":
-            step = self._jobs.add_action_step(self._job_id, value)
+            step = self._jobs.add_action_step(self._job_id, value,
+                                              **self._opening_bindings(value))
         else:
             try:
                 step = self._jobs.add_job_step(self._job_id, int(value))

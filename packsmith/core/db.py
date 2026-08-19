@@ -2,6 +2,7 @@ import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
 from packsmith.common.logging import log
+from packsmith.core import backup
 
 # The shape of the tables below (design 9.2). Bump this whenever a change makes an older
 # database no longer usable as-is, and add whatever brings one forward in `_migrate`.
@@ -17,6 +18,10 @@ SCHEMA_VERSION = 2      # v2: job_steps.enabled (design 3.3.2's step muting)
 
 class SchemaTooNewError(RuntimeError):
     """This database was written by a newer Packsmith than the one opening it."""
+
+
+class RebuildRefused(RuntimeError):
+    """A database needed rebuilding, held data, and could not be backed up first."""
 
 
 def _shape_of(conn) -> dict:
@@ -50,17 +55,55 @@ def _drift_between(expected: dict, found: dict) -> list:
 # This is the mailman — it delivers queries, it doesn't read the letters.
 class UserDB:
 
-    def __init__(self, db_path: Path):
+    def __init__(self, db_path: Path, *, keep_backups: int = backup.DEFAULT_KEEP):
         self._path = db_path
         self._depth = 0            # open `transaction()` scopes; see execute()
+        self._keep_backups = keep_backups
         self._conn = sqlite3.connect(str(db_path))
         self._conn.execute("PRAGMA foreign_keys = ON")
         self._conn.row_factory = sqlite3.Row  # rows always behave like dicts cuz this is the 21st century
+        # BEFORE anything that can drop a table. `_drop_stale_tables` and the rebuild inside
+        # `_settle_schema_version` both destroy on purpose, and a snapshot taken after them
+        # would faithfully preserve the damage.
+        self.snapshot("open")
         self._drop_stale_tables()
         self._ensure_tables()
         self._migrate()
         self._settle_schema_version()
         log.info(f"UserDB connected: {db_path}")
+
+    # --- snapshots (see backup.py) -----------------------------------------
+
+    def snapshot(self, reason: str, *, force: bool = False):
+        """A consistent copy of this database in `backups/`, or None if skipped.
+
+        Coalesced by default, so a caller can be liberal about asking — forty deletes in a
+        row leave one copy of the state before them, not forty of the demolition.
+
+        A database with no user data in it is never worth a copy: the tables exist from the
+        moment the file does, so "has tables" would keep snapshotting empty profiles and
+        those copies would evict real history out of the retention window.
+        """
+        if not force and not self._has_data():
+            return None
+        return backup.snapshot(self._conn, self._path, reason, keep=self._keep_backups,
+                               force=force)
+
+    def backups(self) -> list[dict]:
+        return backup.list_backups(self._path)
+
+    def _has_data(self) -> bool:
+        """Whether losing this database would lose anything. Cheap on purpose: `EXISTS`
+        stops at the first row rather than counting a registry's worth of them."""
+        for table in ("tag_assignments", "tag_definitions", "blueprints",
+                      "blueprint_instances", "instance_bindings", "views", "jobs"):
+            try:
+                if self._conn.execute(
+                        f'SELECT EXISTS(SELECT 1 FROM "{table}")').fetchone()[0]:
+                    return True
+            except sqlite3.Error:
+                continue          # a drifted database may not have every table
+        return False
 
     # Tables whose *shape* changed incompatibly, which CREATE TABLE IF NOT EXISTS cannot
     # fix — it sees the name and does nothing, then later statements referencing the new
@@ -384,7 +427,24 @@ class UserDB:
         Tables rather than the file, so an open connection stays valid and Windows' file
         locking is never involved. `foreign_keys` is suspended for the drops — dropping in
         any order otherwise trips a constraint against a table that is about to go too.
+
+        **Never runs without a snapshot to go back to.** This is the most destructive path
+        in Packsmith and it used to fire on a log warning: drift is detected, every table
+        goes, and a profile's tags, blueprints and bindings are gone with nothing to restore
+        from. The `found > SCHEMA_VERSION` branch above already refuses for exactly this
+        reason; this one did the destroying anyway. If the snapshot cannot be taken, the
+        rebuild does not happen — an unusable database can be repaired, and an erased one
+        cannot.
         """
+        if self._has_data():
+            saved = self.snapshot("before-rebuild", force=True)
+            if saved is None:
+                raise RebuildRefused(
+                    f"{self._path} needs rebuilding but holds data and could not be backed "
+                    f"up first, so it has been left alone. Copy it somewhere safe, then "
+                    f"delete or move it to start fresh.")
+            log.error("REBUILDING %s — every table is being dropped. Your data as it was "
+                      "moments ago is at %s", self._path, saved)
         self._conn.execute("PRAGMA foreign_keys = OFF")
         try:
             for row in self._conn.execute(

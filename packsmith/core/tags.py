@@ -178,6 +178,9 @@ class TagStore:
         return {"views": views, "steps": sorted(set(steps))}
 
     def undefine(self, registry_type: str, name: str):
+        # Cascades to every assignment of the tag — the single largest thing a click can
+        # destroy in L2.
+        self._db.snapshot("before-delete-tag")
         self._db.execute("DELETE FROM tag_definitions WHERE registry_type = ? AND name = ?",
                          (registry_type, name))
         # Rebuild cached definitions
@@ -496,15 +499,34 @@ class TagStore:
                FROM tag_assignments a JOIN tag_definitions d ON a.tag_id = d.id
                ORDER BY d.registry_type, d.name, a.entry_id"""
         )
+        # Both lookups below are hoisted out of the loop, and both for the same reason
+        # `_Registry.has` builds a set: this runs over EVERY assignment in the profile, and
+        # is called whenever anything might have changed — including a blueprint edit, which
+        # cannot create a tag orphan at all. Measured on a real pack (2,198 assignments,
+        # 18,639 items) it was 131 ms, which is most of the pause after committing a
+        # blueprint cell.
+        #
+        # `values` is a LIST in the dump, so `entry_id not in registry["values"]` was a
+        # linear scan — up to 41 million comparisons — and `definition()` was a database
+        # query per row for one of five definitions. Sets and a dict, built once each.
+        members = {}
+        definitions = {}
         orphans = []
         for row in rows:
             reg_type, entry_id = row["registry_type"], row["entry_id"]
-            registry = packdump.registry.get(reg_type)
-            if registry is None or entry_id not in registry["values"]:
+            if reg_type not in members:
+                registry = packdump.registry.get(reg_type)
+                members[reg_type] = (set(registry["values"]) if registry is not None
+                                     else None)
+            known = members[reg_type]
+            if known is None or entry_id not in known:
                 orphans.append(Orphan(reg_type, row["tag_name"], entry_id, row["value"],
                                       "missing_entry"))
                 continue
-            definition = self.definition(reg_type, row["tag_name"])
+            key = (reg_type, row["tag_name"])
+            if key not in definitions:
+                definitions[key] = self.definition(reg_type, row["tag_name"])
+            definition = definitions[key]
             if (definition is not None and definition["type"] == "enum"
                     and row["value"] not in definition.get("values", [])):
                 orphans.append(Orphan(reg_type, row["tag_name"], entry_id, row["value"],

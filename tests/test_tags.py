@@ -317,3 +317,79 @@ def test_same_name_different_registry_is_not_a_duplicate(tags):
     tags.define(BLOCK, "weight", "number")   # must not raise
     with pytest.raises(ValueError):
         tags.define(REG, "weight", "number")  # THIS is the real duplicate
+
+
+# --- orphan detection runs on everything, so it has to be cheap -----------------------
+#
+# `find_orphans` walks every assignment in the profile and is called whenever anything
+# might have changed — including a blueprint edit, which cannot create a tag orphan at all.
+# On a real pack (2,198 assignments, 18,639 items) it took 131 ms, most of the pause after
+# committing a blueprint cell. Two causes, both the same shape as the linear scan once
+# fixed in `_Registry.has`: `registry["values"]` is a LIST, and `definition()` was queried
+# once per row for one of five definitions.
+
+class _BigDump:
+    def __init__(self, entries):
+        self.registry = {"minecraft:item": {"values": entries}}
+
+    def attribute(self, *_a):
+        return None
+
+
+class _CountingValues(list):
+    """A registry's value list that records every membership test made against it."""
+
+    def __init__(self, values):
+        super().__init__(values)
+        self.contains_calls = 0
+
+    def __contains__(self, item):
+        self.contains_calls += 1
+        return super().__contains__(item)
+
+
+def test_orphan_detection_does_not_rescan_the_registry_per_assignment(tags):
+    """Counted rather than timed. A stopwatch here is both flaky and weak — a list scan of
+    50,000 entries still finishes fast enough to slip under any budget loose enough to be
+    reliable, which is exactly what the first version of this test did. What matters is the
+    SHAPE: the dump's list must be read into a set once, never asked `in` per assignment.
+    """
+    values = _CountingValues(f"mod:item_{i}" for i in range(2_000))
+    tags.define("minecraft:item", "remove", "bool")
+    with tags._db.transaction():
+        tags.assign("minecraft:item", list(values)[:500], "remove", True, owner="user")
+
+    assert tags.find_orphans(_BigDump(values)) == []
+    assert values.contains_calls == 0, (
+        f"the dump's list was searched {values.contains_calls} times — membership belongs "
+        f"to a set built once, not a scan per assignment")
+
+
+def test_orphan_detection_reads_each_definition_once(tags):
+    """The other half. `definition()` is a database round trip, and there are five of them
+    in a profile — not one per assignment."""
+    entries = [f"mod:item_{i}" for i in range(200)]
+    tags.define("minecraft:item", "remove", "bool")
+    with tags._db.transaction():
+        tags.assign("minecraft:item", entries, "remove", True, owner="user")
+
+    calls = []
+    original = tags.definition
+    tags.definition = lambda *a, **k: (calls.append(a), original(*a, **k))[1]
+    try:
+        tags.find_orphans(_BigDump(entries))
+    finally:
+        tags.definition = original
+
+    assert len(calls) <= 2, f"one lookup per assignment is back ({len(calls)} calls)"
+
+
+def test_a_missing_entry_is_still_reported(tags):
+    """The guard on the optimisation: making it fast must not make it blind."""
+    tags.define("minecraft:item", "remove", "bool")
+    tags.assign("minecraft:item", "mod:gone", "remove", True, owner="user")
+
+    found = tags.find_orphans(_BigDump(["mod:still_here"]))
+
+    assert [o.entry_id for o in found] == ["mod:gone"]
+    assert found[0].reason == "missing_entry"

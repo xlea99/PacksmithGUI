@@ -33,9 +33,15 @@ def qapp():
 def instance(user_db, tmp_path):
     root = tmp_path / "instance"
     paxi = root / "config" / "paxi"
-    (paxi / "datapacks" / "tweaks_create" / "data").mkdir(parents=True)
-    (paxi / "datapacks" / "rei_removals").mkdir(parents=True)
     (paxi / "resourcepacks").mkdir(parents=True)
+    # Real packs, manifest and all: a folder without `pack.mcmeta` is not a pack the game
+    # loads, so a fixture of bare directories was modelling something that does not work —
+    # and now reads, correctly, as disabled.
+    for name in ("tweaks_create", "rei_removals"):
+        (paxi / "datapacks" / name / "data").mkdir(parents=True)
+        (paxi / "datapacks" / name / "pack.mcmeta").write_text(
+            json.dumps({"pack": {"pack_format": 15, "description": name}}),
+            encoding="utf-8")
     (paxi / "datapack_load_order.json").write_text(
         json.dumps({"loadOrder": ["rei_removals"]}), encoding="utf-8")
     return FileStore(user_db, root)
@@ -214,10 +220,17 @@ def test_an_empty_name_creates_nothing(panel):
 def test_a_duplicate_name_is_refused_rather_than_merged(panel):
     """Writing into an existing pack would quietly adopt someone else's files."""
     view, files, answers = panel
+    manifest = (files.root / "config" / "paxi" / "datapacks" / "tweaks_create"
+                / "pack.mcmeta")
+    before = manifest.read_text(encoding="utf-8")
+
     answers["text"] = "tweaks_create"
     view._new_pack("datapacks")
-    assert not (files.root / "config" / "paxi" / "datapacks" / "tweaks_create"
-                / "pack.mcmeta").exists(), "an existing pack was written into"
+
+    # Checked by CONTENT rather than existence: every real pack has a manifest, so "one is
+    # there" says nothing about whether this call wrote it. `create_pack` would stamp its
+    # own description over the pack's.
+    assert manifest.read_text(encoding="utf-8") == before,         "an existing pack was written into"
 
 
 def test_a_name_with_a_separator_is_refused(panel):
@@ -277,3 +290,103 @@ def test_smart_mode_shows_both_kinds_for_a_loader_that_has_both(user_db, tmp_pat
         assert any("Resource Pack" in label for label in labels)
     finally:
         panel.deleteLater()
+
+
+# --- the browser has to notice a claim when it happens ---------------------------------
+#
+# Reported from real use: editing an untracked file claimed it (5ms, measured) and coloured
+# the editor tab, but the Files panel kept showing it as untracked until you switched tabs
+# and back. Saving refreshed the panel; the *first edit* claim only set a status message.
+
+def test_a_first_edit_claim_reaches_the_files_panel(user_db, tmp_path, qapp):
+    """§6.2: "editing is the gesture that tracks it" — so the browser must say so at the
+    keystroke, not whenever something else happens to rebuild the tree."""
+    from packsmith.core.files import FileStore
+    from packsmith.gui.editor.sources import InstanceFileSource
+    from packsmith.gui.shell.panels.files_panel import FilesPanel
+
+    root = tmp_path / "instance"
+    (root / "config").mkdir(parents=True)
+    (root / "config" / "emi.json").write_text("{}", encoding="utf-8")
+    files = FileStore(user_db, root)
+    panel = FilesPanel(files, loader=None)
+    assert panel._owners == {}, "nothing is owned yet"
+
+    claimed = []
+    source = InstanceFileSource(files, on_claim=claimed.append)
+    source.on_first_edit("config/emi.json")
+    panel.refresh()                      # what `_on_file_claimed` now does for us
+
+    assert claimed == ["config/emi.json"]
+    assert any("emi.json" in path for path in panel._owners)
+
+
+def test_the_window_refreshes_the_panel_on_a_claim(user_db, tmp_path, qapp, monkeypatch):
+    """The wiring, which is the half that was missing — the panel could always refresh,
+    nothing asked it to."""
+    from packsmith.gui.main_window import MainWindow
+
+    window = MainWindow.__new__(MainWindow)
+    refreshed = []
+    window._set_status = lambda text: None
+    window._files_panel = type("P", (), {"refresh": lambda self: refreshed.append(True)})()
+
+    window._on_file_claimed("config/emi.json")
+
+    assert refreshed == [True]
+
+
+# --- switching a pack off from the browser (design 8.1) -------------------------------
+
+def _pack_row(view, index=0):
+    view._mode.setCurrentIndex(1)
+    return categories(view)[0].child(index)
+
+
+def test_a_pack_row_offers_disable(panel):
+    view, _files, _answers = panel
+    menu = view._menu_for(_pack_row(view))
+    assert "Disable" in [a.text() for a in menu.actions() if a.text()]
+
+
+def test_a_pack_keeps_its_ordinary_actions_too(panel):
+    """A pack IS a folder you manage — switching it off is one more entry, not a menu of
+    its own."""
+    view, _files, _answers = panel
+    labels = [a.text() for a in view._menu_for(_pack_row(view)).actions() if a.text()]
+    assert "New File…" in labels and "Delete…" in labels
+
+
+def test_disabling_renames_the_manifest_and_says_so(panel):
+    view, files, _answers = panel
+    said = []
+    view.ownership_changed.connect(said.append)
+    folder = files.root / "config" / "paxi" / "datapacks" / "rei_removals"
+
+    view._set_pack_enabled("datapacks", "rei_removals", False, "off")
+
+    assert not (folder / "pack.mcmeta").exists()
+    assert (folder / "pack.mcmeta.DISABLED").is_file()
+    assert said == ["off"], "the status bar is where this panel says such things"
+
+
+def test_a_disabled_pack_still_appears_but_says_it_is_off(panel):
+    """Hiding it would make it unreachable — switching one back on means finding it."""
+    view, files, _answers = panel
+    view._set_pack_enabled("datapacks", "rei_removals", False, "off")
+    view._mode.setCurrentIndex(1)
+
+    shown = labels(categories(view)[0])
+    assert "rei_removals  (disabled)" in shown
+    assert "tweaks_create" in shown
+
+
+def test_a_disabled_pack_offers_enable(panel):
+    view, _files, _answers = panel
+    view._set_pack_enabled("datapacks", "rei_removals", False, "off")
+    view._mode.setCurrentIndex(1)
+    row = next(c for c in [categories(view)[0].child(i)
+                           for i in range(categories(view)[0].childCount())]
+               if "rei_removals" in c.text(0))
+
+    assert "Enable" in [a.text() for a in view._menu_for(row).actions() if a.text()]

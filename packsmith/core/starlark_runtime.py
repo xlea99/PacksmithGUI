@@ -289,8 +289,8 @@ pack = struct(
         unbind = _bp_unbind,
     ),
     filesystem = struct(resolve = _resolve),
-    datapacks = struct(resolve = _datapack_resolve),
-    resourcepacks = struct(resolve = _resourcepack_resolve),
+    datapacks = struct(resolve = _datapack_resolve, owned = _dp_owned),
+    resourcepacks = struct(resolve = _resourcepack_resolve, owned = _rp_owned),
     capabilities = struct(
         has = _cap_has,
         version = _cap_version,
@@ -354,6 +354,10 @@ def _inject(module: Module, pack):
             pack.datapacks.resolve(pack_name, namespace, path).path,
         "_rp_target": lambda pack_name, namespace, path:
             pack.resourcepacks.resolve(pack_name, namespace, path).path,
+        # "What did I write last time" — read off `file_ownership` rather than remembered,
+        # and scoped to one pack so a step cannot clear another step's output.
+        "_dp_owned": pack.datapacks.owned,
+        "_rp_owned": pack.resourcepacks.owned,
         "_cap_has": pack.capabilities.has,
         "_cap_version": pack.capabilities.version,
         # §7.6: "print could be redirected to pack.log("debug", ...) for author-convenience

@@ -233,6 +233,7 @@ class BlueprintStore:
                          (description, self._require_blueprint(name)["id"]))
 
     def delete(self, name: str):
+        self._db.snapshot("before-delete-blueprint")
         row = self._require_blueprint(name)
         users = self._db.fetch_all(
             "SELECT DISTINCT b.name AS blueprint FROM blueprint_slots s "
@@ -458,6 +459,8 @@ class BlueprintStore:
         """
         impact = self.preview_remove_slot(blueprint, path)
         self._require_no_block(impact)
+        if impact.destructive:
+            self._db.snapshot("before-remove-slot")
         subtree = self._subtree(blueprint, path)
 
         if not impact.destructive:
@@ -507,6 +510,8 @@ class BlueprintStore:
                                           ref_blueprint=ref_blueprint,
                                           enum_values=enum_values)
         self._require_no_block(impact)
+        if impact.destructive:
+            self._db.snapshot("before-retype-slot")
         if auto_coerce and not impact.can_coerce:
             raise BlueprintError(
                 f"'{path}' can't be retyped without loss: "
@@ -866,6 +871,7 @@ class BlueprintStore:
                          (new_name, instance.id))
 
     def delete_instance(self, blueprint: str, name: str):
+        self._db.snapshot("before-delete-instance")
         instance = self.instance(blueprint, name)
         referrers = self._db.fetch_all(
             "SELECT b.name AS blueprint, i.name AS instance FROM instance_bindings ib "
@@ -1069,6 +1075,41 @@ class BlueprintStore:
                                         owner=binding["owner"],
                                         action_ref=binding["action_ref"])
         return result
+
+    def all_bindings(self, blueprint: str) -> dict:
+        """``{instance_name: {slot_path: Binding}}`` for a whole blueprint, in one query.
+
+        `bindings()` answers for ONE instance, and answering it rebuilds the blueprint's
+        entire slot tree — correct for one lookup, catastrophic for a grid. Rendering 47
+        instances x 38 slots called the per-cell `value_of` 1,786 times: 1,786 tree
+        rebuilds, half a million recursive calls, 560 ms per redraw of a view that redraws
+        after every edit.
+
+        The shape is the fix. A grid wants the whole rectangle, so it asks for the
+        rectangle instead of for each cell in turn.
+        """
+        rows = self._db.fetch_all(
+            "SELECT i.name AS instance, bi.slot_id AS slot_id, bi.value AS value, "
+            "       bi.owner AS owner, bi.action_ref AS action_ref "
+            "FROM instance_bindings bi "
+            "JOIN blueprint_instances i ON i.id = bi.instance_id "
+            "JOIN blueprints b ON b.id = i.blueprint_id "
+            "WHERE b.name = ?", (blueprint,))
+        by_id = {slot.id: slot for slot in self.slots(blueprint)}
+        found = {}
+        for row in rows:
+            slot = by_id.get(row["slot_id"])
+            if slot is None:
+                continue                      # a slot removed out from under a binding
+            found.setdefault(row["instance"], {})[slot.path] = Binding(
+                slot_path=slot.path, value=row["value"], owner=row["owner"],
+                action_ref=row["action_ref"])
+        return found
+
+    def decode(self, slot: Slot, stored):
+        """A stored binding as a Python value. Public so a caller holding a whole
+        `binding_index` can decode without going back through `value_of`."""
+        return None if stored is None else self._decode(slot, stored)
 
     def value_of(self, blueprint: str, instance: str, path: str):
         """The bound value, decoded to a Python value, or None when unset."""

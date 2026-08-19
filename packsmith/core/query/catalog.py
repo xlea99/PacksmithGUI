@@ -68,6 +68,14 @@ class BlueprintFieldCatalog:
         self._store = blueprint_store
         self._blueprint = blueprint_name
         self._slots = {s.path: s for s in blueprint_store.value_slots(blueprint_name)}
+        # Every binding for this blueprint, read once. A catalog is built per query and a
+        # query reads every cell, so resolving one binding at a time meant re-reading the
+        # schema for each — see `BlueprintStore.binding_index`.
+        self._bindings = blueprint_store.all_bindings(blueprint_name)
+
+    def _bound(self, instance, path):
+        binding = self._bindings.get(instance, {}).get(path)
+        return binding.value if binding is not None else None
 
     def slot_paths(self) -> list:
         return list(self._slots)
@@ -81,8 +89,8 @@ class BlueprintFieldCatalog:
             if slot is None:
                 raise QueryError(f"'{blueprint}' has no slot '{field.name}'")
             return _Resolver(_COLUMN_TYPES.get(slot.type, "string"),
-                             lambda instance: self._store.value_of(blueprint, instance,
-                                                                   slot.path))
+                             lambda instance: self._store.decode(
+                                 slot, self._bound(instance, slot.path)))
         if isinstance(field, _Mod):
             raise QueryError(
                 "Mod is a fact about a registry entry, not a blueprint instance")

@@ -35,6 +35,14 @@ QSS = f"""
         background: {style.BG_DEEP}; color: {style.TEXT};
         border: 1px solid {style.BORDER}; padding: 2px 6px; font-size: 11px;
     }}
+    /* A value the app SUGGESTED, which the user has not confirmed. A combo box always has
+       a current item — there is no empty state — so an untouched picker looks exactly like
+       a deliberate choice, and the step it belongs to reads as bound when it is not. Dimmed
+       and italic says "this is what I would pick", not "this is what you picked". Cleared
+       the moment anything is chosen, including choosing the same row. */
+    QComboBox[unconfirmed="true"] {{
+        color: {style.TEXT_FAINT}; font-style: italic;
+    }}
     /* Reserves the caret's space so a long value never runs under it. The caret itself is
        painted by DropDown.paintEvent. */
     QComboBox::drop-down {{ border: none; width: 18px; }}

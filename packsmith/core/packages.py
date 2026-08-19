@@ -178,6 +178,31 @@ class PackageIndex:
         """
         return dict(self._errors)
 
+    def fingerprint(self) -> tuple:
+        """A cheap signature of every manifest on disk — name, size and mtime.
+
+        Enough to notice an edit made **outside** Packsmith without parsing anything. The
+        app reloads on its own saves (`MainWindow._reload_edited_package`), but 3.3.1's
+        promise is that a package is "just files on disk", which invites editing them in
+        whatever editor the author already has open — and nothing was watching for that,
+        so a hand-added action stayed invisible until a restart.
+
+        Deliberately not a content hash: this runs on every window activation, and the
+        question is only "has anything moved", which stat answers without reading a byte.
+        Globbed rather than taken from `self._packages`, so a package **added** or deleted
+        while Packsmith was in the background counts too.
+        """
+        if self._dir is None or not self._dir.is_dir():
+            return ()
+        found = []
+        for manifest in sorted(self._dir.glob(f"*/{MANIFEST_NAME}")):
+            try:
+                stat = manifest.stat()
+            except OSError:                 # vanished mid-scan; the reload will notice
+                continue
+            found.append((manifest.parent.name, stat.st_size, stat.st_mtime_ns))
+        return tuple(found)
+
     def reload(self):
         """Re-read everything from disk. Needed after a package or action is created or a
         manifest is edited — action *sources* are re-read on every run, but manifests are

@@ -171,6 +171,8 @@ class RunReportTab(QWidget):
 
     status = Signal(str)
     diff_requested = Signal(object)     # a file change record
+    file_open_requested = Signal(str)   # instance-relative path
+    reveal_requested = Signal(str)      # instance-relative path
     rollback_requested = Signal(int)    # step_runs id
 
     def __init__(self, report, parent=None):
@@ -310,7 +312,47 @@ class RunReportTab(QWidget):
         view.setToolTip("Double-click a file to see what changed")
         view.doubleClicked.connect(
             lambda index: self.diff_requested.emit(view.model().at(index.row())))
+        view.setContextMenuPolicy(Qt.CustomContextMenu)
+        view.customContextMenuRequested.connect(
+            lambda pos, v=view: self._file_menu(v, pos))
         self._body.addWidget(table)
+
+    def _file_menu(self, view, pos):
+        """What changed, what it is now, and where it lives.
+
+        The diff stays the double-click because it is what this tab is for. The other two
+        are the questions a diff raises rather than answers — *what does the file look like
+        now* and *where is it* — and both already exist elsewhere in the app, so this is
+        wiring rather than capability.
+        """
+        index = view.indexAt(pos)
+        change = view.model().at(index.row()) if index.isValid() else None
+        if change is None:
+            return
+        self.file_menu(change, parent=view).exec(view.viewport().mapToGlobal(pos))
+
+    def file_menu(self, change, parent=None) -> QMenu:
+        """The menu for one file row, built but not shown.
+
+        Split from `_file_menu` so it can be inspected without a popup: `exec` spins its
+        own event loop, which a test cannot return from.
+        """
+        path = change["path"]
+        menu = QMenu(parent)
+        menu.addAction("Show what changed", lambda: self.diff_requested.emit(change))
+        menu.addSeparator()
+        open_file = menu.addAction("Open file", lambda: self.file_open_requested.emit(path))
+        reveal = menu.addAction("Reveal in File Explorer",
+                                lambda: self.reveal_requested.emit(path))
+        # A run that DELETED a file leaves nothing to open or reveal — `after` is None for
+        # absence (§3.3's change record), so the record itself says so and no disk check is
+        # needed. Disabled rather than hidden: a menu that changes shape row to row is
+        # harder to use than one with a greyed entry explaining itself.
+        if change.get("after") is None:
+            for action in (open_file, reveal):
+                action.setEnabled(False)
+                action.setToolTip("this run deleted the file")
+        return menu
 
     def _build_blueprints(self):
         """Grouped by instance, headlined by gaps closed.
