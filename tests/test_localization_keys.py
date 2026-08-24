@@ -83,8 +83,17 @@ def test_an_entry_with_no_key_is_none(dump):
 
 def test_the_attribute_list_is_discoverable():
     """What the view constructor offers as columns. Hardcoding `localization` at both ends
-    is why adding the second one meant unpicking a special case."""
-    assert Packdump.attribute_names() == ["localization", "localization_key"]
+    is why adding the second one meant unpicking a special case.
+
+    Asserts the property, not a snapshot of the list. It used to compare against the exact
+    two names, which made it fail on every attribute added afterwards — a test that has to
+    be edited to admit each new member is not testing discoverability, it is a second place
+    to hardcode the list.
+    """
+    names = Packdump.attribute_names()
+    assert "localization" in names and "localization_key" in names
+    assert names.index("localization") < names.index("localization_key"), \
+        "order is the order columns appear in"
 
 
 # --- old snapshots ---------------------------------------------------------------------------

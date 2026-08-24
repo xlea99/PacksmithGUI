@@ -296,7 +296,11 @@ WRITE_ACCESS = ("write", "read_write")
 # and which one an action writes into decides load order and therefore which override wins.
 # That is identity, not a path — which is why `config/quark-common.toml` stays a literal and
 # this does not.
-MAPPING_KINDS = ("tag", "blueprint", "blueprint_instance", "registry_entry", "pack")
+# `folder` is a TRACKED ROOT (design 6.6) the user bound to this step. It is what makes
+# "adding a folder" and "letting an action write there" two separate consents: adding one
+# gives a person a view, binding it gives one action a target.
+MAPPING_KINDS = ("tag", "blueprint", "blueprint_instance", "registry_entry", "pack",
+                 "folder")
 BLUEPRINT_KINDS = ("blueprint", "blueprint_instance")
 PACK_KINDS = ("datapacks", "resourcepacks")
 # 3.3: `one` is a single-select picker, `many` is "zero or more" and a multi-select list.
@@ -932,7 +936,9 @@ def _parse_mappings(raw: dict) -> dict:
         # Files use the open-world engine, which hard-blocks instead of negotiating (§6.1):
         # an action writing over a user-owned file is refused outright. Demanding a policy
         # here would ask the author to choose between options that do not exist.
-        if access in WRITE_ACCESS and policy is None and kind != "pack":
+        # `folder` is exempt for the same reason `pack` is: both name places on disk, and
+        # the open-world engine hard-blocks rather than negotiating.
+        if access in WRITE_ACCESS and policy is None and kind not in ("pack", "folder"):
             raise ValueError(
                 f"mapping '{name}' has access='{access}' but declares no conflict_policy; "
                 f"one of {', '.join(CONFLICT_POLICIES)} is required")

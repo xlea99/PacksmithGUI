@@ -5,6 +5,9 @@ from PySide6.QtGui import QColor
 
 from packsmith.gui.table.edit_commands import EditStack, TagEditCommand
 from packsmith.core.query import evaluate, Tag, Attribute
+from packsmith.core.blueprints import BlueprintError
+from packsmith.core.query.ast import QueryError
+from packsmith.core.query.evaluator import filter_predicate
 from packsmith.gui.shell import style
 
 
@@ -16,8 +19,21 @@ OwnershipRole = Qt.UserRole + 1
 # Every role `data()` can answer. A frozenset so the check is one hash lookup — it runs
 # more often than anything else in the table.
 _HANDLED_ROLES = frozenset({
-    Qt.DisplayRole, Qt.ForegroundRole, Qt.TextAlignmentRole, OwnershipRole,
+    Qt.DisplayRole, Qt.ForegroundRole, Qt.TextAlignmentRole, Qt.BackgroundRole,
+    OwnershipRole,
 })
+
+# A row that no longer matches the view's filter, still on screen because the tab you are
+# editing in never re-evaluates (see `MainWindow._on_tags_written`). Tinted rather than
+# removed: the row leaving under your cursor mid-click is the bug that rule exists to
+# prevent, but leaving it looking identical to the rows that still belong is its own
+# quieter one — you cannot tell what you have already dealt with.
+#
+# Warm and low-saturation, and the text dims with it. It has to read as "handled, on its
+# way out" at a glance without competing with the ownership colours in the same table, and
+# without looking like an error: these are the rows you got RIGHT.
+_DEPARTING_BG = QColor(120, 52, 52, 90)
+_DEPARTING_FG = QColor(150, 140, 140)
 
 
 class RegistryTableModel(QAbstractTableModel):
@@ -42,11 +58,17 @@ class RegistryTableModel(QAbstractTableModel):
     # that is no longer in the database.
     tags_written = Signal()
 
-    def __init__(self, query, packdump, tag_store, confirm_takeover=None):
+    def __init__(self, query, packdump, tag_store, confirm_takeover=None,
+                 blueprint_store=None):
         super().__init__()
         self._query = query
         self._packdump = packdump
         self._tag_store = tag_store
+        # Only registry views whose filter asks a blueprint question need this — `BoundIn`
+        # and `Mentions` (design 3.2.4). Keyword-and-optional so the many headless callers
+        # that query pure L1 stay unchanged, and so a view that never mentions a blueprint
+        # costs nothing.
+        self._blueprint_store = blueprint_store
         # Called with [(entry_id, tag_name, action_ref), ...] before the user takes cells
         # an action manages (design 3.2.1: transfers are loud). Returns True to proceed.
         # None = no confirmation (headless use).
@@ -54,6 +76,8 @@ class RegistryTableModel(QAbstractTableModel):
         self._registry_type = query.scope.type
         self._edit_stack = EditStack(tag_store)
         self._ownership = {}      # tag_name -> {entry_id: ownership}; see _ownership_of
+        # Entry ids still displayed that no longer match the filter — see `_DEPARTING_BG`.
+        self._departing = set()
         self._result = None
         self._evaluate()
 
@@ -61,7 +85,13 @@ class RegistryTableModel(QAbstractTableModel):
 
     def _evaluate(self):
         self._ownership.clear()
-        self._result = evaluate(self._query, packdump=self._packdump, tag_store=self._tag_store)
+        # A fresh evaluation IS the reconcile: whatever left is gone from the rows, and
+        # whatever came back belongs again. Carrying the old set over would tint rows that
+        # are perfectly fine.
+        self._departing.clear()
+        self._result = evaluate(self._query, packdump=self._packdump,
+                                tag_store=self._tag_store,
+                                blueprint_store=self._blueprint_store)
 
     def reevaluate(self):
         """Re-run the query and refresh, membership included. For external changes
@@ -298,7 +328,16 @@ class RegistryTableModel(QAbstractTableModel):
                 return None
             return self._ownership_of(name).get(row.entry_id)
 
+        if role == Qt.BackgroundRole:
+            # Whole row, every column — a tint on one cell would read as "this cell" when
+            # what has changed is the row's right to be here at all.
+            return _DEPARTING_BG if row.entry_id in self._departing else None
+
         if role == Qt.ForegroundRole:
+            # Departing beats the localization mute: both say "less important", and the
+            # row leaving is the larger fact about it.
+            if row.entry_id in self._departing:
+                return _DEPARTING_FG
             # The fallback is real content but not the *entry's own* name, so it reads
             # muted — you can tell at a glance which rows a mod never localized.
             return (QColor(style.TEXT_FAINT)
@@ -387,9 +426,52 @@ class RegistryTableModel(QAbstractTableModel):
         # is intentionally left alone — no re-eval on edit.
         row.values[self._column_name(col)] = self._tag_store.get_tag(
             self._registry_type, row.entry_id, tag_name)
-        self.dataChanged.emit(index, index, [Qt.DisplayRole, OwnershipRole])
+        self._mark_departing([row.entry_id])
+        self.dataChanged.emit(self.index(index.row(), 0),
+                              self.index(index.row(), self.columnCount() - 1),
+                              [Qt.DisplayRole, Qt.BackgroundRole, Qt.ForegroundRole,
+                               OwnershipRole])
         self.tags_written.emit()
         return True
+
+    # --- rows on their way out ---------------------------------------------
+
+    def _mark_departing(self, entry_ids=None):
+        """Recheck membership for `entry_ids`, or for every displayed row.
+
+        Bounded by what is ON SCREEN, not by the registry: `self._result.rows` is already
+        post-filter, so the 18,639-row case only arises for a view with no filter — and a
+        view with no filter can never have a row stop matching, which is the early return.
+        """
+        if self._query.filter is None:
+            return
+        try:
+            matches = filter_predicate(
+                self._query, packdump=self._packdump, tag_store=self._tag_store,
+                blueprint_store=self._blueprint_store)
+        except (QueryError, BlueprintError):
+            # A filter the engine can no longer answer — most really: the blueprint a
+            # `MENTIONS` / `BOUND_IN` view names gets deleted while the view is open, and
+            # `all_bindings` raises BlueprintError from underneath the query engine. Left
+            # unguarded that escapes through `setData`, i.e. on every keystroke in the view.
+            #
+            # The rows on screen are still the last good answer, so they are left unmarked;
+            # tinting all of them would say every one had been dealt with. (Undefining a
+            # filter's TAG does not come here — it resolves to None and simply stops
+            # matching, so every row tints, which is true: they are all leaving.)
+            return
+        if entry_ids is None:
+            entry_ids = [r.entry_id for r in self._result.rows]
+        for entry_id in entry_ids:
+            if entry_id is None:
+                continue          # computed/distinct row — no entry to re-check
+            if matches(entry_id):
+                self._departing.discard(entry_id)
+            else:
+                self._departing.add(entry_id)
+
+    def is_departing(self, entry_id) -> bool:
+        return entry_id in self._departing
 
     def confirm_takeover_of(self, cells) -> bool:
         """Gate an edit that would take cells away from an action (design 3.2.1).
@@ -412,12 +494,16 @@ class RegistryTableModel(QAbstractTableModel):
         """Re-sync every tag cell's value from the store (row membership unchanged) and
         signal the view. Used by bulk edits, undo/redo, and action-run refreshes."""
         self._resync_values()
+        # After the values, so the recheck reads the store rather than the stale cells —
+        # and here rather than in each caller, because this is the one path all of them
+        # share. Undo lands here too, which is what un-tints a row you put back.
+        self._mark_departing()
         self.tags_written.emit()
         if self.rowCount() and self.columnCount():
             self.dataChanged.emit(
                 self.index(0, 0),
                 self.index(self.rowCount() - 1, self.columnCount() - 1),
-                [Qt.DisplayRole, OwnershipRole],
+                [Qt.DisplayRole, Qt.BackgroundRole, Qt.ForegroundRole, OwnershipRole],
             )
 
     def _resync_values(self):

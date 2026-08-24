@@ -14,7 +14,8 @@ import operator
 import re
 
 from packsmith.core.query.ast import (
-    Query, Registry, Blueprint, Cmp, Has, And, Or, Not, VALID_OPS, QueryError,
+    Query, Registry, Blueprint, BoundIn, Cmp, Has, Mentions, And, Or, Not, VALID_OPS,
+    QueryError,
     AGGREGATES, Collect, CountDistinct, Slot, Attribute, _AllSlots, _AllAttributes,
     _Count, _Id,
 )
@@ -236,7 +237,7 @@ def _source(scope, packdump, tag_store, blueprint_store):
     if isinstance(scope, Registry):
         if packdump is None:
             raise QueryError("a registry-scoped query needs a packdump")
-        return (RegistryFieldCatalog(packdump, tag_store, scope.type),
+        return (RegistryFieldCatalog(packdump, tag_store, scope.type, blueprint_store),
                 list(packdump.registry.get(scope.type, {}).get("values", [])))
     if isinstance(scope, Blueprint):
         if blueprint_store is None:
@@ -271,6 +272,9 @@ def _compile_filter(node, catalog):
         # Existence, not value — see `presence`. Using the resolver here made HAS true for
         # every entry whenever the tag had a default.
         return catalog.presence(node.field)
+    if isinstance(node, (BoundIn, Mentions)):
+        # Built once for the whole query rather than per entry — see `catalog.crossing`.
+        return catalog.crossing(node)
     if isinstance(node, Cmp):
         return _compile_cmp(node, catalog.resolver(node.field))
     raise QueryError(f"not a filter: {node!r}")
@@ -358,3 +362,21 @@ def _equal(v, other, ci):
     if ci and isinstance(v, str) and isinstance(other, str):
         return v.lower() == other.lower()
     return v == other
+
+
+def filter_predicate(query, *, packdump=None, tag_store=None, blueprint_store=None):
+    """``entry_id -> bool`` for ``query``'s filter, or None when it has none.
+
+    Membership without re-running the query. A view deliberately does NOT re-evaluate while
+    you are editing in it — the row would vanish from under the cursor mid-click — but it
+    still has to be able to say *that a row no longer belongs*, so it can show you rather
+    than quietly keep it. Two different questions, and only the second is safe to ask while
+    someone is working.
+
+    The catalog is built fresh, which is the point: the caller is asking precisely because
+    the store moved, and the one inside a rendered Result is a snapshot from before it did.
+    """
+    if query.filter is None:
+        return None
+    catalog, _rows = _source(query.scope, packdump, tag_store, blueprint_store)
+    return _compile_filter(query.filter, catalog)

@@ -124,7 +124,12 @@ def test_the_stylesheet_does_not_fight_the_font(qapp):
 def test_the_strip_is_ordered_by_what_the_panels_are_for():
     """Two groups: where you work, then the vocabulary that work is expressed in. The
     order is a claim about meaning, so it is pinned rather than left to whoever edits the
-    list next."""
+    list next.
+
+    Tracked folders are NOT a slot here. They are a list you configure once and then browse
+    through, so they live as a subtab of Files beside the browser they configure — a
+    top-level slot would have put a settings list next to the six things you use daily.
+    """
     assert [spec.key for spec in PANEL_SPECS] == [
         "views", "automation", "files", "tags", "blueprints", "registry"]
 

@@ -10,6 +10,7 @@ MVP scope: whole-file ownership only. Per-key ownership, comment-preserving
 round-trip parsers, and the content-addressed blob store are all deferred. Reads and
 writes are plain UTF-8 text within the instance root; paths are stored relative to it.
 """
+import base64
 import hashlib
 import os
 from pathlib import Path
@@ -36,10 +37,55 @@ def _like_prefix(key: str) -> str:
     return key.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
-def content_hash(content: str) -> str:
+def content_hash(content) -> str:
     """A file's identity for reporting. Hashed from the exact bytes that get written, which
-    is only a stable answer because writes no longer translate line endings."""
-    return hashlib.sha256(content.encode("utf-8")).hexdigest()
+    is only a stable answer because writes no longer translate line endings.
+
+    Takes bytes as readily as text: a PNG has an identity for exactly the same reasons a
+    JSON file does, and hashing its decoded form is not available."""
+    raw = content if isinstance(content, bytes) else content.encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
+# A rollback snapshot is stored as JSON in `step_runs.rollback_data`, and bytes are not
+# JSON. They are carried as a tagged object instead of, say, latin-1 text: a marker cannot
+# be produced by accident from a real file's content, whereas any string encoding can, and
+# a snapshot that silently decodes as text would restore a corrupted PNG while reporting
+# success. The pair is here rather than at the serialization boundary because the encode
+# and the decode have to agree, and two files apart is how they stop agreeing.
+_BINARY_TAG = "__packsmith_bytes__"
+
+
+def encode_snapshot(content):
+    """A prior file state, made JSON-safe. None (the file did not exist) passes through."""
+    if isinstance(content, bytes):
+        return {_BINARY_TAG: base64.b64encode(content).decode("ascii")}
+    return content
+
+
+def decode_snapshot(value):
+    """The inverse. Tolerates an already-decoded value so a caller can be careless."""
+    if isinstance(value, dict) and _BINARY_TAG in value:
+        return base64.b64decode(value[_BINARY_TAG])
+    return value
+
+
+def is_binary(content) -> bool:
+    return isinstance(content, bytes)
+
+
+def _reportable(content):
+    """What a change record carries for a file's content.
+
+    Text goes through untouched — `changes()` carries the bytes on both sides precisely so
+    a dry run can be diffed, and that is the whole value of the preview. Binary cannot be:
+    a PNG rendered into a diff view is noise at best, and the record travels through JSON,
+    which has nowhere to put it. A short description keeps the record honest about what the
+    action would do without pretending the content is inspectable.
+    """
+    if isinstance(content, bytes):
+        return f"<binary, {len(content):,} bytes>"
+    return content
 
 
 def _read_text(path) -> str:
@@ -54,16 +100,35 @@ def _write_text(path, content: str):
 
 
 class FileStore:
-    """Reads/writes files under the instance root and tracks whole-file ownership.
+    """Reads/writes files under ONE tracked root and tracks whole-file ownership.
 
-    The open-world cousin of TagStore. Paths are relative to ``instance_root`` and
-    may not escape it. Writing stamps ownership; nothing here stages — staging is
-    FileStaging's job, and it calls ``write`` only at commit time.
+    The open-world cousin of TagStore. Paths are relative to the root and may not escape
+    it. Writing stamps ownership; nothing here stages — staging is FileStaging's job, and
+    it calls ``write`` only at commit time.
+
+    **One store per root, not one store over many roots** (design 6.6). The alternative was
+    a `root=` argument on all fifteen path-taking methods below, which is fifteen chances to
+    forget one and have it silently answer about the instance. Here a store simply cannot be
+    asked about a root it is not — the wrong-root bug becomes unrepresentable rather than
+    merely avoided. `FileRoots` composes them.
     """
 
-    def __init__(self, db, instance_root):
+    def __init__(self, db, instance_root, *, root_id: int = 1, name: str = "minecraft"):
         self._db = db
         self._root = Path(instance_root).resolve()
+        # Which row in `tracked_roots` this store is. Half of every ownership key: the same
+        # relative path under two roots is two different files, and was one row before 6.6.
+        self._root_id = root_id
+        self._name = name
+
+    @property
+    def name(self) -> str:
+        """This root's label — what the browser shows and what a binding names."""
+        return self._name
+
+    @property
+    def root_id(self) -> int:
+        return self._root_id
 
     @staticmethod
     def key(rel_path: str) -> str:
@@ -122,16 +187,28 @@ class FileStore:
     # survive. See `tests/test_fidelity.py`.
 
     def read(self, rel_path: str):
+        """The file's text, its BYTES if it is not decodable text, or None if absent.
+
+        Sniffed rather than declared: nothing records which files are binary, and a caller
+        holding a handle to a PNG should not have to know before it reads. A file that is
+        not valid UTF-8 cannot be text, and that is the whole test.
+        """
         p = self._abs(rel_path)
-        return _read_text(p) if p.is_file() else None
+        if not p.is_file():
+            return None
+        try:
+            return _read_text(p)
+        except UnicodeDecodeError:
+            return p.read_bytes()
 
     def exists(self, rel_path: str) -> bool:
         return self._abs(rel_path).is_file()
 
     def ownership(self, rel_path: str):
         row = self._db.fetch_one(
-            "SELECT owner_kind, owner_action_ref FROM file_ownership WHERE path = ?",
-            (self.key(rel_path),),
+            "SELECT owner_kind, owner_action_ref FROM file_ownership "
+            "WHERE root_id = ? AND path = ?",
+            (self._root_id, self.key(rel_path)),
         )
         if not row:
             return None  # untouched — no ownership record
@@ -147,7 +224,8 @@ class FileStore:
         return {
             row["path"]: {"kind": row["owner_kind"], "action_ref": row["owner_action_ref"]}
             for row in self._db.fetch_all(
-                "SELECT path, owner_kind, owner_action_ref FROM file_ownership")
+                "SELECT path, owner_kind, owner_action_ref FROM file_ownership "
+                "WHERE root_id = ?", (self._root_id,))
         }
 
     # --- ownership without writing (design 6.1) ---
@@ -166,8 +244,9 @@ class FileStore:
         """
         prefix = str(under or "").replace("\\", "/").strip("/")
         rows = self._db.fetch_all(
-            "SELECT path FROM file_ownership WHERE owner_kind = 'action' "
-            "AND owner_action_ref = ?", (action_ref,))
+            "SELECT path FROM file_ownership WHERE root_id = ? "
+            "AND owner_kind = 'action' AND owner_action_ref = ?",
+            (self._root_id, action_ref))
         found = [row["path"] for row in rows]
         if prefix:
             found = [p for p in found if p == prefix or p.startswith(prefix + "/")]
@@ -181,19 +260,19 @@ class FileStore:
             raise ValueError("Action ownership requires an owner_action_ref")
         self._abs(rel_path)      # keep the escape check honest even when not writing
         self._db.execute(
-            """INSERT INTO file_ownership (path, owner_kind, owner_action_ref)
-               VALUES (?, ?, ?)
-                   ON CONFLICT(path) DO UPDATE SET
+            """INSERT INTO file_ownership (root_id, path, owner_kind, owner_action_ref)
+               VALUES (?, ?, ?, ?)
+                   ON CONFLICT(root_id, path) DO UPDATE SET
                        owner_kind = excluded.owner_kind,
                        owner_action_ref = excluded.owner_action_ref""",
-            (self.key(rel_path), owner, owner_action_ref),
+            (self._root_id, self.key(rel_path), owner, owner_action_ref),
         )
 
     def release(self, rel_path: str):
         """Drop the ownership record, returning the file to **untouched** — anyone may
         claim it again. The file on disk is untouched; only the claim goes away."""
-        self._db.execute("DELETE FROM file_ownership WHERE path = ?",
-                         (self.key(rel_path),))
+        self._db.execute("DELETE FROM file_ownership WHERE root_id = ? AND path = ?",
+                         (self._root_id, self.key(rel_path)))
 
     # --- write (called at commit; captures prior bytes for store-by-path rollback) ---
 
@@ -206,17 +285,20 @@ class FileStore:
         if file_must_exist and not p.is_file():
             raise FileNotFoundError(f"Expected file to exist: {rel_path}")
 
-        prior = _read_text(p) if p.is_file() else None
+        prior = self.read(rel_path)
         p.parent.mkdir(parents=True, exist_ok=True)
-        _write_text(p, content)
+        if isinstance(content, bytes):
+            p.write_bytes(content)
+        else:
+            _write_text(p, content)
 
         self._db.execute(
-            """INSERT INTO file_ownership (path, owner_kind, owner_action_ref)
-               VALUES (?, ?, ?)
-                   ON CONFLICT(path) DO UPDATE SET
+            """INSERT INTO file_ownership (root_id, path, owner_kind, owner_action_ref)
+               VALUES (?, ?, ?, ?)
+                   ON CONFLICT(root_id, path) DO UPDATE SET
                        owner_kind = excluded.owner_kind,
                        owner_action_ref = excluded.owner_action_ref""",
-            (self.key(rel_path), owner, owner_action_ref),
+            (self._root_id, self.key(rel_path), owner, owner_action_ref),
         )
         return prior
 
@@ -236,12 +318,12 @@ class FileStore:
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_bytes(content)
         self._db.execute(
-            """INSERT INTO file_ownership (path, owner_kind, owner_action_ref)
-               VALUES (?, ?, ?)
-                   ON CONFLICT(path) DO UPDATE SET
+            """INSERT INTO file_ownership (root_id, path, owner_kind, owner_action_ref)
+               VALUES (?, ?, ?, ?)
+                   ON CONFLICT(root_id, path) DO UPDATE SET
                        owner_kind = excluded.owner_kind,
                        owner_action_ref = excluded.owner_action_ref""",
-            (self.key(rel_path), owner, owner_action_ref),
+            (self._root_id, self.key(rel_path), owner, owner_action_ref),
         )
         return prior
 
@@ -254,8 +336,8 @@ class FileStore:
         p = self._abs(rel_path)
         if p.is_file():
             p.unlink()
-        self._db.execute("DELETE FROM file_ownership WHERE path = ?",
-                         (self.key(rel_path),))
+        self._db.execute("DELETE FROM file_ownership WHERE root_id = ? AND path = ?",
+                         (self._root_id, self.key(rel_path)))
 
     def rename(self, rel_path: str, new_rel_path: str):
         """Move a file or directory, taking its ownership records with it.
@@ -279,10 +361,12 @@ class FileStore:
         self._db.execute(
             """UPDATE file_ownership
                   SET path = ? || substr(path, ?)
-                WHERE path LIKE ? ESCAPE '\\'""",
-            (new_key, len(old_key) + 1, _like_prefix(old_key) + "/%"))
-        self._db.execute("UPDATE file_ownership SET path = ? WHERE path = ?",
-                         (new_key, old_key))
+                WHERE root_id = ? AND path LIKE ? ESCAPE '\\'""",
+            (new_key, len(old_key) + 1, self._root_id,
+             _like_prefix(old_key) + "/%"))
+        self._db.execute(
+            "UPDATE file_ownership SET path = ? WHERE root_id = ? AND path = ?",
+            (new_key, self._root_id, old_key))
 
     def delete_tree(self, rel_path: str):
         """Recursively remove a directory and forget everything owned beneath it."""
@@ -290,8 +374,11 @@ class FileStore:
         p = self._abs(rel_path)
         if p.is_dir():
             shutil.rmtree(p)
-        self._db.execute("DELETE FROM file_ownership WHERE path = ? OR path LIKE ? ESCAPE '\\'",
-                         (self.key(rel_path), _like_prefix(self.key(rel_path)) + "/%"))
+        self._db.execute(
+            "DELETE FROM file_ownership WHERE root_id = ? "
+            "AND (path = ? OR path LIKE ? ESCAPE '\\')",
+            (self._root_id, self.key(rel_path),
+             _like_prefix(self.key(rel_path)) + "/%"))
 
     def owned_under(self, rel_path: str) -> dict:
         """Ownership records at or beneath a path — what a recursive delete would destroy."""
@@ -299,8 +386,8 @@ class FileStore:
         return {row["path"]: {"kind": row["owner_kind"], "action_ref": row["owner_action_ref"]}
                 for row in self._db.fetch_all(
                     "SELECT path, owner_kind, owner_action_ref FROM file_ownership "
-                    "WHERE path = ? OR path LIKE ? ESCAPE '\\'",
-                    (key, _like_prefix(key) + "/%"))}
+                    "WHERE root_id = ? AND (path = ? OR path LIKE ? ESCAPE '\\')",
+                    (self._root_id, key, _like_prefix(key) + "/%"))}
 
     def restore(self, rel_path: str, prior_content, prior_ownership):
         """Return a file to a prior state (for rollback). A None prior_content means
@@ -311,22 +398,46 @@ class FileStore:
             return
         p = self._abs(rel_path)
         p.parent.mkdir(parents=True, exist_ok=True)
+        prior_content = decode_snapshot(prior_content)
         # Same rule as `write`, and it matters most here: a rollback that re-translated
         # line endings would restore a file that is not the file it snapshotted.
-        _write_text(p, prior_content)
+        if isinstance(prior_content, bytes):
+            p.write_bytes(prior_content)
+        else:
+            _write_text(p, prior_content)
         if prior_ownership:
             self._db.execute(
-                """INSERT INTO file_ownership (path, owner_kind, owner_action_ref)
-                   VALUES (?, ?, ?)
-                       ON CONFLICT(path) DO UPDATE SET
+                """INSERT INTO file_ownership (root_id, path, owner_kind, owner_action_ref)
+                   VALUES (?, ?, ?, ?)
+                       ON CONFLICT(root_id, path) DO UPDATE SET
                            owner_kind = excluded.owner_kind,
                            owner_action_ref = excluded.owner_action_ref""",
-                (self.key(rel_path), prior_ownership["kind"],
+                (self._root_id, self.key(rel_path), prior_ownership["kind"],
                  prior_ownership["action_ref"]),
             )
         else:
-            self._db.execute("DELETE FROM file_ownership WHERE path = ?",
-                         (self.key(rel_path),))
+            self._db.execute("DELETE FROM file_ownership WHERE root_id = ? AND path = ?",
+                         (self._root_id, self.key(rel_path)))
+
+
+class _OneRoot:
+    """A single `FileStore` wearing the `FileRoots` interface.
+
+    Staging spans roots now, but most of its callers — every test, every headless script —
+    legitimately have one store and no registry. Rather than make them all build one, a
+    store is accepted directly and adapted here. Duck-typed on `.store` rather than
+    imported, because `roots` imports this module and the dependency only runs one way.
+    """
+
+    def __init__(self, store):
+        self._store = store
+
+    def store(self, name=None):
+        if name and name != self._store.name:
+            raise ValueError(
+                f"this step was given only the '{self._store.name}' root, so it cannot "
+                f"write to '{name}' — bind the folder to the step (design 6.6)")
+        return self._store
 
 
 class FileStaging:
@@ -337,8 +448,11 @@ class FileStaging:
     for store-by-path rollback — recorded by the runner into the step run.
     """
 
-    def __init__(self, file_store: FileStore, log=None):
-        self._store = file_store
+    def __init__(self, files, log=None):
+        self._roots = files if hasattr(files, "store") else _OneRoot(files)
+        # The instance store. Kept because plenty of internals want "the default place"
+        # and saying so once is clearer than `self._roots.store()` at every use.
+        self._store = self._roots.store()
         self._log = log or (lambda level, message: None)
         # Keyed by the STORE's canonical key, not the caller's spelling. Staging under two
         # spellings of one file in a single step otherwise produces two pending writes and
@@ -353,11 +467,13 @@ class FileStaging:
         because the runner builds staging before the `pack` that owns the log."""
         self._log = log
 
-    def write(self, rel_path, content, *, owner, owner_action_ref=None, file_must_exist=False):
+    def write(self, rel_path, content, *, owner, owner_action_ref=None,
+              file_must_exist=False, root=None):
+        store = self._roots.store(root)
         # Hard-block user-owned files (design 6.1) at STAGING time rather than commit, so
         # the failure points at the line that attempted it instead of surfacing later.
         if owner == "action":
-            current = self._store.ownership(rel_path)
+            current = store.ownership(rel_path)
             if current is not None and current["kind"] == "user":
                 raise FileOwnershipError(
                     f"'{rel_path}' is owned by you — actions are blocked from writing it. "
@@ -377,42 +493,51 @@ class FileStaging:
         # it, in a traceback about flushing a buffer — same reasoning as the hard-block
         # above, which is why both now live here. A file this step staged earlier counts as
         # existing: an action that writes a file and then edits it is doing so on purpose.
-        key = self._store.key(rel_path)
-        if file_must_exist and not (key in self._pending
-                                    or self._store.exists(rel_path)):
+        # Keyed by (ROOT, path). The same relative path under two roots is two different
+        # files, and one key for both would stage one write over the other and produce a
+        # single rollback snapshot for a pair of files.
+        key = (store.name, store.key(rel_path))
+        if file_must_exist and not (key in self._pending or store.exists(rel_path)):
             raise FileNotFoundError(f"Expected file to exist: {rel_path}")
         self._pending[key] = {
             "path": rel_path, "content": content, "owner": owner,
             "owner_action_ref": owner_action_ref, "file_must_exist": file_must_exist,
+            "root": store.name,
         }
         self._touched.add(key)
 
-    def read(self, rel_path):
-        staged = self._pending.get(self._store.key(rel_path))
+    def read(self, rel_path, root=None):
+        store = self._roots.store(root)
+        staged = self._pending.get((store.name, store.key(rel_path)))
         if staged is not None:
             return staged["content"]
-        return self._store.read(rel_path)
+        return store.read(rel_path)
 
-    def exists(self, rel_path):
-        return (self._store.key(rel_path) in self._pending
-                or self._store.exists(rel_path))
+    def exists(self, rel_path, root=None):
+        store = self._roots.store(root)
+        return ((store.name, store.key(rel_path)) in self._pending
+                or store.exists(rel_path))
 
-    def ownership(self, rel_path):
-        staged = self._pending.get(self._store.key(rel_path))
+    def ownership(self, rel_path, root=None):
+        store = self._roots.store(root)
+        staged = self._pending.get((store.name, store.key(rel_path)))
         if staged is not None:
             return {"kind": staged["owner"], "action_ref": staged["owner_action_ref"]}
-        return self._store.ownership(rel_path)
+        return store.ownership(rel_path)
 
-    def owned_by(self, action_ref: str, *, under: str = "") -> list:
+    def owned_by(self, action_ref: str, *, under: str = "", root=None) -> list:
         """Committed ownership, plus what this step has staged — §7.4's rule that every
         read on `pack` is staged-first, with no exceptions for the awkward ones.
 
         A file the action staged this step counts as owned; one it staged for somebody else
         does not, which cannot happen today but would be a silent lie if it ever did.
         """
-        found = set(self._store.owned_by(action_ref, under=under))
+        store = self._roots.store(root)
+        found = set(store.owned_by(action_ref, under=under))
         prefix = str(under or "").replace("\\", "/").strip("/")
-        for staged in self._pending.values():
+        for (staged_root, _key), staged in self._pending.items():
+            if staged_root != store.name:
+                continue          # another root's file is not this root's answer
             path = staged["path"]
             if staged.get("owner") != "action" or staged.get("owner_action_ref") != action_ref:
                 found.discard(path)
@@ -458,19 +583,24 @@ class FileStaging:
             if earlier is not None:
                 # An earlier step staged this file, so ITS bytes are what this step is
                 # editing — the same relation a committed earlier step would have.
-                before = _side(earlier["content"], earlier["owner"],
+                before = _side(_reportable(earlier["content"]), earlier["owner"],
                                earlier["owner_action_ref"])
-            elif self._store.exists(path):
-                prior_owner = self._store.ownership(path) or {}
-                before = _side(self._store.read(path), prior_owner.get("kind"),
-                               prior_owner.get("action_ref"))
+            elif self._roots.store(staged["root"]).exists(path):
+                store = self._roots.store(staged["root"])
+                prior_owner = store.ownership(path) or {}
+                before = _side(_reportable(store.read(path)),
+                               prior_owner.get("kind"), prior_owner.get("action_ref"))
             else:
                 before = None
-            after = _side(staged["content"], staged["owner"], staged["owner_action_ref"])
+            after = _side(_reportable(staged["content"]), staged["owner"],
+                          staged["owner_action_ref"])
             after["hash"] = content_hash(staged["content"])
+            if is_binary(staged["content"]):
+                after["binary"] = True
+                after["size"] = len(staged["content"])
             described.append({
-                "engine": "file", "path": path, "kind": classify(before, after),
-                "before": before, "after": after,
+                "engine": "file", "root": staged["root"], "path": path,
+                "kind": classify(before, after), "before": before, "after": after,
             })
         return sorted(described, key=lambda d: d["path"])
 
@@ -485,8 +615,9 @@ class FileStaging:
 
         for key, staged in self._pending.items():
             rel_path = staged["path"]      # the spelling the action used, for the message
-            prior_owner = self._store.ownership(rel_path)          # capture before overwrite
-            prior_content = self._store.write(
+            store = self._roots.store(staged["root"])
+            prior_owner = store.ownership(rel_path)                # capture before overwrite
+            prior_content = store.write(
                 rel_path, staged["content"],
                 owner=staged["owner"], owner_action_ref=staged["owner_action_ref"],
                 # Already validated at staging time; re-asserting here could only fail
@@ -496,8 +627,21 @@ class FileStaging:
             # Snapshot under the canonical key too, so two spellings of one file cannot
             # produce two rollback entries — the second of which would hold the FIRST
             # write's content and restore mid-step state.
+            # The root travels WITH the snapshot. A rollback that restored by path alone
+            # would put the bytes back under the instance regardless of where they came
+            # from — and a record written before 6.6 has no root, which reads as the
+            # instance, which is where it must have been.
+            # A STRING key, because this dict is serialized into `step_runs.rollback_data`
+            # as JSON and JSON has no tuples — but still root-qualified, or two roots
+            # holding the same relative path would share one snapshot and a rollback would
+            # restore one file's bytes over the other. The path is carried inside as well,
+            # so the reader never has to parse this back apart; a record written before
+            # roots existed has a bare path as its key and no `path` field, which reads as
+            # the instance, which is the only place it could have been.
             self.snapshots.setdefault(
-                key, {"content": prior_content, "ownership": prior_owner})
+                f"{staged['root']}::{key[1]}",
+                {"content": encode_snapshot(prior_content), "ownership": prior_owner,
+                 "root": staged["root"], "path": rel_path})
         self._pending.clear()
 
     def discard(self):

@@ -18,7 +18,7 @@ from packsmith.core.profile import Profile
 #   2 — localization gained `keys`: the translation key behind each display name.
 #
 # Mirrored in the mod as `DumpSchema.VERSION`; bump both together.
-_VALID_SCHEMAS = {1, 2}
+_VALID_SCHEMAS = {1, 2, 3}
 _CURRENT_SCHEMA = max(_VALID_SCHEMAS)
 
 
@@ -49,6 +49,14 @@ class Packdump:
 
         # Various attributes
         self._localizations = {}
+        # Which block an item places, and what shape that block is — schema 3, and not
+        # derivable from the registries: an item's block can carry a different id, and a
+        # block's form is a fact about its Java class rather than about its name.
+        # {registry_type: {entry_id: value}}, empty for older snapshots.
+        self._places_block = {}
+        self._forms = {}
+        self._block_classes = {}
+
         # The translation key behind each display name: {registry_type: {entry_id: key}}.
         # NOT nested under locale, unlike the names above — `block.spawn.anthill` is the
         # same key whether you are reading English or German. Empty for schema-1 snapshots,
@@ -336,6 +344,13 @@ class Packdump:
                 raise FileNotFoundError(f"no localization files in {attr_dir_in}")
             for path in locale_files:
                 result._load_localizations(path)
+
+            # Optional, and by presence rather than by version: a snapshot from before
+            # schema 3 simply has no such file, and answers None for what it never held —
+            # the same shrug it gives for an entry a registry never had.
+            block_items = attr_dir_in / "block_items.json"
+            if block_items.is_file():
+                result._load_block_items(block_items)
             # Which locale is *active* must not depend on filename sort order, or adding a
             # German dump would silently re-language the whole GUI.
             if "en_us" in result._localizations:
@@ -347,6 +362,19 @@ class Packdump:
         log.info(f"Successfully loaded packdump from {snapshot_path}")
         return result
     # Various helper loaders for attributes
+    def _load_block_items(self, path: Path):
+        """`attributes/block_items.json` — what the game knows and a reader cannot guess.
+
+        Each map is read independently. A half-written file that has `places` but no `forms`
+        should still give up the half it has, for the same reason `keys` is feature-detected
+        above: the version says what a reader may expect, not what a file actually contains.
+        """
+        with open(path, "r") as f:
+            data = json.load(f)
+        self._places_block = data.get("places") or {}
+        self._forms = data.get("forms") or {}
+        self._block_classes = data.get("classes") or {}
+
     def _load_localizations(self,locals_path: Path):
         with open(locals_path, "r") as f:
             locals_dict = json.load(f)
@@ -423,6 +451,18 @@ class Packdump:
             if self._localization_keys:
                 payload["keys"] = self._localization_keys
             write_json(attr_dir / f"localization.{locale}.json", payload)
+
+        # Same rule as `keys`: written only when this snapshot actually carries them, so
+        # round-tripping an older dump produces an older dump rather than one claiming the
+        # mod found no block items at all.
+        if self._places_block or self._forms or self._block_classes:
+            write_json(attr_dir / "block_items.json", {
+                "schema_version": self._schema,
+                "type": "block_items",
+                "places": self._places_block,
+                "forms": self._forms,
+                "classes": self._block_classes,
+            })
 
         log.info(f"Packdump saved to {snapshot_path}")
 
@@ -515,6 +555,40 @@ class Packdump:
     def _has_localization_key(self, registry_type: str) -> bool:
         return bool(self._localization_keys.get(registry_type))
 
+    def _read_places_block(self, registry_type: str, entry_id: str):
+        return self._places_block.get(registry_type, {}).get(entry_id)
+
+    def _has_places_block(self, registry_type: str) -> bool:
+        return bool(self._places_block.get(registry_type))
+
+    def _read_form(self, registry_type: str, entry_id: str):
+        return self._forms.get(registry_type, {}).get(entry_id)
+
+    def _has_form(self, registry_type: str) -> bool:
+        return bool(self._forms.get(registry_type))
+
+    def _read_block_class(self, registry_type: str, entry_id: str):
+        return self._block_classes.get(registry_type, {}).get(entry_id)
+
+    def _has_block_class(self, registry_type: str) -> bool:
+        return bool(self._block_classes.get(registry_type))
+
+    def is_block_item(self, entry_id: str) -> bool:
+        """Whether this `minecraft:item` places a block.
+
+        A real answer from the game rather than an inference. The two guesses available from
+        the registries alone — id present in `minecraft:block`, or a `block.` translation key
+        — disagree with each other on 114 items of a 300-mod pack, and each is wrong in the
+        direction the other is right. `False` for a snapshot older than schema 3, which is
+        indistinguishable from "not a block item" and is why callers that care should ask
+        `knows_block_items()` first.
+        """
+        return entry_id in self._places_block.get("minecraft:item", {})
+
+    def knows_block_items(self) -> bool:
+        """Whether this snapshot was dumped by a mod that recorded any of this at all."""
+        return bool(self._places_block)
+
     # name -> (read it for one entry, does this registry carry it at all). The two live
     # together because they are the same fact asked at different scales, and a reader
     # without a prober is how a column ends up offered for a registry that has no values
@@ -522,6 +596,9 @@ class Packdump:
     _ATTRIBUTES = {
         "localization": (_read_localization, _has_localization),
         "localization_key": (_read_localization_key, _has_localization_key),
+        "places_block": (_read_places_block, _has_places_block),
+        "form": (_read_form, _has_form),
+        "block_class": (_read_block_class, _has_block_class),
     }
 
     @classmethod

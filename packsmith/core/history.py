@@ -116,6 +116,14 @@ class JobRunStore:
             "SELECT * FROM job_runs ORDER BY id DESC")]
 
 
+def _root_store(files, root):
+    """The store for one root. `files` may be a `FileRoots` or a bare `FileStore`, because
+    plenty of callers legitimately have only the instance and no registry."""
+    if root and hasattr(files, "store"):
+        return files.store(root)
+    return files
+
+
 def rollback_step(run_id: int, *, tag_store, history, file_store=None,
                   blueprint_store=None):
     """Reverse a committed step, restoring every engine to its pre-step state.
@@ -144,8 +152,16 @@ def rollback_step(run_id: int, *, tag_store, history, file_store=None,
     file_snapshots = data.get("files", {})
     if file_snapshots and file_store is None:
         raise ValueError("this step wrote files; rollback needs a file_store")
-    for path, snap in file_snapshots.items():
-        file_store.restore(path, snap["content"], snap["ownership"])
+    for stored_key, snap in file_snapshots.items():
+        # The key is root-qualified since 6.6 and was a bare path before it; the path is
+        # carried inside now, so the key never has to be parsed back apart.
+        path = snap.get("path", stored_key)
+        # The root travels with the snapshot (design 6.6). Restoring by path alone would
+        # put the bytes back under the instance regardless of where they came from — and a
+        # record written before roots existed has none, which reads as the instance,
+        # which is the only place it could have been.
+        _root_store(file_store, snap.get("root")).restore(
+            path, snap["content"], snap["ownership"])
 
     # Blueprints: same shape as L2, plus instances the step brought into existence.
     blueprint_inverse = data.get("blueprints", [])

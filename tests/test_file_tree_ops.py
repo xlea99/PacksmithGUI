@@ -151,7 +151,7 @@ def qapp():
 def panel(files, monkeypatch):
     """A real panel over a real store, with the modals answered for it."""
     from PySide6.QtWidgets import QInputDialog, QMessageBox
-    from packsmith.gui.shell.panels.files_panel import FilesPanel
+    from packsmith.gui.shell.panels.files_panel import FileBrowser
 
     (files.root / "cfg").mkdir()
     files.write("cfg/a.json", "1", owner="user")
@@ -162,7 +162,7 @@ def panel(files, monkeypatch):
                         staticmethod(lambda *a, **k: (answers["text"], True)))
     monkeypatch.setattr(QMessageBox, "question",
                         staticmethod(lambda *a, **k: answers["confirm"]))
-    return FilesPanel(files), files, answers
+    return FileBrowser(files), files, answers
 
 
 def _labels(menu):

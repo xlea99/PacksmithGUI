@@ -103,7 +103,7 @@ class Buffers:
 def run_action(action_fn, *, tag_store, packdump, action_ref,
                mappings=None, config=None, file_store=None, history=None,
                history_context=None, conflict_policies=None,
-               blueprint_store=None, pack_targets=None,
+               blueprint_store=None, pack_targets=None, package_dir=None,
                buffers=None, commit=True) -> StepResult:
     """Run a single action callable through the staging lifecycle. Returns a
     StepResult; never raises for a failing action — failures are captured.
@@ -129,7 +129,7 @@ def run_action(action_fn, *, tag_store, packdump, action_ref,
                 action_ref=action_ref, mappings=mappings, config=config,
                 conflict_policies=conflict_policies,
                 blueprint_staging=blueprints, blueprint_store=blueprint_store,
-                pack_targets=pack_targets)
+                pack_targets=pack_targets, package_dir=package_dir)
     if files is not None:
         files.logs_to(pack.log)     # its notices belong with the action's own output
 

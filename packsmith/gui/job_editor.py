@@ -260,10 +260,11 @@ class StepForm(QWidget):
     committed = Signal()
 
     def __init__(self, manifest, tag_store, step, parent=None, blueprint_store=None,
-                 packdump=None, pack_targets=None):
+                 packdump=None, pack_targets=None, file_roots=None):
         super().__init__(parent)
         self._dump = packdump
         self._pack_targets = pack_targets
+        self._file_roots = file_roots
         self._manifest = manifest
         self._tags = tag_store
         self._blueprints = blueprint_store
@@ -603,7 +604,7 @@ class StepPanel(QWidget):
     pick_cancelled = Signal()
 
     def __init__(self, *, job_store, tag_store, package_index, blueprint_store=None,
-                 packdump=None, pack_targets=None, parent=None):
+                 packdump=None, pack_targets=None, parent=None, file_roots=None):
         super().__init__(parent)
         self._jobs = job_store
         self._tags = tag_store
@@ -611,6 +612,7 @@ class StepPanel(QWidget):
         self._blueprints = blueprint_store
         self._dump = packdump
         self._pack_targets = pack_targets
+        self._file_roots = file_roots
         self._step_id = None
         self._form = None
         self._picker = None
@@ -775,7 +777,8 @@ class StepPanel(QWidget):
         self._subtitle.setVisible(bool(manifest.description))
 
         self._form = StepForm(manifest, self._tags, step, blueprint_store=self._blueprints,
-                              packdump=self._dump, pack_targets=self._pack_targets)
+                              packdump=self._dump, pack_targets=self._pack_targets,
+                              file_roots=self._file_roots)
         self._form.committed.connect(self._write)
         self._host_layout.addWidget(self._form)
         self._show_relink_if_owed(step)
@@ -904,7 +907,8 @@ class JobEditorTab(QWidget):
     action_info_requested = Signal(str)    # action ref — open its reference page
 
     def __init__(self, job, *, job_store, package_index, tag_store, parent=None,
-                 blueprint_store=None, packdump=None, pack_targets=None, history=None):
+                 blueprint_store=None, packdump=None, pack_targets=None, history=None,
+                 file_roots=None):
         super().__init__(parent)
         self._job_id = job.id
         self._jobs = job_store
@@ -913,6 +917,7 @@ class JobEditorTab(QWidget):
         self._blueprints = blueprint_store
         self._dump = packdump
         self._pack_targets = pack_targets
+        self._file_roots = file_roots
         # Optional: without it the Last run column simply stays empty, which is the honest
         # rendering of "this tab has no history to read" rather than a reason to refuse.
         self._history = history
@@ -1103,7 +1108,8 @@ class JobEditorTab(QWidget):
                                              tag_store=self._tags,
                                              blueprint_store=self._blueprints,
                                              packdump=self._dump,
-                                             pack_targets=self._pack_targets):
+                                             pack_targets=self._pack_targets,
+                                             file_roots=self._file_roots):
                     self._problems.setdefault(problem.step_id, []).append(problem)
             except Exception:        # a cosmetic check must never stop the tab opening
                 pass
@@ -1364,7 +1370,8 @@ class JobEditorTab(QWidget):
         guessed = best_guess_bindings(manifest, self._tags,
                                       blueprint_store=self._blueprints,
                                       packdump=self._dump,
-                                      pack_targets=self._pack_targets)
+                                      pack_targets=self._pack_targets,
+                                      file_roots=self._file_roots)
         # A slot it declined to guess stays genuinely unbound: an empty entry would read as
         # "bound to nothing" to `step_problems`, which is a different claim.
         bindings = {name: value for name, value in guessed.items()

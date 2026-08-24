@@ -12,7 +12,7 @@ Gaps are painted rather than left blank. An empty slot is the *output* of the pr
 missing content that needs generating or sourcing — so it reads as a marked absence, not as
 an empty cell you might have missed.
 """
-from PySide6.QtCore import QRect, Qt, QTimer, Signal
+from PySide6.QtCore import QEvent, QRect, Qt, QTimer, Signal
 from PySide6.QtGui import QCursor, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QAbstractItemView, QCheckBox, QComboBox, QCompleter, QDialog, QDialogButtonBox,
@@ -397,10 +397,25 @@ class _SlotDelegate(QStyledItemDelegate):
                 lambda value, e=editor: self._choose(e, row, column, value))
         return editor
 
+    def eventFilter(self, editor, event):
+        """Notice an Enter on its way to finishing the edit.
+
+        Read here rather than in the view: while a cell is being edited the editor holds
+        focus, so `_InstanceGrid.keyPressEvent` never sees the key at all. The picker
+        installs its own filter on the same editor and swallows Enter when a suggestion is
+        highlighted — that path sets the flag from `_choose` instead, so both arrive.
+        """
+        if (event.type() == QEvent.KeyPress
+                and event.key() in (Qt.Key_Return, Qt.Key_Enter)):
+            self._tab.advance_after_commit()
+        return super().eventFilter(editor, event)
+
     def _choose(self, editor, row, column, value):
         """Picking from the list finishes the edit. In a grid you chose the value, not a
         prefix of it — making you press Enter again to confirm your own click is friction
         for nothing."""
+        # Choosing IS finishing, however it was chosen, so it moves on like an Enter would.
+        self._tab.advance_after_commit()
         try:
             editor.setText(value)
         except RuntimeError:
@@ -453,6 +468,7 @@ class BlueprintEditorTab(QWidget):
         self._sticky = {}              # the last slot's type/registry, for the next one
         self._tree_items = {}          # slot path -> its row in the schema tree
         self._picker = None            # the open suggestion popup, kept alive
+        self._advance = False          # Enter pending: step down after the commit
         # Per tab, per §9.3.3 — global undo would reverse something you cannot see.
         self._undo = UndoStack(store._db, [BindingEngine(store)])
         self._picker_cell = None       # (row, column) it is attached to, if any
@@ -1229,6 +1245,19 @@ class BlueprintEditorTab(QWidget):
         return (self._picker is not None and self._picker.isVisible()
                 and self._picker_cell not in (None, (row, column)))
 
+    def advance_after_commit(self):
+        """Arm the spreadsheet step-down for the commit that is about to happen.
+
+        A flag rather than an argument because the two paths that end an edit with Enter
+        both run inside Qt's own machinery — the delegate's event filter and the picker's —
+        and neither is on the call path that eventually reaches `commit_cell`.
+        """
+        self._advance = True
+
+    def _take_advance(self) -> bool:
+        armed, self._advance = self._advance, False
+        return armed
+
     def _keep_cell(self, row, column):
         """Leave the cursor where the user's attention is.
 
@@ -1248,6 +1277,18 @@ class BlueprintEditorTab(QWidget):
         # and the other must not undo it. `take_pressed_cell` is read-and-clear, so without
         # this the second pass reads None and falls back to the cell being left.
         target = [(row, column)]
+
+        # Enter steps down a row, the way a spreadsheet does — filling a column of 47
+        # instances should be type/Enter/type/Enter, not a reach for the mouse between
+        # every one. Read here, once, because `restore()` runs twice and a read-and-clear
+        # in there would leave the second pass disagreeing with the first.
+        #
+        # Stopping at the last row rather than wrapping: wrapping to the top of the next
+        # column looks like the cursor jumped somewhere random, and the bottom of a column
+        # is exactly where you stop to think anyway. A click still wins over this below —
+        # clicking elsewhere is a statement about where you want to be next.
+        if self._take_advance() and row + 1 < len(self._instances):
+            target[0] = (row + 1, column)
 
         def restore():
             # Read the press HERE rather than in `_keep_cell`, because of the order the

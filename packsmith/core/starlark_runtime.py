@@ -232,15 +232,22 @@ def _bp_slot_info(blueprint, path):
         group = d["group"],
     )
 
-def _resolve(path):
+def _resolve(path, root = None):
+    # `root` names a TRACKED FOLDER the user bound to this step (design 6.6) — never a
+    # literal. Omitted it means the instance, whose paths are the only universal ones:
+    # `config/reliable_remover/...` is a fact about a mod and true everywhere, while
+    # `deep_end_tweaks` is one person's folder on one machine.
+    at = root if root else "minecraft"
     return struct(
+        root = at,
         path = path,
-        read_all = partial(_fs_read_all, path),
-        read_json = partial(_fs_read_json, path),
-        write = partial(_fs_write, path),
-        write_json = partial(_fs_write_json, path),
-        exists = partial(_fs_exists, path),
-        ownership = partial(_fs_ownership, path),
+        read_all = partial(_fs_read_all, path, at),
+        read_json = partial(_fs_read_json, path, at),
+        write = partial(_fs_write, path, at),
+        write_json = partial(_fs_write_json, path, at),
+        copy_from = partial(_fs_copy_from, path, at),
+        exists = partial(_fs_exists, path, at),
+        ownership = partial(_fs_ownership, path, at),
     )
 
 # The provider-routed resolvers (7.3). The host does the routing — it asks the active
@@ -257,6 +264,16 @@ def _datapack_resolve(pack, namespace, path):
 
 def _resourcepack_resolve(pack, namespace, path):
     return _resolve(_rp_target(pack, namespace, path))
+
+# `owned` hands back HANDLES for the same reason `resolve` does: a bare path has to be
+# re-resolved by hand to be used, and that round trip is only correct while there is one
+# root it could mean. Paths cross the host boundary because primitives are what cross it
+# cleanly; the struct is rebuilt here, the same way the resolvers above do it.
+def _datapack_owned(pack):
+    return [_resolve(path) for path in _dp_owned(pack)]
+
+def _resourcepack_owned(pack):
+    return [_resolve(path) for path in _rp_owned(pack)]
 
 pack = struct(
     action_ref = {_literal(pack.action_ref)},
@@ -289,8 +306,8 @@ pack = struct(
         unbind = _bp_unbind,
     ),
     filesystem = struct(resolve = _resolve),
-    datapacks = struct(resolve = _datapack_resolve, owned = _dp_owned),
-    resourcepacks = struct(resolve = _resourcepack_resolve, owned = _rp_owned),
+    datapacks = struct(resolve = _datapack_resolve, owned = _datapack_owned),
+    resourcepacks = struct(resolve = _resourcepack_resolve, owned = _resourcepack_owned),
     capabilities = struct(
         has = _cap_has,
         version = _cap_version,
@@ -331,21 +348,28 @@ def _inject(module: Module, pack):
         "_bp_create": _blueprints(pack).create,
         "_bp_bind": _blueprints(pack).bind,
         "_bp_unbind": _blueprints(pack).unbind,
-        # Filesystem operations take the path first so `partial` can pre-bind it.
-        "_fs_read_all": lambda path: pack.filesystem.resolve(path).read_all(),
-        "_fs_read_json": lambda path: pack.filesystem.resolve(path).read_json(),
+        # Filesystem operations take the path and ROOT first so `partial` can pre-bind
+        # both — the prelude builds one handle struct and every method on it has to
+        # reach the same file.
+        "_fs_read_all": lambda path, root: pack.filesystem.resolve(path, root).read_all(),
+        "_fs_read_json": lambda path, root: pack.filesystem.resolve(path, root).read_json(),
         # The existence flags are part of the declared surface (§7.3) — dropping them here
         # made `handle.write(x, file_must_exist=True)` a TypeError from Starlark, so the
         # only guard an action could ask for was unreachable from the only language that
         # writes actions.
-        "_fs_write": lambda path, content, file_must_exist=False:
-            pack.filesystem.resolve(path).write(
+        "_fs_write": lambda path, root, content, file_must_exist=False:
+            pack.filesystem.resolve(path, root).write(
                 content, file_must_exist=file_must_exist),
-        "_fs_write_json": lambda path, obj, file_must_exist=False:
-            pack.filesystem.resolve(path).write_json(
+        "_fs_write_json": lambda path, root, obj, file_must_exist=False:
+            pack.filesystem.resolve(path, root).write_json(
                 obj, file_must_exist=file_must_exist),
-        "_fs_exists": lambda path: pack.filesystem.resolve(path).exists(),
-        "_fs_ownership": lambda path: pack.filesystem.resolve(path).ownership(),
+        # Bytes never enter Starlark — the language has no type for them, and an action
+        # that could hold a PNG could also corrupt one. It names a source and a
+        # destination; the copy happens on this side.
+        "_fs_copy_from": lambda path, root, source:
+            pack.filesystem.resolve(path, root).copy_from(source),
+        "_fs_exists": lambda path, root: pack.filesystem.resolve(path, root).exists(),
+        "_fs_ownership": lambda path, root: pack.filesystem.resolve(path, root).ownership(),
         # Provider-routed resolvers hand back the routed PATH, not a handle: the prelude
         # rebuilds the handle with `_resolve` so every resolver produces one shape (7.3).
         # A missing loader or an unknown pack raises here, on the host side, with the
@@ -356,8 +380,10 @@ def _inject(module: Module, pack):
             pack.resourcepacks.resolve(pack_name, namespace, path).path,
         # "What did I write last time" — read off `file_ownership` rather than remembered,
         # and scoped to one pack so a step cannot clear another step's output.
-        "_dp_owned": pack.datapacks.owned,
-        "_rp_owned": pack.resourcepacks.owned,
+        # Flattened to paths at the boundary and rebuilt into handles by the prelude —
+        # a host-side object is not something Starlark can hold methods on.
+        "_dp_owned": lambda name: [h.path for h in pack.datapacks.owned(name)],
+        "_rp_owned": lambda name: [h.path for h in pack.resourcepacks.owned(name)],
         "_cap_has": pack.capabilities.has,
         "_cap_version": pack.capabilities.version,
         # §7.6: "print could be redirected to pack.log("debug", ...) for author-convenience

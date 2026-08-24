@@ -141,6 +141,62 @@ class Has:
     field: object
 
 
+# --- Registry entries, asked about a blueprint -------------------------------
+#
+# Both cross from L1 back into L2 the *opposite* way to everything above: the row is a
+# registry entry and the question is about a blueprint. That direction had no expression at
+# all — `Slot` under a registry scope refuses, and rightly, because a slot belongs to one
+# instance and an entry belongs to none.
+#
+# What makes these well-formed where `Slot` is not: neither asks which instance or slot an
+# entry belongs to. They ask a yes/no question about the blueprint taken WHOLE — is this id
+# claimed anywhere in it, does its name belong to the vocabulary of its instances. A
+# blueprint as a *set* is something a registry entry can be compared against.
+#
+# Together they express the question the primitive implies but could not previously ask:
+# "everything that looks like it belongs to one of my stones, that I did not choose."
+#
+#     Mentions("StoneType") AND NOT BoundIn("StoneType")
+
+@dataclass(frozen=True)
+class BoundIn:
+    """This entry's id is a value bound somewhere in ``blueprint``.
+
+    ``slot`` narrows it to one slot path — "what else did I pass over for `pillar.base`"
+    rather than "what did I pass over entirely".
+    """
+    blueprint: str
+    slot: str = None
+
+
+@dataclass(frozen=True)
+class Mentions:
+    """This entry's id carries the name of one of ``blueprint``'s instances, as whole words.
+
+    **Whole words, never substring.** `stone` is a real instance name in a real pack, and
+    substring matching on it drags in `cobblestone`, `sandstone`, `limestone`, `tombstone`
+    and `sandstone_stove` — measured at 674 false positives out of 2,135, a third of the
+    answer being garbage. Token matching (§5.3's `matches_tokens`) is the same machinery the
+    candidate finder already uses, for the same reason.
+
+    **The instance name is the search term, and no ceremony says so.** Measured against a
+    real 42-instance blueprint, 98% of bound ids carry their own instance name as whole
+    words; a dedicated `search_term` slot would be 42 cells encoding what 41 of them already
+    say. It would also be a drift surface — add an instance, forget the cell, and it
+    silently leaves the view — and unfilled cells would read as gaps in a blueprint whose
+    gaps are its actual output (§3.2.2).
+
+    ``alias_slot`` is the escape hatch for the other 2%: a string slot whose value adds
+    search terms for that instance. In the pack this was designed against exactly one
+    instance needed it — `primestone`, whose blocks are all named `alexscaves:limestone`.
+    Additive, never replacing: the question is whether ANY instance mentions the entry, so a
+    wider net costs nothing while a wrong exclusion costs a block going unnoticed. Absent
+    means "the name is enough", which is true for almost every instance.
+    """
+    blueprint: str
+    alias_slot: str = None
+
+
 @dataclass(frozen=True)
 class And:
     clauses: list
@@ -211,3 +267,33 @@ class Query:
     distinct: bool = False
     group_by: list = None
     having: object = None
+
+
+def blueprints_read(node) -> set:
+    """Every blueprint name ``node`` depends on, at any depth.
+
+    A registry-scoped query can now read L2 *blueprint* state (`BoundIn`, `Mentions`), which
+    means it can go stale from an edit made somewhere else entirely — bind a cell in the
+    grid and a "what did I not choose" view is wrong until it re-runs. Whoever refreshes
+    views needs to know which ones care, and asking the query is the only way that cannot
+    drift from what the query actually does.
+
+    Walks generically rather than matching known shapes: a node added later is covered the
+    day it exists, which is the same argument `serde` makes for deriving its node table.
+    """
+    import dataclasses
+
+    found = set()
+    stack = [node]
+    while stack:
+        current = stack.pop()
+        if isinstance(current, (list, tuple)):
+            stack.extend(current)
+            continue
+        if isinstance(current, Blueprint):
+            found.add(current.name)
+        elif isinstance(current, (BoundIn, Mentions)):
+            found.add(current.blueprint)
+        if dataclasses.is_dataclass(current) and not isinstance(current, type):
+            stack.extend(getattr(current, f.name) for f in dataclasses.fields(current))
+    return found

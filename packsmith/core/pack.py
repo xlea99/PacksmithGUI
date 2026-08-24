@@ -9,6 +9,7 @@ construction — an action cannot forge a different owner.
 One ``Pack`` is constructed per step invocation and injected into the action's entry
 point as its single argument.
 """
+from pathlib import Path
 import json
 
 from packsmith.core.bindings import policy_key
@@ -383,14 +384,26 @@ class _FileHandle:
     """A handle to one file (from ``pack.filesystem.resolve(path)``). Writes are
     staged and stamp the calling action as owner (whole-file, open-world engine)."""
 
-    def __init__(self, staging, rel_path, action_ref):
+    def __init__(self, staging, rel_path, action_ref, package_dir=None, root=None):
         self._staging = staging
         self._path = rel_path
         self._action_ref = action_ref
+        self._package_dir = package_dir
+        self._root = root or "minecraft"
+
+    @property
+    def root(self):
+        """Which tracked root this handle lives under.
+
+        A handle that cannot say where it lives is the reason `owned()` stopped returning
+        strings: a path alone is only re-resolvable while there is exactly one place it
+        could mean, and since 6.6 there is not.
+        """
+        return self._root
 
     @property
     def path(self):
-        """Where this handle writes, relative to the instance root.
+        """Where this handle writes, relative to its root.
 
         Public because §7.3 has handles carrying their resolved path, and because it is
         what a provider-routed resolver has to hand back: `pack.datapacks.resolve(...)`
@@ -407,17 +420,18 @@ class _FileHandle:
         gone. Staged — nothing reaches disk until the step completes. Writing over a
         user-owned file is hard-blocked rather than resolved by policy (design 6.1)."""
         self._staging.write(self._path, content, owner="action",
-                            owner_action_ref=self._action_ref, file_must_exist=file_must_exist)
+                            owner_action_ref=self._action_ref,
+                            file_must_exist=file_must_exist, root=self._root)
 
     def read_all(self):
         """The file's whole contents as text, or None if it does not exist. Staged-first,
         so it reflects a write this step already made."""
-        return self._staging.read(self._path)
+        return self._staging.read(self._path, root=self._root)
 
     def read_json(self):
         """Read the whole file as parsed JSON/JSON5 (comments tolerated). Returns
         None if the file doesn't exist."""
-        content = self._staging.read(self._path)
+        content = self._staging.read(self._path, root=self._root)
         return None if content is None else _loads_json5(content)
 
     def write_json(self, obj, *, file_must_exist=False):
@@ -425,32 +439,80 @@ class _FileHandle:
         Quick-and-dirty: comments are NOT preserved (whole-file ownership). Per-key,
         comment-preserving round-tripping is a deferred future capability."""
         self._staging.write(self._path, _dumps_json(obj), owner="action",
-                            owner_action_ref=self._action_ref, file_must_exist=file_must_exist)
+                            owner_action_ref=self._action_ref,
+                            file_must_exist=file_must_exist, root=self._root)
+
+    def copy_from(self, source):
+        """Copy a file out of this action's own package to here, bytes intact.
+
+        The way a PNG reaches the pack. Packsmith does not generate images and is not going
+        to — what it does is put an authored one where the game will find it, which is the
+        tedious, error-prone half: the right namespace, the right folder, and a record of
+        who put it there.
+
+        **The source is package-relative and cannot escape the package.** An action's
+        package is content the user authored and version-controls alongside the code that
+        uses it, so a texture living beside the action that places it needs no new trust
+        boundary. Reading an arbitrary path on disk is a different question with a different
+        answer, and it belongs with tracked folders rather than smuggled in here.
+
+        Staged like every other write, so it dry-runs, reports, obeys the hard-block, and
+        rolls back — none of which comes free with `shutil.copy`.
+        """
+        self._staging.write(self._path, self._read_package_file(source), owner="action",
+                            owner_action_ref=self._action_ref, root=self._root)
+
+    def _read_package_file(self, source) -> bytes:
+        if self._package_dir is None:
+            raise RuntimeError(
+                "copy_from needs the action's package folder, which this step was not "
+                "given — see run_action(package_dir=...)")
+        root = Path(self._package_dir).resolve()
+        target = (root / str(source)).resolve()
+        if target != root and not target.is_relative_to(root):
+            raise ValueError(f"'{source}' escapes the package folder")
+        if not target.is_file():
+            raise FileNotFoundError(
+                f"'{source}' is not in the '{root.name}' package")
+        return target.read_bytes()
 
     def exists(self):
         """Whether the file is there — counting one this step has staged but not committed."""
-        return self._staging.exists(self._path)
+        return self._staging.exists(self._path, root=self._root)
 
     def ownership(self):
         """Who owns this file — `{"kind": "user"|"action", "action_ref": ...}` — or None if
         Packsmith has never tracked it (design 6.1's untouched state)."""
-        return self._staging.ownership(self._path)
+        return self._staging.ownership(self._path, root=self._root)
 
 
 class _Filesystem:
     """``pack.filesystem`` — whole-file access within the instance root. Raises if
     the step wasn't given a filesystem provider (no instance / file store)."""
 
-    def __init__(self, staging, action_ref):
+    def __init__(self, staging, action_ref, package_dir=None):
         self._staging = staging
         self._action_ref = action_ref
+        self._package_dir = package_dir
 
-    def resolve(self, path):
-        """A handle on one file, by path relative to the instance root. Escaping the root
-        is refused. The handle does the I/O — see its `read_all` / `write`."""
+    def resolve(self, path, root=None):
+        """A handle on one file. Escaping the root is refused.
+
+        `root` is a tracked folder's name and comes from a `kind = "folder"` mapping the
+        user bound to this step — **never a literal** (design 6.6). Omitted, it means the
+        instance, which is the one root every profile has and the one whose paths are
+        universal: `config/reliable_remover/...` is a fact about a mod, true everywhere, so
+        hardcoding it couples the action to nothing. `deep_end_tweaks` is one person's
+        folder on one machine.
+
+        There is deliberately no `minecraft:` prefix form. A second spelling of one path is
+        a cost with no benefit, and worse, the grammar would advertise a capability that
+        must not exist — if `minecraft:x` parsed, the next thing written is `tweaks:x`.
+        """
         if self._staging is None:
             raise RuntimeError("filesystem capability is not available for this step")
-        return _FileHandle(self._staging, path, self._action_ref)
+        return _FileHandle(self._staging, path, self._action_ref, self._package_dir,
+                           root=root)
 
 
 class _PackNamespace:
@@ -471,9 +533,13 @@ class _PackNamespace:
     # `assets/` is resource pack territory (§6.5).
     _ROOTS = {"datapacks": "data", "resourcepacks": "assets"}
 
-    def __init__(self, staging, action_ref, targets, kind):
+    def __init__(self, staging, action_ref, targets, kind, package_dir=None):
         self._staging = staging
         self._action_ref = action_ref
+        # Carried so a provider-routed handle can `copy_from` too: putting a texture into a
+        # resource pack is the whole point, and it would be strange if the namespace that
+        # knows where resource packs live were the one place that could not do it.
+        self._package_dir = package_dir
         self._targets = targets
         self._kind = kind
 
@@ -500,7 +566,14 @@ class _PackNamespace:
         if self._staging is None:
             raise CapabilityError(
                 f"{self._kind} capability is not available for this step (no file store)")
-        return list(self._staging.owned_by(self._action_ref, under=self._pack_root(pack)))
+        # HANDLES, not paths. A path handed back to an author is re-resolved by hand —
+        # `pack.filesystem.resolve(path)` — and that round trip is only correct while there
+        # is exactly one root it could mean. A handle never stopped knowing where it lives,
+        # so it cannot be resolved into the wrong place, and it is the object the caller
+        # wanted anyway: every use of this list ends in reading or writing the file.
+        return [_FileHandle(self._staging, path, self._action_ref, self._package_dir)
+                for path in self._staging.owned_by(self._action_ref,
+                                                   under=self._pack_root(pack))]
 
     def _pack_root(self, pack) -> str:
         provider = self._targets.provider_for(self._kind) if self._targets else None
@@ -548,7 +621,7 @@ class _PackNamespace:
         member = f"{self._ROOTS[self._kind]}/{namespace}/{str(path).lstrip('/')}"
         target = provider.override_path(self._targets.root, pack, member, kind=self._kind)
         rel = target.relative_to(self._targets.root).as_posix()
-        return _FileHandle(self._staging, rel, self._action_ref)
+        return _FileHandle(self._staging, rel, self._action_ref, self._package_dir)
 
 
 class _Capabilities:
@@ -585,7 +658,8 @@ class Pack:
 
     def __init__(self, *, staging, tag_store, packdump, action_ref,
                  file_staging=None, mappings=None, config=None, conflict_policies=None,
-                 blueprint_staging=None, blueprint_store=None, pack_targets=None):
+                 blueprint_staging=None, blueprint_store=None, pack_targets=None,
+                 package_dir=None):
         self.action_ref = action_ref
         self._log = []
         # Set by fail(); None means "no deliberate failure was requested".
@@ -596,13 +670,14 @@ class Pack:
         self.blueprints = _Blueprints(blueprint_staging, blueprint_store, action_ref,
                                       conflict_policies=conflict_policies, log=self.log) \
             if blueprint_store is not None else None
-        self.filesystem = _Filesystem(file_staging, action_ref)
+        self.filesystem = _Filesystem(file_staging, action_ref, package_dir)
         # Provider-routed (§7.3): the same two namespaces exist whether or not a loader is
         # installed, and refuse with a message naming what is missing rather than being
         # absent — `pack.datapacks` raising AttributeError would tell the author nothing.
-        self.datapacks = _PackNamespace(file_staging, action_ref, pack_targets, "datapacks")
+        self.datapacks = _PackNamespace(file_staging, action_ref, pack_targets, "datapacks",
+                                        package_dir)
         self.resourcepacks = _PackNamespace(file_staging, action_ref, pack_targets,
-                                            "resourcepacks")
+                                            "resourcepacks", package_dir)
         self.capabilities = _Capabilities(
             pack_targets.table if pack_targets is not None else None)
         self.step = _Step(mappings, config)

@@ -166,7 +166,7 @@ def test_a_partial_commit_keeps_its_rollback_record(tags, tmp_path):
     import json
     recorded = json.loads(history.get(result.run_id)["rollback_data"])
     assert recorded["files"], "the way back was thrown away"
-    assert "made.json" in recorded["files"]
+    assert "minecraft::made.json" in recorded["files"], recorded["files"]
 
 
 def test_a_rolled_back_transaction_records_nothing_to_undo(tags, tmp_path):

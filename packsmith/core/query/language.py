@@ -36,7 +36,8 @@ gesture in the bar does the most valuable thing (design 5.3), finding
 import re
 
 from packsmith.core.query.ast import (
-    And, Attribute, Cmp, Has, Id, Mod, Not, Or, Slot, Tag, QueryError, _Id, _Mod,
+    And, Attribute, BoundIn, Cmp, Has, Id, Mentions, Mod, Not, Or, Slot, Tag, QueryError,
+    _Id, _Mod,
 )
 from packsmith.core.query.tokens import tokenize
 
@@ -55,6 +56,7 @@ _OP_TEXT = {"eq": "==", "neq": "!=", "gte": ">=", "lte": "<=", "gt": ">", "lt": 
             "contains": "CONTAINS", "matches": "MATCHES",
             "matches_tokens": "MATCHES_TOKENS", "in": "IN", "not_in": "NOT IN"}
 _KEYWORDS = {"and", "or", "not", "has", "in", "contains", "matches", "matches_tokens",
+             "mentions", "bound_in",
              "true", "false"} | set(_CI_WORD_OPS)
 
 # `Cmp.ci` is engine-legal but had no spelling, so `format` silently dropped it and a
@@ -225,6 +227,8 @@ class _Parser:
         if self.at_keyword("has"):
             self.next()
             return Has(self.parse_field())
+        if self.at_keyword("mentions", "bound_in"):
+            return self.parse_crossing()
         if self._starts_comparison():
             return self.parse_comparison()
         return self.parse_bare()
@@ -325,6 +329,34 @@ class _Parser:
                 return float(token.value) if "." in token.value else int(token.value)
             return token.value
         self.fail("expected a value", token)
+
+    def parse_crossing(self):
+        """``MENTIONS "StoneType"`` / ``BOUND_IN "StoneType"``, each taking an optional
+        second argument in the list form the language already uses for arguments:
+
+            MENTIONS "StoneType"                      instance names only
+            MENTIONS ("StoneType", "search_terms")    plus an alias slot
+            BOUND_IN "StoneType"                      bound anywhere
+            BOUND_IN ("StoneType", "pillar.base")     bound in that one slot
+
+        A whole condition rather than a field with an operator, because there is nothing to
+        compare — the answer is already yes or no, the same shape as HAS.
+        """
+        node = BoundIn if self.next().value == "bound_in" else Mentions
+        token = self.peek()
+        if token is not None and token.kind == "(":
+            self.next()
+            args = [str(self._scalar())]
+            if self.peek() is not None and self.peek().kind == ",":
+                self.next()
+                args.append(str(self._scalar()))
+            if self.peek() is None or self.peek().kind != ")":
+                self.fail("expected ')'")
+            self.next()
+            if len(args) > 2:
+                self.fail("expected at most a blueprint and one slot")
+            return node(*args)
+        return node(str(self._scalar()))
 
     def parse_bare(self):
         """A run of words with no operator: the candidate finder (design 5.3).
@@ -454,12 +486,22 @@ def _format(node, parent_precedence):
         return f"NOT {_format(inner, 3)}"
     if isinstance(node, Has):
         return f"HAS {_field_text(node.field)}"
+    if isinstance(node, (BoundIn, Mentions)):
+        return _crossing_text(node)
     if isinstance(node, Cmp):
         ci = getattr(node, "ci", False)
         operator = (_CI_OPS[node.op] if ci and node.op in _CI_OPS
                     else _OP_TEXT[node.op])
         return f"{_field_text(node.field)} {operator} {_value_text(node)}"
     raise QueryError(f"cannot format {node!r}")
+
+
+def _crossing_text(node) -> str:
+    keyword = "BOUND_IN" if isinstance(node, BoundIn) else "MENTIONS"
+    second = node.slot if isinstance(node, BoundIn) else node.alias_slot
+    if second:
+        return f'{keyword} ("{node.blueprint}", "{second}")'
+    return f'{keyword} "{node.blueprint}"'
 
 
 def _join(clauses, separator, precedence, parent_precedence):

@@ -268,13 +268,27 @@ def test_one_stack_reverses_tags_and_bindings_together(user_db, blueprints):
 
 # --- the tab wires it up ----------------------------------------------------------------
 
+class _EditorDump(FakeDump):
+    """FakeDump is bind-time validation only. Opening a cell editor also *evaluates* the
+    candidate template, which reaches for attributes — without this `createEditor` raises
+    and no editor ever appears, which looks like the key handling being broken."""
+    def attribute(self, *_args, **_kwargs):
+        return None
+
+
 @pytest.fixture
 def tab(blueprints, qapp):
     from packsmith.core.query.ast import AllSlots, Blueprint, Id, Query
     from packsmith.gui.blueprint_editor import BlueprintEditorTab
-    return BlueprintEditorTab(
+    widget = BlueprintEditorTab(
         Query(scope=Blueprint("StoneType"), select=[Id, AllSlots]),
-        blueprints, packdump=FakeDump())
+        blueprints, packdump=_EditorDump())
+    # Shown, because a cell editor parented to a hidden widget never reports isVisible()
+    # and the search below would find nothing at all.
+    widget.resize(900, 400)
+    widget.show()
+    yield widget
+    widget.close()
 
 
 @pytest.fixture(scope="session")
@@ -326,3 +340,81 @@ def test_the_shortcut_finds_a_blueprint_tab(tab):
     assert hasattr(tab, "undo") and hasattr(tab, "redo")
     source = __import__("inspect").getsource(MainWindow._active_history)
     assert "_tab_models" not in source or "hasattr" in source
+
+
+# --- Enter walks down the column, like a spreadsheet -----------------------------------
+#
+# Filling one slot across 47 instances is the grid's whole job. Enter used to commit and
+# leave the cursor where it was, so every next cell cost a reach for the mouse or a
+# deliberate arrow-down. This is small and it is the difference between the grid being
+# usable for an afternoon and not.
+#
+# Driven through real key events rather than by calling `commit_cell`, because the two
+# paths that finish an edit with Enter both run inside Qt's own machinery — the delegate's
+# event filter and the picker's — and calling the method directly tests neither.
+
+def _cell_editor(tab):
+    """The editor inside the GRID. `tab.findChildren` also finds the template bar's line
+    edit, which is visible, is not the cell editor, and silently absorbs the typing."""
+    from PySide6.QtWidgets import QLineEdit
+    return next((w for w in tab._grid.viewport().findChildren(QLineEdit)
+                 if w.isVisible()), None)
+
+
+def _type(tab, row, column, text):
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+    from PySide6.QtWidgets import QApplication
+    tab._grid.setCurrentCell(row, column)
+    tab.begin_edit(row, column)
+    QApplication.processEvents()
+    editor = _cell_editor(tab)
+    assert editor is not None, f"no editor opened on {(row, column)}"
+    editor.setText(text)
+    QTest.keyClick(editor, Qt.Key_Return)
+    QApplication.processEvents()
+
+
+def _at(tab):
+    return (tab._grid.currentRow(), tab._grid.currentColumn())
+
+
+def test_enter_moves_to_the_cell_below(tab, blueprints):
+    _type(tab, 0, 0, "minecraft:granite")
+    assert _at(tab) == (1, 0)
+
+
+def test_the_value_still_lands_where_it_was_typed(tab, blueprints):
+    """The cursor moving must not mean the write moved with it."""
+    typed_into = tab._instances[0].name
+    _type(tab, 0, 0, "minecraft:granite")
+
+    assert blueprints.value_of("StoneType", typed_into, "base") == "minecraft:granite"
+    assert blueprints.value_of("StoneType", tab._instances[1].name, "base") is None
+
+
+def test_enter_walks_a_whole_column(tab, blueprints):
+    for row, value in enumerate(("minecraft:granite", "minecraft:andesite")):
+        assert _at(tab) == (row, 0) or tab._grid.setCurrentCell(row, 0) is None
+        _type(tab, row, 0, value)
+
+    assert [blueprints.value_of("StoneType", i.name, "base") for i in tab._instances] ==         ["minecraft:granite", "minecraft:andesite"]
+
+
+def test_the_last_row_stays_put(tab):
+    """Rather than wrapping to the top of the next column, which reads as the cursor
+    jumping somewhere random — and the bottom of a column is where you stop anyway."""
+    last = len(tab._instances) - 1
+    _type(tab, last, 0, "minecraft:granite")
+
+    assert _at(tab) == (last, 0)
+
+
+def test_each_enter_is_its_own_undo(tab):
+    """The step-down must not fold a column of edits into one batch — you undo the cell you
+    just got wrong, not the last five."""
+    _type(tab, 0, 0, "minecraft:granite")
+    _type(tab, 1, 0, "minecraft:andesite")
+
+    tab.undo()
+    assert tab._undo.can_undo is True, "two edits collapsed into one entry"

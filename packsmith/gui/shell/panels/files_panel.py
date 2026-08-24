@@ -22,15 +22,18 @@ from PySide6.QtCore import Qt, Signal, QUrl
 from PySide6.QtGui import QColor, QDesktopServices, QIcon, QPixmap, QPainter
 from PySide6.QtWidgets import (
     QApplication, QTreeWidget, QTreeWidgetItem, QWidget, QHBoxLayout, QLabel, QMenu,
-    QMessageBox, QAbstractItemView, QInputDialog,
+    QMessageBox, QAbstractItemView, QInputDialog, QTabWidget,
 )
 
 from packsmith.core.capabilities import (
     CapabilityError, DATAPACKS_WRITE, RESOURCEPACKS_WRITE)
 from packsmith.core.files import FileStore
+from packsmith.core.roots import INSTANCE_ROOT
 from packsmith.gui.shell import icons, style
 from packsmith.gui.shell.tree import PanelTree
+from packsmith.gui.shell.panels.automation_panel import _TABS_QSS
 from packsmith.gui.shell.panels.base import Panel, SearchBox
+from packsmith.gui.shell.panels.folders_panel import FoldersPanel
 from packsmith.gui.shell.dropdown import DropDown
 
 # How many matches are drawn. Measured on a real 300-mod instance: 41,515 files, of which
@@ -74,44 +77,61 @@ def _norm(path: str) -> str:
     return FileStore.key(path)
 
 
-class FilesPanel(Panel):
+class FileBrowser(Panel):
 
     file_activated = Signal(str)        # relative path (double-clicked)
     ownership_changed = Signal(str)     # relative path
 
-    def __init__(self, file_store, parent=None, loader=None):
+    def __init__(self, file_store, parent=None, loader=None, roots=None, smart=False):
         super().__init__("Files", parent)
+        # `roots` is the registry (design 6.6); `_files` is the store for whichever
+        # root is being shown. Optional so a headless or single-root caller can hand over a
+        # store and get exactly the old behaviour.
+        self._roots = roots
         self._files = file_store
         self._owners = {}
         # The active global pack loader (§8.1), or None. Smart Mode's categories come from
         # it: without a loader there is no such thing as a global datapack, so there is
         # nothing to categorise and the mode stays disabled.
         self._loader = loader
-        self._smart = False
+        # Fixed at construction rather than toggled. Two browsers exist — one honest, one
+        # smart — and each is simply one of them, so nothing has to guard against a mode
+        # that its loader cannot serve.
+        self._smart = smart
         self._mc_version = None      # set by the window; decides pack_format
         self._client_jar = None      # the real jar, when it can be found
 
-        mode_row = QWidget()
-        mode_lay = QHBoxLayout(mode_row)
-        mode_lay.setContentsMargins(6, 4, 6, 2)
-        self._mode = DropDown()
-        self._mode.addItem("Honest — raw filesystem")
-        self._mode.addItem("Smart — by purpose"
-                           + ("" if loader else " (needs a pack loader)"))
-        if loader is None:
-            # §6.2 says categories without an integration simply don't appear. Minecraft
-            # has no vanilla global datapacks (§8.1), so with no loader mod installed
-            # there is genuinely nothing for this mode to show.
-            self._mode.model().item(1).setEnabled(False)
-            self._mode.setToolTip(
-                "Smart Mode groups files by purpose, and its categories come from an "
-                "installed global pack loader (Paxi, OpenLoader, …). This pack has none.")
-        else:
-            self._mode.setToolTip(f"Smart Mode categories come from {loader.name} (§8.1)")
-        self._mode.currentIndexChanged.connect(self._on_mode_changed)
-        self._mode.setStyleSheet(f"font-size: 11px; color: {style.TEXT_MUTED};")
-        mode_lay.addWidget(self._mode)
-        self.body().addWidget(mode_row)
+        # Which tracked root is on screen. Hidden entirely while the instance is the
+        # only one, because a picker with one option is furniture that teaches nothing.
+        root_row = QWidget()
+        root_lay = QHBoxLayout(root_row)
+        root_lay.setContentsMargins(6, 4, 6, 0)
+        self._root_pick = DropDown()
+        self._root_pick.setStyleSheet(f"font-size: 11px; color: {style.TEXT_MUTED};")
+        self._root_pick.setToolTip(
+            "Which tracked folder to browse. Add more in the Folders panel.")
+        self._root_pick.currentIndexChanged.connect(self._on_root_changed)
+        root_lay.addWidget(self._root_pick)
+        self.body().addWidget(root_row)
+        self._root_row = root_row
+        # Smart Mode never gets one. Its categories describe the INSTANCE's pack loader, so
+        # a root picker there would offer folders in which the whole tab means nothing —
+        # structurally impossible beats disabled-with-a-tooltip.
+        if smart:
+            self._roots = None
+
+        # Smart Mode's categories come from a pack LOADER (§8.1), and with none installed
+        # there is genuinely nothing to categorise — §6.2: categories without an
+        # integration simply don't appear. Said in the tab rather than by disabling a
+        # dropdown entry nobody can see the reason for.
+        self._empty_note = QLabel(
+            "Smart Mode groups files by purpose, and its categories come from an installed "
+            "global pack loader (Paxi, OpenLoader, …). This pack has none.")
+        self._empty_note.setWordWrap(True)
+        self._empty_note.setStyleSheet(
+            f"color: {style.TEXT_FAINT}; font-size: 10px; padding: 4px 8px;")
+        self._empty_note.setVisible(smart and loader is None)
+        self.body().addWidget(self._empty_note)
 
         legend = QLabel(
             f"<span style='color:{style.OWNER_USER}'>●</span> yours &nbsp;"
@@ -147,7 +167,50 @@ class FilesPanel(Panel):
         self._tree.customContextMenuRequested.connect(self._on_context_menu)
         self.body().addWidget(self._tree)
 
+        self.reload_roots()
         self.refresh()
+
+    # --- tracked roots (design 6.6) ----------------------------------------
+
+    def reload_roots(self):
+        """Re-read the registry after a folder is added, renamed or untracked."""
+        if self._roots is None:
+            self._root_row.hide()
+            return
+        names = self._roots.names()
+        current = self._root_pick.currentData()
+        self._root_pick.blockSignals(True)
+        self._root_pick.clear()
+        for name in names:
+            self._root_pick.addItem(name, name)
+        index = self._root_pick.findData(current)
+        self._root_pick.setCurrentIndex(index if index >= 0 else 0)
+        self._root_pick.blockSignals(False)
+        # One root is not a choice. Showing the picker anyway would imply the feature is
+        # unavailable rather than simply unused.
+        self._root_row.setVisible(len(names) > 1)
+        self.show_root(self._root_pick.currentData() or INSTANCE_ROOT)
+
+    def show_root(self, name):
+        """Browse one tracked root. An unknown name is ignored rather than raising — this is
+        reachable from a double-click in another panel, which can outlive the row."""
+        if self._roots is None or not self._roots.has(name):
+            return
+        index = self._root_pick.findData(name)
+        if index >= 0 and index != self._root_pick.currentIndex():
+            self._root_pick.setCurrentIndex(index)      # re-enters through the signal
+            return
+        self._files = self._roots.store(name)
+        # Nothing to reset by hand: `refresh` re-harvests the expansion set off the live
+        # tree and drops the search index itself. Clearing either here would be dead code
+        # that reads like a guard — the state is rebuilt from the new root a line later.
+        # Smart Mode groups files by categories a pack LOADER declares, and a loader is a
+        # fact about the instance (§8.1). Under another root those categories describe
+        # nothing — the mode is not merely empty there, it is meaningless.
+        self.refresh()
+
+    def _on_root_changed(self, _index):
+        self.show_root(self._root_pick.currentData())
 
     # --- population ---------------------------------------------------------
 
@@ -159,8 +222,7 @@ class FilesPanel(Panel):
         panel back to Honest Mode rather than leave a mode with nothing behind it.
         """
         self._loader = loader
-        if loader is None:
-            self._smart = False
+        self._empty_note.setVisible(self._smart and loader is None)
         self.refresh()
 
     def refresh(self):
@@ -193,10 +255,6 @@ class FilesPanel(Panel):
         else:
             self._populate(None, self._files.root, "")
         self._restore_expanded(self._expanded)
-
-    def _on_mode_changed(self, index):
-        self._smart = index == 1 and self._loader is not None
-        self.refresh()
 
     def _populate_smart(self):
         """§6.2 Smart Mode: files grouped by purpose rather than by where they sit.
@@ -683,3 +741,110 @@ class FilesPanel(Panel):
         """
         target = (self._files.root / rel).parent
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(target)))
+
+
+_TAB_ORDER = ("basic", "smart", "folders")
+_TAB_TITLES = {"basic": "Basic", "smart": "Smart", "folders": "Tracked Folders"}
+
+
+class FilesPanel(Panel):
+    """Files, as three subtabs sharing one sidebar slot (design 6.2, 6.6).
+
+    **The mode dropdown is gone.** Basic and Smart are not a setting on one browser, they
+    are two ways of looking that you move between — and a dropdown makes that look like a
+    filter applied to the thing below it. Tabs say what they are, and they are where your
+    eye already goes for "same panel, different view", because Automation works this way.
+
+    **Tracked folders live here rather than in their own sidebar slot.** They are a list you
+    set up once and then browse *through* — spending a top-level slot on it put a rarely
+    touched settings list beside the six things you use daily. It belongs next to the
+    browser it configures.
+
+    One browser class, built twice. Basic and Smart differ in exactly one flag and share
+    every line of tree building, ownership colouring and context menu; two classes would
+    have been the same code twice, and a single instance toggling a mode is what this
+    replaced.
+    """
+
+    file_activated = Signal(str)
+    ownership_changed = Signal(str)
+
+    def __init__(self, file_store, parent=None, loader=None, roots=None):
+        super().__init__("Files", parent)
+        self.basic = FileBrowser(file_store, loader=loader, roots=roots)
+        self.smart = FileBrowser(file_store, loader=loader, smart=True)
+        self.folders = FoldersPanel(roots) if roots is not None else None
+
+        self._tabs = QTabWidget()
+        self._tabs.setStyleSheet(_TABS_QSS)
+        self._tabs.setDocumentMode(True)
+        self._tabs.tabBar().setExpanding(True)
+        self._tabs.tabBar().setDrawBase(False)
+        for key in _TAB_ORDER:
+            child = self._child(key)
+            if child is None:
+                continue
+            child.hide_header()          # the tab already carries the name
+            self._tabs.addTab(child, _TAB_TITLES[key])
+        self.body().addWidget(self._tabs)
+
+        # Forwarded rather than re-emitted from a chosen tab: a double-click is the same
+        # request wherever it came from, and the window should not have to know which view
+        # was in front when it happened.
+        for browser in (self.basic, self.smart):
+            browser.file_activated.connect(self.file_activated)
+            browser.ownership_changed.connect(self.ownership_changed)
+        if self.folders is not None:
+            self.folders.roots_changed.connect(self.basic.reload_roots)
+            self.folders.root_activated.connect(self.show_root)
+
+    def _child(self, key):
+        return {"basic": self.basic, "smart": self.smart, "folders": self.folders}[key]
+
+    # --- what the window asks of it ----------------------------------------
+
+    def refresh(self):
+        """Both browsers, not just the visible one: the tab stack keeps hidden widgets
+        alive, so refreshing only what is in front leaves the other on stale ownership."""
+        self.basic.refresh()
+        self.smart.refresh()
+        if self.folders is not None:
+            self.folders.refresh()
+
+    def set_loader(self, loader):
+        self.basic.set_loader(loader)
+        self.smart.set_loader(loader)
+
+    def reload_roots(self):
+        self.basic.reload_roots()
+        if self.folders is not None:
+            self.folders.refresh()
+
+    def show_root(self, name):
+        """Browse one tracked root — which means the Basic tab, since Smart is the
+        instance's pack loader and describes nothing anywhere else."""
+        self._tabs.setCurrentIndex(_TAB_ORDER.index("basic"))
+        self.basic.show_root(name)
+
+    def show_tab(self, key: str):
+        if key in _TAB_TITLES and self._child(key) is not None:
+            self._tabs.setCurrentIndex(self._tabs.indexOf(self._child(key)))
+
+    # The window reaches in for these two — see `_mc_version` / `_client_jar` on the
+    # browser. Kept as properties so both halves stay in step rather than one silently
+    # keeping an older jar than the other.
+    @property
+    def _mc_version(self):
+        return self.basic._mc_version
+
+    @_mc_version.setter
+    def _mc_version(self, value):
+        self.basic._mc_version = self.smart._mc_version = value
+
+    @property
+    def _client_jar(self):
+        return self.basic._client_jar
+
+    @_client_jar.setter
+    def _client_jar(self, value):
+        self.basic._client_jar = self.smart._client_jar = value

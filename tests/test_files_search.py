@@ -12,7 +12,7 @@ import pytest
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from packsmith.core.files import FileStore
-from packsmith.gui.shell.panels.files_panel import FilesPanel
+from packsmith.gui.shell.panels.files_panel import FileBrowser
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -30,7 +30,7 @@ def panel(qapp, user_db, tmp_path):
     (root / "config" / "deep" / "quark_extra.json").write_text("{}", encoding="utf-8")
     (root / "mods" / "Quark.jar").write_text("x", encoding="utf-8")
     (root / "options.txt").write_text("x", encoding="utf-8")
-    widget = FilesPanel(FileStore(user_db, root))
+    widget = FileBrowser(FileStore(user_db, root))
     yield widget
     widget.deleteLater()
 

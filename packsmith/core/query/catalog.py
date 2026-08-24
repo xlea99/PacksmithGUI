@@ -8,8 +8,10 @@ definitions are registry-scoped (design 3.2.1), the catalog is built for one reg
 and reads its own ``definitions_for(registry_type)``.
 """
 from packsmith.core.query.ast import (
-    _Id, _Mod, _Count, Collect, CountDistinct, Tag, Attribute, Slot, QueryError,
+    _Id, _Mod, _Count, BoundIn, Collect, CountDistinct, Mentions, Tag, Attribute, Slot,
+    QueryError,
 )
+from packsmith.core.query.tokens import tokenize
 
 
 def mod_of(entry_id: str) -> str:
@@ -132,10 +134,15 @@ class RegistryFieldCatalog:
     short to go stale.
     """
 
-    def __init__(self, packdump, tag_store, registry_type: str):
+    def __init__(self, packdump, tag_store, registry_type: str, blueprint_store=None):
         self._dump = packdump
         self._tags = tag_store
         self._reg = registry_type
+        # Only for BoundIn / Mentions, which ask a registry entry a question about a
+        # blueprint taken whole. Optional for the same reason the tag store is: a pure L1
+        # id search is a coherent world to query in and should not have to invent one.
+        self._blueprints = blueprint_store
+        self._crossings = {}
         # No tag store means no Layer 2 at all, which is a coherent world to query in —
         # the candidate finder (design 5.3) is a pure L1 id search and shouldn't have to
         # invent a tag store to run. Tags then simply have no value anywhere.
@@ -187,6 +194,52 @@ class RegistryFieldCatalog:
         if isinstance(field, Slot):
             raise QueryError("blueprint slots require a Blueprint scope (not supported in v1)")
         raise QueryError(f"not a field: {field!r}")
+
+    # --- asking a blueprint about a registry entry -------------------------
+
+    def crossing(self, node):
+        """A predicate for `BoundIn` / `Mentions`, built **once per query**.
+
+        The whole set is assembled here rather than per entry, because the alternative is
+        an 18,639-row scan each asking the store the same question. `all_bindings` already
+        reads every binding in one query — the same index the blueprint catalog preloads.
+
+        Memoised per node so repeating a clause (`NOT BoundIn(x) OR ...`) costs one build.
+        """
+        if node in self._crossings:
+            return self._crossings[node]
+        if self._blueprints is None:
+            raise QueryError(
+                f"{type(node).__name__} asks about blueprint '{node.blueprint}' — "
+                f"this query needs a blueprint store")
+        every = self._blueprints.all_bindings(node.blueprint)
+
+        if isinstance(node, BoundIn):
+            claimed = {binding.value
+                       for bindings in every.values()
+                       for path, binding in bindings.items()
+                       if node.slot is None or path == node.slot}
+            predicate = claimed.__contains__
+        else:
+            # An instance's own name, plus whatever its alias slot adds. Held as token
+            # SETS: `azure_seastone` has to match as both its words together, not as the
+            # accident of either one appearing.
+            vocabulary = []
+            for instance in self._blueprints.instances(node.blueprint):
+                terms = [instance.name]
+                if node.alias_slot:
+                    extra = every.get(instance.name, {}).get(node.alias_slot)
+                    if extra is not None and extra.value:
+                        terms += str(extra.value).replace(",", " ").split()
+                vocabulary += [tokenize(term) for term in terms if term]
+            vocabulary = [words for words in vocabulary if words]
+
+            def predicate(entry_id, _vocab=vocabulary):
+                words = tokenize(entry_id)
+                return any(wanted <= words for wanted in _vocab)
+
+        self._crossings[node] = predicate
+        return predicate
 
     def presence(self, field):
         """"Is this assigned?" — **existence**, which is a different question from value.

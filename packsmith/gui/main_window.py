@@ -20,7 +20,7 @@ from PySide6.QtCore import Qt, QEvent, QTimer
 from PySide6.QtGui import QShortcut, QKeySequence, QFont
 
 from packsmith.common.setup import (
-    load_state, load_ui_state, save_state, save_ui_state)
+    GLOBAL_PATHS, load_state, load_ui_state, save_state, save_ui_state)
 from packsmith.core.profile import Profile, list_profiles
 
 # Which profile was open last (§4.1). App STATE, not config — see `common/setup.py`.
@@ -54,6 +54,7 @@ from packsmith.core.bindings import (
     best_guess_bindings, record_names, resolve_step, step_problems)
 from packsmith.core import filetypes
 from packsmith.core.files import FileStore, content_hash
+from packsmith.core.roots import FileRoots
 from packsmith.core.history import StepRunStore, JobRunStore
 from packsmith.core.views import ViewStore
 from packsmith.core.jobs import JobStore
@@ -93,7 +94,7 @@ from packsmith.gui.shell.panels.packages_panel import PackagesPanel
 from packsmith.gui.shell.panels.automation_panel import AutomationPanel
 from packsmith.gui.shell.panels.blueprints_panel import BlueprintsPanel
 from packsmith.gui.query_bar import QueryBar, combine
-from packsmith.core.query.ast import Blueprint as QueryBlueprint, QueryError
+from packsmith.core.query.ast import Blueprint as QueryBlueprint, QueryError, blueprints_read
 from packsmith.core.query.language import QuerySyntaxError
 from packsmith.gui.blueprint_editor import BlueprintEditorTab, NewBlueprintDialog
 from packsmith.gui.action_editor import (
@@ -271,7 +272,12 @@ class MainWindow(QMainWindow):
         # What the packages directory looked like when we last read it — see
         # `_check_for_edited_packages`.
         self._package_fingerprint = self._packages.fingerprint()
-        self._file_store = FileStore(self._db, self._profile.mc_path)
+        # The registry, and the instance store out of it. Actions are handed the REGISTRY
+        # (staging accepts either), so a step with a bound `folder` mapping can reach it;
+        # the panels and editors want the instance specifically and take that.
+        self._roots = FileRoots(self._db, self._profile.mc_path,
+                                protected=[GLOBAL_PATHS.userdata])
+        self._file_store = self._roots.instance
         self._history = StepRunStore(self._db)
         self._job_history = JobRunStore(self._db)
         self._views = ViewStore(self._db)
@@ -383,7 +389,8 @@ class MainWindow(QMainWindow):
         # its categories — with no loader mod there are no global datapacks to categorise.
         self._loaders = self._resolve_loaders()
         active_loader = self._loaders.provider_for(DATAPACKS_WRITE)
-        self._files_panel = FilesPanel(self._file_store, loader=active_loader)
+        self._files_panel = FilesPanel(self._file_store, loader=active_loader,
+                                       roots=self._roots)
         self._files_panel._mc_version = self._profile.mc_version
         # The real client jar, when this launcher's layout is one Packsmith knows or the
         # user has pointed at it. Used for `pack_format` today (Mojang's own number rather
@@ -750,6 +757,26 @@ class MainWindow(QMainWindow):
         errors = self._bottom.panel("errors")
         if errors is not None:
             errors.refresh()
+        self._mark_blueprint_readers_stale()
+
+    def _mark_blueprint_readers_stale(self):
+        """A binding changed, so any registry view that asks about a blueprint is now wrong.
+
+        Registry views could always go stale from a tag edit (`_on_tags_written`) and never
+        from a blueprint one, because until `BoundIn` / `Mentions` no registry view could
+        depend on a blueprint at all. A "what did I not choose" view is the case that makes
+        it visible: bind `quark:granite_pillar` and it should leave the leftovers, and
+        instead it sat there until the tab was closed and reopened.
+
+        Only the views that actually read a blueprint are marked. The rest re-evaluate for
+        nothing, and on an 18,639-row registry that is not free.
+
+        Marked rather than refreshed, for the same reason tag writes are: the reconcile
+        happens when you look at the tab, so nothing re-runs a query nobody is watching.
+        """
+        for tab, model in self._tab_models.items():
+            if blueprints_read(model._query):
+                self._stale_tabs.add(tab)
 
     def _new_blueprint(self):
         dialog = NewBlueprintDialog(parent=self)
@@ -1635,7 +1662,8 @@ class MainWindow(QMainWindow):
         """One tab rendering a query: model -> table, with type-aware cell delegates
         and per-tag edit-mode toggles. The model sorts itself; there is no proxy."""
         model = RegistryTableModel(query, self._packdump, self._tags,
-                                   confirm_takeover=self._confirm_tag_takeover)
+                                   confirm_takeover=self._confirm_tag_takeover,
+                                   blueprint_store=self._blueprints)
 
         table = RegistryTableView()
         # The model sorts itself, so there is no proxy: a QSortFilterProxyModel compares
@@ -3029,7 +3057,11 @@ class MainWindow(QMainWindow):
                            # absent resolution table, and the editor was simply never given
                            # one. Running a job already passed it, so a step you could not
                            # configure would run fine once bound some other way.
-                           pack_targets=self._pack_targets())
+                           pack_targets=self._pack_targets(),
+                           # Same reasoning for tracked folders: without the registry
+                           # a `folder` mapping cannot offer anything to bind, and the
+                           # step would be unconfigurable rather than merely unbound.
+                           file_roots=self._roots)
         tab.changed.connect(self._reload_jobs)
         tab.run_requested.connect(self._run_job)
         tab.dry_run_requested.connect(self._dry_run_job)
@@ -3102,7 +3134,7 @@ class MainWindow(QMainWindow):
             result = run_job(job, blueprint_store=self._blueprints,
                              job_store=self._jobs, package_index=self._packages,
                              tag_store=self._tags, packdump=self._packdump,
-                             file_store=self._file_store, history=self._history,
+                             file_store=self._roots, history=self._history,
                              job_history=self._job_history,
                              pack_targets=self._pack_targets(),
                              on_progress=self._on_job_progress,

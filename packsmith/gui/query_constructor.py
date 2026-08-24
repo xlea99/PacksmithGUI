@@ -352,9 +352,23 @@ class QueryConstructorDialog(QDialog):
         self._rows_box.setSpacing(4)
         root.addLayout(self._rows_box)
 
+        controls = QHBoxLayout()
         add_btn = QPushButton("+  Add condition")
         add_btn.clicked.connect(lambda: self._add_row())
-        root.addWidget(add_btn, alignment=Qt.AlignLeft)
+        controls.addWidget(add_btn)
+        # The builder knows a fixed set of row shapes, and the language keeps outgrowing it
+        # — token matching, nested groups, and now MENTIONS / BOUND_IN, which is the whole
+        # "what did I not choose" question (§3.2.4). Text mode already existed as a
+        # *fallback* for opening a query the rows could not reproduce, which meant a NEW
+        # view could never reach it: it starts from no filter, so there is nothing to fail
+        # to decompose. One button turns a rescue hatch into a front door, and every future
+        # node is reachable the day it parses rather than the day someone builds a widget.
+        self._mode_btn = QPushButton("Edit as text")
+        self._mode_btn.setToolTip("Write the filter in the same syntax as the filter bar")
+        self._mode_btn.clicked.connect(self._toggle_mode)
+        controls.addWidget(self._mode_btn)
+        controls.addStretch()
+        root.addLayout(controls)
 
         root.addStretch()
 
@@ -378,6 +392,46 @@ class QueryConstructorDialog(QDialog):
         if original is not None and self.build_filter() != original:
             self._enter_text_mode(original)
 
+    def _toggle_mode(self):
+        """Swap between the rows and the text, carrying the filter across intact."""
+        if getattr(self, "_text_edit", None) is not None:
+            self._leave_text_mode()
+        else:
+            # Whatever the rows currently say, so switching never costs work already done.
+            self._enter_text_mode(self.build_filter())
+
+    def _leave_text_mode(self):
+        """Back to rows — but only if they can hold what the text says.
+
+        Refusing is the point. Silently rewriting a filter the rows cannot express is
+        exactly the bug the reproduce-check below was added to prevent, and it would be
+        worse here because the user typed the thing being discarded.
+        """
+        text = self._text_edit.text().strip()
+        try:
+            parsed = parse_query(text) if text else None
+        except QuerySyntaxError as e:
+            QMessageBox.warning(self, "Can't read that filter", str(e))
+            return
+
+        for widget in (self._text_edit, self._text_note):
+            widget.setParent(None)
+            widget.deleteLater()
+        self._text_edit = self._text_note = None
+        self._combiner.setEnabled(True)
+        self._mode_btn.setText("Edit as text")
+
+        combiner, nodes = _decompose(parsed)
+        self._combiner.setCurrentIndex(0 if combiner == "AND" else 1)
+        for node in nodes:
+            self._add_row(preset=node)
+        if parsed is not None and self.build_filter() != parsed:
+            self._enter_text_mode(parsed)      # the rows would have corrupted it
+            QMessageBox.information(
+                self, "Kept as text",
+                "The visual builder can't express that filter without changing it, so "
+                "it's staying as text. Nothing was lost.")
+
     def _enter_text_mode(self, original):
         """Show the filter as text instead of rows, when the rows would corrupt it.
 
@@ -389,12 +443,20 @@ class QueryConstructorDialog(QDialog):
         for row in list(self._rows):
             self._remove_row(row)
         self._combiner.setEnabled(False)
-        self._text_edit = QLineEdit(format_query(original))
-        self._text_edit.setToolTip("The same syntax as the filter bar")
+        self._mode_btn.setText("Back to conditions")
+        self._text_edit = QLineEdit(format_query(original) if original is not None else "")
+        self._text_edit.setPlaceholderText('MENTIONS "StoneType" AND NOT BOUND_IN "StoneType"')
+        self._text_edit.setToolTip(
+            "The same syntax as the filter bar.\n\n"
+            't:remove                     a tag\n'
+            'mod == quark                 a comparison\n'
+            'id MATCHES_TOKENS_I ("cut")  word matching\n'
+            'MENTIONS "StoneType"         names one of a blueprint\'s instances\n'
+            'BOUND_IN "StoneType"         already chosen in that blueprint')
         self._text_note = QLabel(
             "This filter uses something the visual builder can't show (token matching, a "
-            "list, or nested groups), so it's shown as text — edit it here and nothing is "
-            "lost.")
+            "list, nested groups, or a blueprint question), so it's shown as text — edit "
+            "it here and nothing is lost.")
         self._text_note.setWordWrap(True)
         self._text_note.setStyleSheet("color: #d0a050; font-size: 11px;")
         self._rows_box.addWidget(self._text_note)

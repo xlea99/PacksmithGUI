@@ -13,7 +13,7 @@ from packsmith.core import backup
 # machinery can be built the day a change needs it, but a database holding work you care
 # about that cannot say what shape it is has permanently lost the ability to be reasoned
 # about. Hence this landing long before there is anything to migrate.
-SCHEMA_VERSION = 2      # v2: job_steps.enabled (design 3.3.2's step muting)
+SCHEMA_VERSION = 3      # v3: tracked_roots + file_ownership keyed by (root, path)
 
 
 class SchemaTooNewError(RuntimeError):
@@ -297,15 +297,40 @@ class UserDB:
                 position        INTEGER NOT NULL DEFAULT 0
             );
 
+            -- Tracked roots (design 6.6): the places Packsmith may look at all. The
+            -- instance is the default one and not the only one — a glue mod's assets are
+            -- authored in a Gradle project that will never live inside the instance.
+            --
+            -- `id` is IDENTITY and `name` is a LABEL (design 3.2.1's rule, which 3.2.2
+            -- relearned the hard way with instance names): ownership rows and step
+            -- bindings key on the id, so renaming a root orphans nothing.
+            --
+            -- `minecraft` is seeded with a NULL path, meaning "wherever this profile's
+            -- instance is". Copying the path here would make two sources of truth for a
+            -- value the user can change in profile.json, and they would disagree the first
+            -- time someone moved their instance.
+            CREATE TABLE IF NOT EXISTS tracked_roots (
+                id   INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL UNIQUE,
+                path TEXT
+            );
+            INSERT OR IGNORE INTO tracked_roots (id, name, path) VALUES (1, 'minecraft', NULL);
+
             -- File ownership: the OPEN-WORLD engine (design 6.0/6.1). Whole-file only
-            -- for the MVP. `path` is relative to the instance root. Deliberately its
-            -- own table, separate from L2 ownership — files have an uncontrolled
-            -- external writer (the game, mod updates, the user in another tool), so
-            -- this engine plays conservative.
+            -- for the MVP. Deliberately its own table, separate from L2 ownership — files
+            -- have an uncontrolled external writer (the game, mod updates, the user in
+            -- another tool), so this engine plays conservative.
+            --
+            -- Keyed by (root, path), not path alone: the same relative path exists under
+            -- two roots and names two different files, so a bare path was one row for both
+            -- of them. That is a correctness hole rather than a preference — see 6.6.
             CREATE TABLE IF NOT EXISTS file_ownership (
-                path             TEXT PRIMARY KEY,
+                root_id          INTEGER NOT NULL DEFAULT 1
+                                     REFERENCES tracked_roots(id) ON DELETE CASCADE,
+                path             TEXT NOT NULL,
                 owner_kind       TEXT NOT NULL CHECK(owner_kind IN ('user', 'action')),
-                owner_action_ref TEXT
+                owner_action_ref TEXT,
+                PRIMARY KEY (root_id, path)
             );
 
             -- Jobs: a user-authored, user-owned sequence of steps (design 3.3.2). Pure
@@ -490,7 +515,45 @@ class UserDB:
         # what makes this safe to migrate: every step that existed before the column did
         # was, by definition, one that ran.
         self._add_column_if_missing("job_steps", "enabled", "INTEGER NOT NULL DEFAULT 1")
+        self._root_the_file_ownership_table()
         self._conn.commit()
+
+    def _root_the_file_ownership_table(self):
+        """Give `file_ownership` a root (design 6.6). A REBUILD, not an added column.
+
+        SQLite cannot alter a primary key, and the whole point is that the key changes from
+        `path` to `(root_id, path)` — an added column with the old key would leave two roots
+        colliding on one row, which is the bug being fixed.
+
+        Every existing row belongs to the instance, because until roots existed there was
+        nowhere else it could have been.
+        """
+        columns = {row["name"] for row in
+                   self._conn.execute("PRAGMA table_info(file_ownership)")}
+        if not columns or "root_id" in columns:
+            return
+        # Off for the swap: the new table references tracked_roots, and the rename would
+        # otherwise be checked against a table that is mid-replacement.
+        self._conn.execute("PRAGMA foreign_keys = OFF")
+        try:
+            self._conn.executescript("""
+                CREATE TABLE file_ownership_rooted (
+                    root_id          INTEGER NOT NULL DEFAULT 1
+                                         REFERENCES tracked_roots(id) ON DELETE CASCADE,
+                    path             TEXT NOT NULL,
+                    owner_kind       TEXT NOT NULL CHECK(owner_kind IN ('user', 'action')),
+                    owner_action_ref TEXT,
+                    PRIMARY KEY (root_id, path)
+                );
+                INSERT INTO file_ownership_rooted (root_id, path, owner_kind, owner_action_ref)
+                    SELECT 1, path, owner_kind, owner_action_ref FROM file_ownership;
+                DROP TABLE file_ownership;
+                ALTER TABLE file_ownership_rooted RENAME TO file_ownership;
+            """)
+            self._conn.commit()
+        finally:
+            self._conn.execute("PRAGMA foreign_keys = ON")
+        log.info("Migrated file_ownership: keyed by (root_id, path)")
 
     def _add_column_if_missing(self, table: str, column: str, definition: str):
         existing = {row["name"] for row in self._conn.execute(f"PRAGMA table_info({table})")}

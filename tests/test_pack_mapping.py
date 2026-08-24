@@ -572,7 +572,8 @@ def test_an_action_can_ask_what_it_owns_in_a_pack(world):
     landed = paxi.datapack_root(files.root) / "tweaks" / "data" / "minecraft" / LOOT
     expected = landed.relative_to(files.root).as_posix()
 
-    assert _returned(files, targets, lambda pack: pack.datapacks.owned("tweaks")) == [expected]
+    owned = _returned(files, targets, lambda pack: pack.datapacks.owned("tweaks"))
+    assert [handle.path for handle in owned] == [expected]
 
 
 def _returned(files, targets, body):
@@ -599,7 +600,8 @@ def test_owning_is_scoped_to_the_pack_that_was_asked_for(world):
 
     assert run_with(files, targets, write_both).ok
 
-    mine = _returned(files, targets, lambda pack: pack.datapacks.owned("tweaks"))
+    mine = [handle.path for handle in
+            _returned(files, targets, lambda pack: pack.datapacks.owned("tweaks"))]
     assert all("/tweaks/" in path for path in mine), mine
     assert mine, "the pack it asked about should not be empty"
 
@@ -626,3 +628,60 @@ def test_a_file_staged_this_step_counts_as_owned(world):
         return pack.datapacks.owned("tweaks")
 
     assert _returned(files, targets, write_then_ask), "a staged write was invisible"
+
+
+# --- what `owned` hands back (design 6.1, 7.3) ---------------------------------------
+#
+# It used to be paths, and every caller then fed each one back through
+# `pack.filesystem.resolve(path)` to do anything with it. That round trip is only correct
+# while there is exactly ONE root a bare path could mean — the moment a second tracked root
+# exists, the same relative path names two different files and the re-resolve silently
+# picks the wrong one. A handle never stopped knowing where it lives.
+
+def test_owned_hands_back_handles_not_paths(world):
+    """The contract. A path has to be re-resolved by hand to be used; a handle does not,
+    and cannot be re-resolved into the wrong place."""
+    files, paxi, targets = world
+
+    def write(pack):
+        pack.datapacks.resolve(pack="tweaks", namespace="minecraft", path=LOOT).write("{}")
+
+    assert run_with(files, targets, write).ok
+    owned = _returned(files, targets, lambda pack: pack.datapacks.owned("tweaks"))
+
+    assert owned, "nothing came back"
+    handle = owned[0]
+    assert hasattr(handle, "path") and hasattr(handle, "root")
+    assert not isinstance(handle, str), "a bare path needs re-resolving to be used"
+
+
+def test_a_returned_handle_can_write_without_being_resolved_again(world):
+    """The reason the change is worth a migration: the loop that clears stale output is
+    `for handle in owned(...): handle.write_json({})`, with no second lookup in it."""
+    files, paxi, targets = world
+
+    def write(pack):
+        pack.datapacks.resolve(pack="tweaks", namespace="minecraft", path=LOOT).write("x")
+
+    assert run_with(files, targets, write).ok
+
+    def clear(pack):
+        for handle in pack.datapacks.owned("tweaks"):
+            handle.write("{}")
+
+    assert run_with(files, targets, clear).ok
+    landed = paxi.datapack_root(files.root) / "tweaks" / "data" / "minecraft" / LOOT
+    assert landed.read_text(encoding="utf-8") == "{}"
+
+
+def test_a_handle_says_which_root_it_is_under(world):
+    """One root exists today, so this is a constant — and it is here so that the day a
+    second one exists, nothing that already reads it has to change."""
+    files, _paxi, targets = world
+
+    def write(pack):
+        pack.datapacks.resolve(pack="tweaks", namespace="minecraft", path=LOOT).write("{}")
+
+    assert run_with(files, targets, write).ok
+    owned = _returned(files, targets, lambda pack: pack.datapacks.owned("tweaks"))
+    assert owned[0].root == "minecraft"

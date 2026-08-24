@@ -242,6 +242,17 @@ def run_job(job, *, job_store, package_index, tag_store, packdump,
                      dry_run=dry_run, only_step=only_step, through_step=through_step)
 
 
+def _roots_of(files):
+    """The tracked-root registry, if this run was given one (design 6.6).
+
+    Duck-typed rather than a separate context field: `file_store` is already either a
+    single `FileStore` or a `FileRoots`, because `FileStaging` accepts both — and a step
+    holding one store legitimately has no registry, which is what makes a `folder` mapping
+    refuse rather than resolve to somewhere it was not aimed.
+    """
+    return files if hasattr(files, "names") else None
+
+
 @dataclass
 class _Context:
     """Everything the recursion carries: services, plus the accumulating run state."""
@@ -362,6 +373,20 @@ def _record_failure(ctx, step, action_ref, reason) -> StepResult:
     return StepResult(action_ref=action_ref, status="failed", reason=reason, run_id=run_id)
 
 
+def _package_dir(ctx, manifest):
+    """Where the action's package lives, or None if the index cannot say.
+
+    Only `copy_from` needs it, and it reports its own absence clearly — so an index that
+    does not answer (a Python-callable action, a test double) should lose that one method
+    rather than fail the step. Asked defensively rather than by growing the interface every
+    caller has to implement.
+    """
+    try:
+        return ctx.package_index.package(manifest.package_name).root
+    except (AttributeError, KeyError, TypeError):
+        return None
+
+
 def _run_action_step(step, ctx) -> StepResult:
     """Resolve a step's action and bindings, then run it. Resolution problems (an unbound
     required mapping, a missing action) are step failures, not crashes — a job with one
@@ -374,6 +399,7 @@ def _run_action_step(step, ctx) -> StepResult:
         return _record_failure(ctx, step, action_ref or "?", f"could not load action: {e}")
     try:
         mappings, config = resolve_step(manifest, blueprint_store=ctx.blueprint_store,
+                                        file_roots=_roots_of(ctx.file_store),
                                         bindings=step.bindings, packdump=ctx.packdump,
                                         config=step.config, tag_store=ctx.tag_store,
                                         pack_targets=ctx.pack_targets)
@@ -385,6 +411,7 @@ def _run_action_step(step, ctx) -> StepResult:
         fn, tag_store=ctx.tag_store, packdump=ctx.packdump, action_ref=action_ref,
         mappings=mappings, config=config, file_store=ctx.file_store, history=ctx.history,
         blueprint_store=ctx.blueprint_store, pack_targets=ctx.pack_targets,
+        package_dir=_package_dir(ctx, manifest),
         conflict_policies=conflict_policies_for(manifest, mappings),
         buffers=ctx.buffers, commit=ctx.buffers is None,
         history_context={"job_run_id": ctx.job_run_id, "step_id": step.id,

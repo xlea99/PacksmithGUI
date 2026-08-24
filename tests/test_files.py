@@ -91,9 +91,12 @@ def test_staging_captures_prior_snapshot_on_commit(store):
     st = FileStaging(fs)
     st.write("f.txt", "new", owner="action", owner_action_ref="x:y")
     st.commit()
-    # prior content AND ownership captured for rollback
-    assert st.snapshots["f.txt"] == {
-        "content": "old", "ownership": {"kind": "action", "action_ref": "other:act"}}
+    # prior content AND ownership captured for rollback. The key is root-qualified since
+    # 6.6 — two roots holding the same relative path would otherwise share one snapshot,
+    # and a rollback would restore one file's bytes over the other.
+    assert st.snapshots["minecraft::f.txt"] == {
+        "content": "old", "ownership": {"kind": "action", "action_ref": "other:act"},
+        "root": "minecraft", "path": "f.txt"}
 
 
 # --- end-to-end through the runner -----------------------------------------

@@ -217,6 +217,8 @@ def _wants(slot) -> str:
     """What a slot needs, as a noun phrase — for a message that has to stand alone."""
     if slot.kind == "pack":
         return f"one of your {slot.pack_kind or 'packs'}"
+    if slot.kind == "folder":
+        return "one of your tracked folders"
     if slot.kind in ("blueprint", "blueprint_instance"):
         noun = "blueprint" if slot.kind == "blueprint" else "blueprint instance"
         return f"a {noun}"
@@ -228,7 +230,8 @@ def _wants(slot) -> str:
 
 
 def resolve_step(manifest, *, bindings: dict, config: dict, tag_store,
-                 blueprint_store=None, packdump=None, pack_targets=None):
+                 blueprint_store=None, packdump=None, pack_targets=None,
+                 file_roots=None):
     """Validate a step's bindings + config against the manifest and return the
     ``(mappings, config)`` pair the runner consumes. Raises on an unbound required
     mapping, a type mismatch, or a missing required config value.
@@ -283,6 +286,21 @@ def resolve_step(manifest, *, bindings: dict, config: dict, tag_store,
                 if not entry_exists(slot.registry_type, item, packdump):
                     raise ValueError(
                         f"mapping '{name}': '{item}' is not in {slot.registry_type}")
+                values.append(item)
+            elif slot.kind == "folder":
+                # Checked here rather than only at bind time, for the same reason a pack is:
+                # a tracked root is a folder Packsmith does not own, and it can be untracked
+                # or moved between binding this step and running it. Writing into a root
+                # that is gone must fail loudly rather than recreate it empty (design 6.6).
+                known = file_roots.names() if file_roots is not None else None
+                if known is None:
+                    raise ValueError(
+                        f"mapping '{name}' needs a tracked folder, but this step was given "
+                        f"no folder registry")
+                if item not in known:
+                    raise ValueError(
+                        f"mapping '{name}': there is no tracked folder called '{item}' any "
+                        f"more — re-bind this step, or add the folder back")
                 values.append(item)
             elif slot.kind == "pack":
                 # Checked here rather than only when bound, for the same reason blueprint
@@ -389,7 +407,7 @@ def conflict_policies_for(manifest, mappings: dict) -> dict:
 
 
 def best_guess_bindings(manifest, tag_store, blueprint_store=None, packdump=None,
-                        pack_targets=None) -> dict:
+                        pack_targets=None, file_roots=None) -> dict:
     """Suggest a binding per mapping slot from the user's existing tags: prefer an
     exact ``likely_name`` match that's type-compatible, else the first type-compatible
     tag, else None. Candidates are drawn from the slot's own ``registry_type`` (definitions
@@ -417,6 +435,18 @@ def best_guess_bindings(manifest, tag_store, blueprint_store=None, packdump=None
                 pick = (slot.likely_name if slot.likely_name in fitting
                         else (fitting[0] if fitting else None))
                 suggestions[name] = _id(pick) if pick is not None else None
+            continue
+        if slot.kind == "folder":
+            # Never the instance by default. `minecraft` fits every folder slot and would
+            # therefore always be the guess, which would quietly aim generated output at the
+            # pack instead of at the repo the author meant — the one place a wrong guess is
+            # worse than no guess.
+            folders = [n for n in (file_roots.names() if file_roots else [])
+                       if n != "minecraft"]
+            pick = (slot.likely_name if slot.likely_name in folders
+                    else (folders[0] if len(folders) == 1 else None))
+            suggestions[name] = ([pick] if pick else []) \
+                if slot.cardinality == "many" else pick
             continue
         if slot.kind == "pack":
             # 3.3's best-guess fill: prefer the author's hint when the user actually has a
@@ -556,7 +586,7 @@ class StepProblem:
 
 
 def step_problems(job, *, package_index, tag_store, blueprint_store=None,
-                  packdump=None, pack_targets=None) -> list:
+                  packdump=None, pack_targets=None, file_roots=None) -> list:
     """Everything that would stop ``job`` running, determined WITHOUT running it.
 
     One function so that three consumers cannot disagree: the pre-flight gate, the Errors
@@ -594,7 +624,8 @@ def step_problems(job, *, package_index, tag_store, blueprint_store=None,
                 detail=f"'{step.action_ref}' is not installed", kind="broken"))
             continue
         try:
-            resolve_step(manifest, bindings=step.bindings, config=step.config,
+            resolve_step(manifest, file_roots=file_roots,
+                         bindings=step.bindings, config=step.config,
                          tag_store=tag_store, blueprint_store=blueprint_store,
                          packdump=packdump, pack_targets=pack_targets)
         except ValueError as e:

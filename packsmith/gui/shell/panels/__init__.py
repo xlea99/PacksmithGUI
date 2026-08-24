@@ -41,8 +41,10 @@ PANEL_SPECS = [
     ),
     PanelSpec(
         "files", "F", "Files",
-        "The semantic file browser — smart/honest modes, loader-aware path resolution "
-        "through integrations.",
+        "The semantic file browser. Three subtabs: Basic (the raw tree), Smart (grouped "
+        "by purpose, from an installed pack loader) and Tracked Folders — the places "
+        "Packsmith may look at all (design 6.6), which is a list you configure beside the "
+        "browser it configures rather than in a sidebar slot of its own.",
     ),
 
     # --- the vocabulary it is expressed in ----------------------------------------------

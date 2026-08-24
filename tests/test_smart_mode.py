@@ -50,13 +50,13 @@ def instance(user_db, tmp_path):
 @pytest.fixture
 def panel(instance, monkeypatch):
     from PySide6.QtWidgets import QInputDialog, QMessageBox
-    from packsmith.gui.shell.panels.files_panel import FilesPanel
+    from packsmith.gui.shell.panels.files_panel import FileBrowser
 
     answers = {"text": "", "ok": True}
     monkeypatch.setattr(QInputDialog, "getText",
                         staticmethod(lambda *a, **k: (answers["text"], answers["ok"])))
     monkeypatch.setattr(QMessageBox, "warning", staticmethod(lambda *a, **k: None))
-    view = FilesPanel(instance, loader=PaxiProvider())
+    view = FileBrowser(instance, loader=PaxiProvider(), smart=True)
     view._mc_version = "1.20.1"
     return view, instance, answers
 
@@ -70,42 +70,61 @@ def labels(item):
     return [item.child(i).text(0) for i in range(item.childCount())]
 
 
-# --- the mode only exists when a loader does -------------------------------------------
+# --- Smart is a TAB now, not a mode ------------------------------------------------------
+#
+# It used to be the second entry in a dropdown, disabled when no pack loader was installed.
+# A disabled dropdown entry cannot say why it is disabled, and the control looked like a
+# filter applied to the tree below it rather than like two ways of looking. Basic and Smart
+# are now separate browsers behind separate tabs, so a browser IS smart or IS NOT — there is
+# no mode to be in the wrong one of.
 
-def test_without_a_loader_smart_mode_is_disabled(instance):
-    """§6.2: categories without an integration simply don't appear — and with no loader
-    mod installed there is no such thing as a global datapack to show."""
+def test_without_a_loader_smart_says_why_it_is_empty(instance):
+    """§6.2: categories without an integration simply don't appear — with no loader mod
+    installed there is no such thing as a global datapack to show. The tab explains that
+    rather than presenting an empty tree."""
+    from packsmith.gui.shell.panels.files_panel import FileBrowser
+
+    view = FileBrowser(instance, loader=None, smart=True)
+    assert view._empty_note.isVisible() or view._empty_note.isVisibleTo(view)
+    assert "pack loader" in view._empty_note.text()
+
+
+def test_with_a_loader_smart_shows_categories_instead_of_the_note(panel):
+    view, _, _ = panel
+    assert not view._empty_note.isVisibleTo(view)
+    assert categories(view), "a loader is installed and nothing was categorised"
+
+
+def test_basic_is_the_tab_you_land_on(instance):
+    """The raw tree is the one that never lies, so it stays the thing you land on."""
     from packsmith.gui.shell.panels.files_panel import FilesPanel
 
-    view = FilesPanel(instance, loader=None)
-    assert not view._mode.model().item(1).isEnabled()
-    assert "pack loader" in view._mode.toolTip()
+    panel = FilesPanel(instance, loader=PaxiProvider())
+    try:
+        assert panel._tabs.tabText(panel._tabs.currentIndex()) == "Basic"
+    finally:
+        panel.deleteLater()
 
 
-def test_with_a_loader_smart_mode_is_offered(panel):
-    view, _, _ = panel
-    assert view._mode.model().item(1).isEnabled()
-    assert "Paxi" in view._mode.toolTip()
+def test_smart_has_no_root_picker(instance):
+    """Its categories describe the INSTANCE's pack loader, so under another tracked root
+    the whole tab would mean nothing. Structurally impossible beats disabled-with-a-tooltip.
+    """
+    from packsmith.gui.shell.panels.files_panel import FileBrowser
 
-
-def test_honest_mode_is_still_the_default(panel):
-    """The raw tree is the one that never lies, so it stays the thing you land on."""
-    view, _, _ = panel
-    assert view._mode.currentIndex() == 0
-    assert [i.text(0) for i in categories(view)] == ["config"]
+    view = FileBrowser(instance, loader=PaxiProvider(), smart=True)
+    assert view._roots is None
 
 
 # --- the categories ---------------------------------------------------------------------
 
 def test_smart_mode_shows_the_two_supercategories(panel):
     view, _, _ = panel
-    view._mode.setCurrentIndex(1)
     assert [c.text(0) for c in categories(view)] == ["Datapacks", "Resource Packs"]
 
 
 def test_packs_appear_under_their_category(panel):
     view, _, _ = panel
-    view._mode.setCurrentIndex(1)
     assert set(labels(categories(view)[0])) == {"tweaks_create", "rei_removals"}
 
 
@@ -113,21 +132,26 @@ def test_packs_are_listed_in_load_order(panel):
     """With Paxi the order is a thing the user controls, so showing them alphabetically
     would show something the game disagrees with."""
     view, _, _ = panel
-    view._mode.setCurrentIndex(1)
     assert labels(categories(view)[0]) == ["rei_removals", "tweaks_create"]
 
 
 def test_an_empty_category_says_how_to_fill_it(panel):
     view, _, _ = panel
-    view._mode.setCurrentIndex(1)
     assert "right-click to create" in labels(categories(view)[1])[0]
 
 
-def test_switching_back_to_honest_mode_restores_the_raw_tree(panel):
-    view, _, _ = panel
-    view._mode.setCurrentIndex(1)
-    view._mode.setCurrentIndex(0)
-    assert [i.text(0) for i in categories(view)] == ["config"]
+def test_the_basic_tab_shows_the_raw_tree_alongside(instance):
+    """Both browsers exist at once now — switching tabs does not rebuild a mode, it moves
+    between two live trees. So the raw one still shows the real folders while Smart is
+    showing categories."""
+    from packsmith.gui.shell.panels.files_panel import FilesPanel
+
+    panel = FilesPanel(instance, loader=PaxiProvider())
+    try:
+        assert [i.text(0) for i in categories(panel.basic)] == ["config"]
+        assert categories(panel.smart) != [], "Smart should be categorising at the same time"
+    finally:
+        panel.deleteLater()
 
 
 # --- the category menu ------------------------------------------------------------------
@@ -136,7 +160,6 @@ def test_a_category_offers_only_what_makes_sense_there(panel):
     """It is the loader's own directory, not a folder you manage: renaming or deleting it
     would break the loader."""
     view, _, _ = panel
-    view._mode.setCurrentIndex(1)
     actions = [a.text() for a in view._menu_for(categories(view)[0]).actions() if a.text()]
     assert "New Datapack…" in actions
     assert not any(a in actions for a in ("Rename…", "Delete…", "New Folder…"))
@@ -144,7 +167,6 @@ def test_a_category_offers_only_what_makes_sense_there(panel):
 
 def test_the_resource_pack_category_offers_the_right_noun(panel):
     view, _, _ = panel
-    view._mode.setCurrentIndex(1)
     actions = [a.text() for a in view._menu_for(categories(view)[1]).actions() if a.text()]
     assert "New Resource Pack…" in actions
 
@@ -152,7 +174,6 @@ def test_the_resource_pack_category_offers_the_right_noun(panel):
 def test_a_pack_inside_a_category_keeps_the_ordinary_menu(panel):
     """A pack IS a folder you manage — only the category is special."""
     view, _, _ = panel
-    view._mode.setCurrentIndex(1)
     pack = categories(view)[0].child(0)
     actions = [a.text() for a in view._menu_for(pack).actions() if a.text()]
     assert "New File…" in actions and "Delete…" in actions
@@ -197,7 +218,6 @@ def test_the_pack_format_follows_the_minecraft_version(panel):
 
 def test_a_new_pack_appears_immediately(panel):
     view, _, answers = panel
-    view._mode.setCurrentIndex(1)
     answers["text"] = "fresh"
     view._new_pack("datapacks")
     assert "fresh" in labels(categories(view)[0])
@@ -251,12 +271,12 @@ def test_smart_mode_survives_a_datapacks_only_loader(user_db, tmp_path):
     that root raises. Smart Mode must show the categories the loader HAS rather than
     assuming every loader does both."""
     from packsmith.core.files import FileStore
-    from packsmith.gui.shell.panels.files_panel import FilesPanel
+    from packsmith.gui.shell.panels.files_panel import FileBrowser
     from packsmith.integrations.moonlight import MoonlightProvider
 
     root = tmp_path / "instance"
     (root / "moonlight-global-datapacks" / "tweaks").mkdir(parents=True)
-    panel = FilesPanel(FileStore(user_db, root), loader=MoonlightProvider())
+    panel = FileBrowser(FileStore(user_db, root), loader=MoonlightProvider(), smart=True)
     try:
         panel._smart = True
         panel.refresh()          # used to raise CapabilityError and take the panel down
@@ -273,14 +293,14 @@ def test_smart_mode_survives_a_datapacks_only_loader(user_db, tmp_path):
 def test_smart_mode_shows_both_kinds_for_a_loader_that_has_both(user_db, tmp_path):
     """The carve-out must be about the loader, not a blanket removal of resource packs."""
     from packsmith.core.files import FileStore
-    from packsmith.gui.shell.panels.files_panel import FilesPanel
+    from packsmith.gui.shell.panels.files_panel import FileBrowser
     from packsmith.integrations.paxi import PaxiProvider
 
     root = tmp_path / "instance"
     paxi = PaxiProvider()
     paxi.create_pack(root, "tweaks")
     paxi.create_pack(root, "skins", kind="resourcepacks")
-    panel = FilesPanel(FileStore(user_db, root), loader=paxi)
+    panel = FileBrowser(FileStore(user_db, root), loader=paxi, smart=True)
     try:
         panel._smart = True
         panel.refresh()
@@ -303,13 +323,13 @@ def test_a_first_edit_claim_reaches_the_files_panel(user_db, tmp_path, qapp):
     keystroke, not whenever something else happens to rebuild the tree."""
     from packsmith.core.files import FileStore
     from packsmith.gui.editor.sources import InstanceFileSource
-    from packsmith.gui.shell.panels.files_panel import FilesPanel
+    from packsmith.gui.shell.panels.files_panel import FileBrowser
 
     root = tmp_path / "instance"
     (root / "config").mkdir(parents=True)
     (root / "config" / "emi.json").write_text("{}", encoding="utf-8")
     files = FileStore(user_db, root)
-    panel = FilesPanel(files, loader=None)
+    panel = FileBrowser(files, loader=None)
     assert panel._owners == {}, "nothing is owned yet"
 
     claimed = []
@@ -339,7 +359,6 @@ def test_the_window_refreshes_the_panel_on_a_claim(user_db, tmp_path, qapp, monk
 # --- switching a pack off from the browser (design 8.1) -------------------------------
 
 def _pack_row(view, index=0):
-    view._mode.setCurrentIndex(1)
     return categories(view)[0].child(index)
 
 
@@ -374,7 +393,6 @@ def test_a_disabled_pack_still_appears_but_says_it_is_off(panel):
     """Hiding it would make it unreachable — switching one back on means finding it."""
     view, files, _answers = panel
     view._set_pack_enabled("datapacks", "rei_removals", False, "off")
-    view._mode.setCurrentIndex(1)
 
     shown = labels(categories(view)[0])
     assert "rei_removals  (disabled)" in shown
@@ -384,7 +402,6 @@ def test_a_disabled_pack_still_appears_but_says_it_is_off(panel):
 def test_a_disabled_pack_offers_enable(panel):
     view, _files, _answers = panel
     view._set_pack_enabled("datapacks", "rei_removals", False, "off")
-    view._mode.setCurrentIndex(1)
     row = next(c for c in [categories(view)[0].child(i)
                            for i in range(categories(view)[0].childCount())]
                if "rei_removals" in c.text(0))
