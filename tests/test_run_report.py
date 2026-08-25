@@ -347,3 +347,80 @@ def test_a_deleted_file_cannot_be_opened_or_revealed(qapp):
     assert actions["Show what changed"].isEnabled()
     assert not actions["Open file"].isEnabled()
     assert not actions["Reveal in File Explorer"].isEnabled()
+
+
+# --- file removals ------------------------------------------------------------------------
+#
+# A deletion is spelled `after is None` (§3.3), which the report already half-understood: it
+# greyed out Open and Reveal for one. The rest of the surface did not — the Owner column read
+# blank on the one row that destroys something, the size read "→ 0 B" (a file that exists and
+# is empty, which is a different outcome), and the diff conflated "removed" with "a historical
+# write whose bytes were not persisted", which are opposites.
+
+def removal(path="gen/rhyolite.json", root=None, size=120, owner="p:generate"):
+    made = {"engine": "file", "kind": "removed", "path": path,
+            "before": {"value": "x" * size, "owner": "action", "action_ref": owner},
+            "after": None}
+    if root:
+        made["root"] = root
+    return made
+
+
+def test_a_removal_names_who_owned_it(qapp):
+    """Blank would read as "nobody was responsible for this" on the one row that destroys
+    something, when the record knows exactly who was."""
+    from packsmith.gui.run_report import FILE_COLUMNS
+
+    owner_cell = next(fn for label, fn in FILE_COLUMNS if label == "Owner")
+    assert owner_cell(removal()) == "p:generate"
+
+
+def test_a_removal_reads_as_gone_rather_than_zero_bytes(qapp):
+    from packsmith.gui.run_report import FILE_COLUMNS
+
+    size_cell = next(fn for label, fn in FILE_COLUMNS if label == "Size")
+    assert size_cell(removal(size=120)) == "120 B → gone"
+    # Substring-safe: "120 B" contains "0 B". The claim is about the AFTER side.
+    assert "→ 0 B" not in size_cell(removal()), "an empty file is a different outcome"
+
+
+def test_a_path_outside_the_instance_says_which_root(qapp):
+    """A run that rewrote a mod repo must not read like one that rewrote your pack."""
+    from packsmith.gui.run_report import FILE_COLUMNS
+
+    path_cell = next(fn for label, fn in FILE_COLUMNS if label == "Path")
+    assert path_cell(removal(root="deep_end_assets")) == "deep_end_assets / gen/rhyolite.json"
+    assert path_cell(removal(root="minecraft")) == "gen/rhyolite.json"
+    assert path_cell(removal()) == "gen/rhyolite.json", "no root recorded means the instance"
+
+
+def test_the_files_heading_counts_removals(qapp):
+    """Three thousand written and six deleted is one number in a table and two very
+    different things to have done."""
+    from PySide6.QtWidgets import QLabel
+    from packsmith.gui.run_report import RunReportTab
+
+    report = reports.from_result(Result([Step(changes=[
+        removal("a.json"), removal("b.json"),
+        change("file", kind="added", path="c.json",
+               after={"value": "{}", "owner": "action", "action_ref": "p:generate"}),
+    ])], dry_run=True))
+    tab = RunReportTab(report)
+    try:
+        # `_section_title` upper-cases, so match on the rendered text rather than the source.
+        titles = [w.text() for w in tab.findChildren(QLabel) if w.text().startswith("FILES")]
+        assert titles, "no Files section was built"
+        assert "3" in titles[0] and "2 REMOVED" in titles[0], titles[0]
+    finally:
+        tab.deleteLater()
+
+
+def test_a_removed_file_cannot_be_opened_or_revealed(qapp):
+    """Already true before deletions could be produced — pinned here because it is now
+    reachable, not hypothetical."""
+    tab, _view = _file_view(qapp, removal())
+    _menu, actions = _menu_labels(tab, removal())
+
+    assert actions["Show what changed"].isEnabled()
+    assert not actions["Open file"].isEnabled()
+    assert not actions["Reveal in File Explorer"].isEnabled()

@@ -460,6 +460,11 @@ class FileStaging:
         # content, so rolling back would restore mid-step state rather than the prior file.
         self._pending = {}   # key -> {"path", "content", "owner", "owner_action_ref", …}
         self._touched = set()   # written by the current step — see `L2Staging._touched`
+        # Files this step took from ANOTHER action. Needed only by `delete`: taking a file
+        # and then removing it is two legal acts whose net effect is one this engine
+        # forbids — erasing someone else's file rather than superseding it. The L2 engine
+        # keeps the same memory for the same reason (`pack._refuse_foreign_delete`).
+        self._taken = set()
         self.snapshots = {}  # key -> prior content (or None), populated at commit
 
     def logs_to(self, log):
@@ -488,6 +493,7 @@ class FileStaging:
                 # is otherwise invisible and simply last-run-wins.
                 self._log("info", f"took '{rel_path}' from "
                                   f"'{current['action_ref']}' — both actions write it")
+                self._taken.add((store.name, store.key(rel_path)))
         # §7.3: the existence flags "guard the write at the moment of the call". Checking
         # at commit told the author their file was missing long after the line that assumed
         # it, in a traceback about flushing a buffer — same reasoning as the hard-block
@@ -506,44 +512,128 @@ class FileStaging:
         }
         self._touched.add(key)
 
+    def delete(self, rel_path, *, owner_action_ref, root=None):
+        """Stage a file's removal.
+
+        Staged rather than done, so a deletion previews in a dry run, appears in the run
+        report as a change like any other, and rolls back — `FileStore.restore` already
+        rewrites prior bytes from a snapshot, so the inverse of a delete is the inverse of
+        a write with the sides swapped and needed nothing new.
+
+        **Stricter than `write`, and it follows §3.2.1 rather than §6.1.** A write may TAKE
+        a file from another action, because the loser can re-run and take it back. A delete
+        cannot: it returns the path to "nobody has ever written this", which is a state only
+        the user can produce. So an action may remove only what it already owns — which is
+        also what makes a sweep ("delete everything I own here that I did not write this
+        run") safe to hand an author at all.
+        """
+        store = self._roots.store(root)
+        key = (store.name, store.key(rel_path))
+        where = rel_path if store.name == self._store.name else f"{store.name} / {rel_path}"
+        current = self.ownership(rel_path, root)
+
+        if current is None:
+            # No ownership row. For a TAG that means pristine and there is nothing to
+            # clear, which is why `_refuse_foreign_delete` returns here — but a file is not
+            # a row, and an untracked file that exists on disk is a real file that arrived
+            # by a door Packsmith does not watch. "Nobody owns it" is not "it is free":
+            # it is the strongest reason to leave it alone, because there is no record of
+            # who would lose it. Absent from disk as well, there is genuinely nothing to do.
+            if self.exists(rel_path, root):
+                raise FileOwnershipError(
+                    f"'{where}' is not tracked by Packsmith, and an action may only delete "
+                    f"files it wrote itself. Something else put it there.")
+        elif current["kind"] == "action" and current["action_ref"] == owner_action_ref:
+            if key in self._taken:
+                # Taken from someone else EARLIER IN THIS STEP. Each act was legal alone —
+                # a write may take, and an action may retract its own work — but together
+                # they launder another owner's file into one that never existed.
+                raise FileOwnershipError(
+                    f"'{where}' was taken from its previous owner during this step; "
+                    f"deleting it now would erase their file rather than supersede it. "
+                    f"Write to it instead, or leave it alone.")
+        else:
+            who = "you" if current["kind"] == "user" else f"'{current['action_ref']}'"
+            raise FileOwnershipError(
+                f"'{where}' is owned by {who}, and an action may not delete what it does "
+                f"not own — only write over it. Write to it instead, or leave it alone.")
+
+        if not self.exists(rel_path, root):
+            # Nothing there. A no-op rather than an error: a sweep computes what it wants
+            # and removes the difference, and the difference is allowed to be already gone.
+            self._pending.pop(key, None)
+            return
+        # `content = None` IS the deletion. Modelling it inside `_pending` rather than in a
+        # second set is what makes every reader below see it for free — `read` returns None,
+        # `exists` says no, `changes` classifies REMOVED — instead of each consulting two
+        # places and one of them eventually forgetting to.
+        self._pending[key] = {
+            "path": rel_path, "content": None, "owner": None,
+            "owner_action_ref": owner_action_ref, "file_must_exist": False,
+            "root": store.name,
+        }
+        self._touched.add(key)
+
     def read(self, rel_path, root=None):
         store = self._roots.store(root)
         staged = self._pending.get((store.name, store.key(rel_path)))
         if staged is not None:
-            return staged["content"]
+            return staged["content"]           # None when this step deleted it
         return store.read(rel_path)
 
     def exists(self, rel_path, root=None):
         store = self._roots.store(root)
-        return ((store.name, store.key(rel_path)) in self._pending
-                or store.exists(rel_path))
+        staged = self._pending.get((store.name, store.key(rel_path)))
+        if staged is not None:
+            # A file this step deleted does not exist, however much it still does on disk.
+            # An action that removes a file and then asks is entitled to its own answer.
+            return staged["content"] is not None
+        return store.exists(rel_path)
 
     def ownership(self, rel_path, root=None):
         store = self._roots.store(root)
         staged = self._pending.get((store.name, store.key(rel_path)))
         if staged is not None:
+            if staged["content"] is None:
+                return None                    # deleted: pristine again, so nobody owns it
             return {"kind": staged["owner"], "action_ref": staged["owner_action_ref"]}
         return store.ownership(rel_path)
 
-    def owned_by(self, action_ref: str, *, under: str = "", root=None) -> list:
+    def owned_by(self, action_ref: str, *, under: str = "", root=None,
+                 excluding=()) -> list:
         """Committed ownership, plus what this step has staged — §7.4's rule that every
         read on `pack` is staged-first, with no exceptions for the awkward ones.
 
         A file the action staged this step counts as owned; one it staged for somebody else
         does not, which cannot happen today but would be a silent lie if it ever did.
+
+        **Everything here is a canonical key** (`FileStore.key`), committed and staged
+        alike. It used to mix the two — DB rows are keys, staged entries were whatever
+        string the writer passed — so on Windows, where `key` lowercases, a staged
+        `META-INF/mods.toml` neither matched nor discarded the committed
+        `meta-inf/mods.toml`, and the same file appeared twice.
+
+        `excluding` is filtered **here** rather than by the caller for that same reason, and
+        it is the difference between a working sweep and a catastrophic one. A generator
+        computes the paths it wrote and removes everything else it owns; comparing its own
+        spellings against these keys would find `ModBlocks.java` absent from its own list
+        and delete the file it had just written, on every single run.
         """
         store = self._roots.store(root)
         found = set(store.owned_by(action_ref, under=under))
         prefix = str(under or "").replace("\\", "/").strip("/")
-        for (staged_root, _key), staged in self._pending.items():
+        for (staged_root, staged_key), staged in self._pending.items():
             if staged_root != store.name:
                 continue          # another root's file is not this root's answer
             path = staged["path"]
             if staged.get("owner") != "action" or staged.get("owner_action_ref") != action_ref:
-                found.discard(path)
+                found.discard(staged_key)
                 continue
             if not prefix or path == prefix or path.startswith(prefix + "/"):
-                found.add(path)
+                found.add(staged_key)
+        if excluding:
+            keep = {store.key(path) for path in excluding}
+            found -= keep
         return sorted(found)
 
     @property
@@ -592,12 +682,18 @@ class FileStaging:
                                prior_owner.get("kind"), prior_owner.get("action_ref"))
             else:
                 before = None
-            after = _side(_reportable(staged["content"]), staged["owner"],
-                          staged["owner_action_ref"])
-            after["hash"] = content_hash(staged["content"])
-            if is_binary(staged["content"]):
-                after["binary"] = True
-                after["size"] = len(staged["content"])
+            if staged["content"] is None:
+                # `after is None` is how absence is spelled in a change record (§3.3), and
+                # the run report already reads it that way — it greys out Open and Reveal
+                # for exactly this case. `classify` turns it into REMOVED.
+                after = None
+            else:
+                after = _side(_reportable(staged["content"]), staged["owner"],
+                              staged["owner_action_ref"])
+                after["hash"] = content_hash(staged["content"])
+                if is_binary(staged["content"]):
+                    after["binary"] = True
+                    after["size"] = len(staged["content"])
             described.append({
                 "engine": "file", "root": staged["root"], "path": path,
                 "kind": classify(before, after), "before": before, "after": after,
@@ -617,6 +713,19 @@ class FileStaging:
             rel_path = staged["path"]      # the spelling the action used, for the message
             store = self._roots.store(staged["root"])
             prior_owner = store.ownership(rel_path)                # capture before overwrite
+            if staged["content"] is None:
+                # Read BEFORE unlinking — `FileStore.delete` returns nothing, and the bytes
+                # are the whole of the rollback. The snapshot is the same shape a write
+                # produces, so `rollback_step` restores a deletion without knowing it was
+                # one: a None prior means "did not exist", and real bytes mean "put these
+                # back", which is exactly what it already does.
+                prior_content = store.read(rel_path) if store.exists(rel_path) else None
+                store.delete(rel_path)
+                self.snapshots.setdefault(
+                    f"{staged['root']}::{key[1]}",
+                    {"content": encode_snapshot(prior_content), "ownership": prior_owner,
+                     "root": staged["root"], "path": rel_path})
+                continue
             prior_content = store.write(
                 rel_path, staged["content"],
                 owner=staged["owner"], owner_action_ref=staged["owner_action_ref"],
@@ -646,3 +755,4 @@ class FileStaging:
 
     def discard(self):
         self._pending.clear()
+        self._taken.clear()

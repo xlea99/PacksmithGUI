@@ -476,6 +476,21 @@ class _FileHandle:
                 f"'{source}' is not in the '{root.name}' package")
         return target.read_bytes()
 
+    def delete(self):
+        """Remove this file — if this action is the one that wrote it.
+
+        The rule is §3.2.1's rather than §6.1's, and it is stricter than writing. A write may
+        TAKE a file from another action, because the loser can re-run and take it back. A
+        delete returns the path to "nobody has ever written this", a state only the user can
+        produce — so this refuses on the user's files *and* on another action's, where
+        `write` merely logs a takeover.
+
+        Staged like everything else: it previews in a dry run, appears in the run report as
+        a removal, and rolls back.
+        """
+        self._staging.delete(self._path, owner_action_ref=self._action_ref,
+                             root=self._root)
+
     def exists(self):
         """Whether the file is there — counting one this step has staged but not committed."""
         return self._staging.exists(self._path, root=self._root)
@@ -513,6 +528,35 @@ class _Filesystem:
             raise RuntimeError("filesystem capability is not available for this step")
         return _FileHandle(self._staging, path, self._action_ref, self._package_dir,
                            root=root)
+
+    def owned(self, root=None, under="", excluding=()):
+        """Files this action already owns — what it wrote on previous runs.
+
+        The answer to *"what did I write last time"*, which Packsmith already records:
+        `file_ownership` stamps every action write with its `package:action_id`. Derived
+        rather than remembered, for the reason §3.2.1 gives for orphans — a record kept
+        beside the truth goes stale, a derived one cannot.
+
+        This is what makes a generator idempotent. Compute what should exist, write it, then
+        delete everything here that you did not write this run, and a palette dropped from a
+        blueprint takes its files with it instead of leaving them to be compiled forever.
+
+        **Scoped per ACTION, which is the safety.** Another action managing the same tree
+        owns its own files and they are not in this list, so two generators need no
+        coordination. Ownership is not per STEP, though — see `_PackNamespace.owned` — so
+        two steps of one action pointed at one tree WILL see each other's output. `under`
+        exists so an author who does that can separate them by path.
+
+        HANDLES, not paths, for the reason `resolve` returns one: a bare path has to be
+        re-resolved to be used, and under more than one root that round trip can land
+        somewhere else.
+        """
+        if self._staging is None:
+            raise RuntimeError("filesystem capability is not available for this step")
+        return [_FileHandle(self._staging, path, self._action_ref, self._package_dir,
+                            root=root)
+                for path in self._staging.owned_by(self._action_ref, under=under,
+                                                   root=root, excluding=excluding)]
 
 
 class _PackNamespace:

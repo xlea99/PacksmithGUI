@@ -246,6 +246,7 @@ def _resolve(path, root = None):
         write = partial(_fs_write, path, at),
         write_json = partial(_fs_write_json, path, at),
         copy_from = partial(_fs_copy_from, path, at),
+        delete = partial(_fs_delete, path, at),
         exists = partial(_fs_exists, path, at),
         ownership = partial(_fs_ownership, path, at),
     )
@@ -259,6 +260,14 @@ def _resolve(path, root = None):
 # The first parameter is named `pack` because that is the keyword 3.3 and 7.3 both write:
 # `pack.datapacks.resolve(pack=step.mappings["output_pack"], ...)`. It shadows the global
 # `pack` struct inside these two functions, which is harmless — neither body wants it.
+def _fs_owned(root = None, under = "", excluding = []):
+    # Paths cross the boundary; handles are rebuilt on this side. A host-side object is not
+    # something Starlark can hold methods on, and `_resolve` is already the one shape every
+    # file handle takes.
+    at = root if root else "minecraft"
+    return [_resolve(path, at) for path in _fs_owned_paths(at, under, excluding)]
+
+
 def _datapack_resolve(pack, namespace, path):
     return _resolve(_dp_target(pack, namespace, path))
 
@@ -305,7 +314,7 @@ pack = struct(
         bind = _bp_bind,
         unbind = _bp_unbind,
     ),
-    filesystem = struct(resolve = _resolve),
+    filesystem = struct(resolve = _resolve, owned = _fs_owned),
     datapacks = struct(resolve = _datapack_resolve, owned = _datapack_owned),
     resourcepacks = struct(resolve = _resourcepack_resolve, owned = _resourcepack_owned),
     capabilities = struct(
@@ -368,6 +377,7 @@ def _inject(module: Module, pack):
         # destination; the copy happens on this side.
         "_fs_copy_from": lambda path, root, source:
             pack.filesystem.resolve(path, root).copy_from(source),
+        "_fs_delete": lambda path, root: pack.filesystem.resolve(path, root).delete(),
         "_fs_exists": lambda path, root: pack.filesystem.resolve(path, root).exists(),
         "_fs_ownership": lambda path, root: pack.filesystem.resolve(path, root).ownership(),
         # Provider-routed resolvers hand back the routed PATH, not a handle: the prelude
@@ -382,6 +392,12 @@ def _inject(module: Module, pack):
         # and scoped to one pack so a step cannot clear another step's output.
         # Flattened to paths at the boundary and rebuilt into handles by the prelude —
         # a host-side object is not something Starlark can hold methods on.
+        # The filesystem twin of `_dp_owned`, and scoped per ACTION rather than per pack —
+        # a tracked folder is the scope, and `under` is what separates two steps of one
+        # action that share one.
+        "_fs_owned_paths": lambda root, under, excluding: [
+            h.path for h in pack.filesystem.owned(root=root, under=under,
+                                                  excluding=excluding)],
         "_dp_owned": lambda name: [h.path for h in pack.datapacks.owned(name)],
         "_rp_owned": lambda name: [h.path for h in pack.resourcepacks.owned(name)],
         "_cap_has": pack.capabilities.has,

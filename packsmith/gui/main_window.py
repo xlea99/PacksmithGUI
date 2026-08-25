@@ -54,7 +54,7 @@ from packsmith.core.bindings import (
     best_guess_bindings, record_names, resolve_step, step_problems)
 from packsmith.core import filetypes
 from packsmith.core.files import FileStore, content_hash
-from packsmith.core.roots import FileRoots
+from packsmith.core.roots import FileRoots, INSTANCE_ROOT
 from packsmith.core.history import StepRunStore, JobRunStore
 from packsmith.core.views import ViewStore
 from packsmith.core.jobs import JobStore
@@ -3229,7 +3229,7 @@ class MainWindow(QMainWindow):
         # runs that both rewrote `emi.json` are two different before/after pairs, and a key
         # of just the path would hand the second one the first one's tab.
         tab.diff_requested.connect(
-            lambda change, k=key: self._open_file_diff(change, k))
+            lambda change, k=key, dry=report.dry_run: self._open_file_diff(change, k, dry))
         # The file as it stands, and where it lives. Both already exist — `_open_document`
         # is the same door the Files panel uses, and `reveal` is the Files panel's own —
         # so a run report can ask the questions its diff raises without either being
@@ -3281,7 +3281,7 @@ class MainWindow(QMainWindow):
         self._refresh_after_run()
         self._bottom.refresh_panels()
 
-    def _open_file_diff(self, change, report_key=("report", None)):
+    def _open_file_diff(self, change, report_key=("report", None), dry_run=False):
         """Show what a run did to one file — the snapshot on the left, today's bytes on
         the right.
 
@@ -3295,13 +3295,34 @@ class MainWindow(QMainWindow):
             return
         path = change["path"]
         before = (change.get("before") or {}).get("value") or ""
-        after = (change.get("after") or {}).get("value")
+        after_side = change.get("after")
         note = ""
-        if after is None:
-            after = self._file_store.read(path) or ""
-            expected = (change.get("after") or {}).get("hash")
-            if expected and content_hash(after) != expected:
-                note = "this file has been edited since the run"
+        # Two different things used to collapse into one `after is None`, and they mean
+        # opposite things.
+        #
+        #   after is None entirely      -> the run REMOVED the file. Gone is the answer.
+        #   after exists, no "value"    -> a historical write, whose bytes `_without_file_bytes`
+        #                                  dropped on the way into `step_runs`. Read the disk.
+        #
+        # Collapsing them read a deletion's "after" off disk — and in a DRY RUN the file is
+        # still there, so the preview showed identical text on both sides and reported that
+        # deleting a file changes nothing.
+        if after_side is None:
+            after = ""
+            note = "this run would delete the file" if dry_run else "this run deleted the file"
+        else:
+            after = after_side.get("value")
+            if after is None:
+                # Root-aware, like `reveal`: the same relative path names a different file
+                # under every tracked root (§6.6), so reading it out of the instance would
+                # diff against whatever happens to sit at that path in the pack.
+                store = self._roots.store(change.get("root") or INSTANCE_ROOT) \
+                    if self._roots.has(change.get("root") or INSTANCE_ROOT) \
+                    else self._file_store
+                after = store.read(path) or ""
+                expected = after_side.get("hash")
+                if expected and content_hash(after) != expected:
+                    note = "this file has been edited since the run"
 
         tab_key = ("diff", report_key, path)
         existing = self._open_tabs.get(tab_key)
@@ -3311,8 +3332,11 @@ class MainWindow(QMainWindow):
         # two diffs open on one path would otherwise share one pair of models, and the
         # second `openDiff` would find them already there and show the first one's text.
         tab = DiffTab(self._editor_host, f"diff:{report_key[1]}:{path}", path,
-                      left="before this run", right="now", original=before,
-                      modified=after, note=note)
+                      left="before this run",
+                      # "now" is a lie for a file the run removes — in a dry run it is still
+                      # sitting on disk, and the empty side is the point being made.
+                      right="removed" if change.get("after") is None else "now",
+                      original=before, modified=after, note=note)
         self._workspace.add_tab(tab, f"Diff: {Path(path).name}",
                                 icon=icons.file_icon(Path(path).name,
                                                      colour=style.TEXT_MUTED))

@@ -151,17 +151,36 @@ TAG_COLUMNS = [
 ]
 
 FILE_COLUMNS = [
-    ("Path", lambda c: c["path"]),
+    ("Path", lambda c: _file_path(c)),
     ("", lambda c: c["kind"]),
     ("Size", lambda c: _size_delta(c)),
-    ("Owner", lambda c: _owner_text(c["after"])),
+    # Falls back to the BEFORE side, which only matters for a removal — and there it is the
+    # whole question. A blank owner on the one row that destroys something reads as "nobody
+    # was responsible for this", when the record knows exactly who was.
+    ("Owner", lambda c: _owner_text(c["after"] or c["before"])),
 ]
+
+
+def _file_path(change) -> str:
+    """The path, qualified by its tracked root when it is not the instance (design 6.6).
+
+    The qualified form is an OUTPUT and never an input — nothing parses it back — so it
+    exists purely so a run that wrote into a mod repo does not read as one that rewrote
+    your pack. Unqualified still means the instance, exactly as it does everywhere else.
+    """
+    root = change.get("root")
+    return change["path"] if not root or root == "minecraft" \
+        else f"{root} / {change['path']}"
 
 
 def _size_delta(change) -> str:
     before, after = _size(change["before"]), _size(change["after"])
     if change["before"] is None:
         return f"{after:,} B"
+    if change["after"] is None:
+        # Not "→ 0 B": zero bytes is a file that exists and is empty, which is a different
+        # outcome and one this run did not produce.
+        return f"{before:,} B → gone"
     sign = "+" if after >= before else ""
     return f"{before:,} → {after:,} B  ({sign}{after - before:,})"
 
@@ -307,7 +326,16 @@ class RunReportTab(QWidget):
         changes = self.report.by_engine("file")
         if not changes:
             return
-        self._section_title(f"Files · {len(changes):,}")
+        # Removals are called out in the heading rather than left to be found by scrolling.
+        # Writing three thousand files and deleting six is one number in a table and two
+        # very different things to have done, and the destructive half is the one you would
+        # want to notice before scrolling — especially in a dry run, where noticing is the
+        # entire purpose.
+        removed = sum(1 for c in changes if c["kind"] == "removed")
+        title = f"Files · {len(changes):,}"
+        if removed:
+            title += f"  ·  {removed:,} removed"
+        self._section_title(title)
         table = _change_table(changes, FILE_COLUMNS, stretch_column=0)
         view = table.findChild(QTableView)
         # Double-click rather than a button per row: a Show Differences button in every row
