@@ -199,3 +199,75 @@ def _menu_for(panel, name):
     finally:
         module.QMenu = original
     return captured
+
+
+# --- the surface the window reaches for ---------------------------------------------------
+#
+# Splitting `FilesPanel` into a container of three browsers moved every method one level
+# down. The container forwards what it was known to need — and `reveal` was not on that list,
+# because nothing in the test suite went near it. It is reached exactly once, from
+# `_show_report`, so the crash waited until a job run produced a report and then took the
+# whole report with it. An AttributeError on a rarely-walked wire is invisible until walked.
+
+def panel(world):
+    from packsmith.gui.shell.panels.files_panel import FilesPanel
+    made = FilesPanel(world["roots"].instance, roots=world["roots"])
+    world["panel"] = made
+    return made
+
+
+def test_the_container_answers_everything_the_window_asks_of_it(world):
+    r"""The list is `grep -o '_files_panel\.[a-zA-Z_]*' packsmith/gui/`. A container that
+    silently lacks one of these does not fail until the single line using it runs."""
+    view = panel(world)
+    for name in ("refresh", "set_loader", "reveal", "file_activated",
+                 "ownership_changed", "_mc_version", "_client_jar"):
+        assert hasattr(view, name), f"the window calls _files_panel.{name}"
+
+
+def test_the_run_reports_reveal_signal_actually_connects(world):
+    """The failure as reported, at the exact line that produced it. `connect` is where an
+    absent slot is caught, and it is the only place — a Signal will happily be declared,
+    emitted and dropped."""
+    from packsmith.gui.run_report import RunReportTab
+    from packsmith.core import reports
+
+    view = panel(world)
+    report = reports.RunReport(job_name="probe", status="success", steps=[])
+    tab = RunReportTab(report)
+    try:
+        tab.reveal_requested.connect(view.reveal)      # this raised AttributeError
+    finally:
+        tab.deleteLater()
+
+
+def test_reveal_uses_the_root_the_file_was_written_to(world, monkeypatch):
+    """Not the root the Basic tab is showing. Forwarding to `self.basic` looked correct and
+    resolves against whatever the user last browsed, so the same report row would open
+    different folders depending on where they had been."""
+    from packsmith.gui.shell.panels import files_panel as fp
+
+    world["roots"].add("tweaks", world["repo"])
+    view = panel(world)
+    view.show_root("minecraft")                        # browsing the INSTANCE
+
+    opened = []
+    monkeypatch.setattr(fp.QDesktopServices, "openUrl", lambda url: opened.append(url.toLocalFile()))
+    view.reveal("tweaks", "src/in_repo.json")
+
+    assert opened, "nothing was revealed"
+    assert str(world["repo"]) in opened[0].replace("/", os.sep), \
+        f"revealed {opened[0]}, expected it under the tweaks root"
+
+
+def test_an_unknown_root_falls_back_to_the_instance_rather_than_failing(world, monkeypatch):
+    """A report recorded before §6.6 carries no root at all, and every file it names was the
+    instance by construction."""
+    from packsmith.gui.shell.panels import files_panel as fp
+
+    view = panel(world)
+    opened = []
+    monkeypatch.setattr(fp.QDesktopServices, "openUrl", lambda url: opened.append(url.toLocalFile()))
+    view.reveal("a_root_that_was_removed", "config/in_instance.json")
+
+    assert opened, "an unknown root should still reveal something"

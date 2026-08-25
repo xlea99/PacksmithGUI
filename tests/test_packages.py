@@ -667,3 +667,46 @@ def test_file_operations_refuse_downloaded_packages(tmp_path):
                  lambda: remove_action(pkg, "x")):
         with pytest.raises(ValueError, match="downloaded"):
             call()
+
+
+# --- a manifest key nobody reads ---------------------------------------------------------
+
+def test_an_unknown_action_key_is_refused_rather_than_dropped(tmp_path):
+    """The failure it prevents costs a job run to diagnose.
+
+    `configuration` misspelled as `config` parsed clean, produced an action with no config
+    params at all, and surfaced as the ACTION failing at run time for a value the manifest
+    had in fact declared — with nothing pointing at the manifest. Silence is the wrong
+    answer to a key nobody reads: the package index already carries per-package errors and
+    the GUI already shows them.
+    """
+    pkg = tmp_path / "typo"
+    pkg.mkdir()
+    (pkg / "manifest.json5").write_text('''{
+      "package": {"name": "typo"},
+      "actions": [
+        {"id": "a", "file": "a.star", "function": "run",
+         "config": {"namespace": {"type": "string", "required": true}}}
+      ],
+    }''', encoding="utf-8")
+
+    index = PackageIndex(tmp_path)
+    assert "typo" in index.errors
+    assert "config" in index.errors["typo"], index.errors["typo"]
+    assert "configuration" in index.errors["typo"], "the message must name the right key"
+
+
+def test_the_correct_spelling_still_loads(tmp_path):
+    pkg = tmp_path / "fine"
+    pkg.mkdir()
+    (pkg / "manifest.json5").write_text('''{
+      "package": {"name": "fine"},
+      "actions": [
+        {"id": "a", "file": "a.star", "function": "run",
+         "configuration": {"namespace": {"type": "string", "required": true}}}
+      ],
+    }''', encoding="utf-8")
+
+    index = PackageIndex(tmp_path)
+    assert index.errors == {}
+    assert list(index.get("fine:a").config) == ["namespace"]

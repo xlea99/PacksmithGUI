@@ -734,12 +734,19 @@ class FileBrowser(Panel):
         self.ownership_changed.emit(message)
 
     def reveal(self, rel):
-        """Open the containing folder in the OS file manager.
+        """Open the containing folder in the OS file manager, for the root this browser
+        is currently showing."""
+        FileBrowser.reveal_in(self._files, rel)
 
-        Public because the Run Report borrows it: "where is this file" is one question
-        however you arrived at it, and a second implementation would be a second answer.
+    @staticmethod
+    def reveal_in(store, rel):
+        """The same, against an explicitly named store.
+
+        Split out because the Run Report knows which root a file was written to and this
+        browser only knows which one it is looking at — one implementation, told where,
+        rather than two answers to "where is this file".
         """
-        target = (self._files.root / rel).parent
+        target = (store.root / rel).parent
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(target)))
 
 
@@ -774,6 +781,9 @@ class FilesPanel(Panel):
         self.basic = FileBrowser(file_store, loader=loader, roots=roots)
         self.smart = FileBrowser(file_store, loader=loader, smart=True)
         self.folders = FoldersPanel(roots) if roots is not None else None
+        # Kept so `reveal` can resolve a path against the root it was WRITTEN to rather than
+        # whichever one the Basic tab happens to be showing.
+        self._roots = roots
 
         self._tabs = QTabWidget()
         self._tabs.setStyleSheet(_TABS_QSS)
@@ -829,6 +839,24 @@ class FilesPanel(Panel):
     def show_tab(self, key: str):
         if key in _TAB_TITLES and self._child(key) is not None:
             self._tabs.setCurrentIndex(self._tabs.indexOf(self._child(key)))
+
+    def reveal(self, root, rel):
+        """Open the folder holding one file, in the OS file manager.
+
+        Borrowed by the Run Report — "where is this file" is one question however you got
+        there. It takes a ROOT as well as a path because forwarding to `self.basic` alone
+        would resolve against whichever root that tab was last pointed at, so revealing the
+        same report row would open different folders depending on where the user had been
+        browsing. An unknown root falls back to the instance rather than guessing: that is
+        what every path meant before §6.6, and it is what a report recorded then means now.
+        """
+        store = None
+        if self._roots is not None and root and self._roots.has(root):
+            store = self._roots.store(root)
+        if store is None:
+            self.basic.reveal(rel)
+            return
+        FileBrowser.reveal_in(store, rel)
 
     # The window reaches in for these two — see `_mc_version` / `_client_jar` on the
     # browser. Kept as properties so both halves stay in step rather than one silently

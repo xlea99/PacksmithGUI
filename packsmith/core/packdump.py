@@ -16,9 +16,14 @@ from packsmith.core.profile import Profile
 #
 #   1 — meta, registries, localization display names.
 #   2 — localization gained `keys`: the translation key behind each display name.
+#   3 — `block_items.json`: which items place a block, which block, and that block's form
+#       and Java class. Not inferable — the two available guesses disagreed on 114 items.
+#   4 — `textures.json`: the texture each block actually renders with, read from the baked
+#       model so resource packs are already applied. `<ns>:block/<path>` is a convention
+#       mods break freely. Client-only, so absent (not empty) on a dedicated-server dump.
 #
 # Mirrored in the mod as `DumpSchema.VERSION`; bump both together.
-_VALID_SCHEMAS = {1, 2, 3}
+_VALID_SCHEMAS = {1, 2, 3, 4}
 _CURRENT_SCHEMA = max(_VALID_SCHEMAS)
 
 
@@ -56,6 +61,13 @@ class Packdump:
         self._places_block = {}
         self._forms = {}
         self._block_classes = {}
+
+        # The texture each block actually renders with — schema 4, and the reason it is here
+        # rather than derived is that `<namespace>:block/<path>` is a convention mods break
+        # freely. Read from the baked model, so every resource pack in the load order is
+        # already applied. Empty for older snapshots AND for any dump taken without a
+        # client, which is why absence must not be read as "this block has no texture".
+        self._textures = {}
 
         # The translation key behind each display name: {registry_type: {entry_id: key}}.
         # NOT nested under locale, unlike the names above — `block.spawn.anthill` is the
@@ -120,6 +132,26 @@ class Packdump:
         # "identical", import is skipped, and Packsmith keeps handing actions a key the game
         # no longer answers to.
         if self._localization_keys != other._localization_keys:
+            return False
+
+        # And the attributes added since. Every one of them is the `keys` argument again: a
+        # fact that changes without any id, count or display name changing with it. A
+        # resource pack retextures a block; a mod update moves an item onto a different
+        # block. Left out here, that dump reads as "identical", the import is skipped, and
+        # the profile keeps answering from data the game has stopped agreeing with.
+        #
+        # The sharpest case is the one that gets you the FIRST time an attribute ships:
+        # going from a dump that never recorded textures to one holding 13,240 of them
+        # changes nothing above this line, so the snapshot carrying the new data would be
+        # discarded as a duplicate of the one without it — permanently, since re-dumping
+        # produces the same "identical" answer every time.
+        if self._places_block != other._places_block:
+            return False
+        if self._forms != other._forms:
+            return False
+        if self._block_classes != other._block_classes:
+            return False
+        if self._textures != other._textures:
             return False
 
         return True
@@ -351,6 +383,13 @@ class Packdump:
             block_items = attr_dir_in / "block_items.json"
             if block_items.is_file():
                 result._load_block_items(block_items)
+
+            # Same presence rule, and it carries more weight here: textures are client data,
+            # so this file is absent both for a pre-schema-4 snapshot and for one dumped on
+            # a dedicated server. Neither means "no textures exist" — see `knows_textures`.
+            textures = attr_dir_in / "textures.json"
+            if textures.is_file():
+                result._load_textures(textures)
             # Which locale is *active* must not depend on filename sort order, or adding a
             # German dump would silently re-language the whole GUI.
             if "en_us" in result._localizations:
@@ -374,6 +413,12 @@ class Packdump:
         self._places_block = data.get("places") or {}
         self._forms = data.get("forms") or {}
         self._block_classes = data.get("classes") or {}
+
+    def _load_textures(self, path: Path):
+        """`attributes/textures.json` — what the renderer resolved, not what a jar shipped."""
+        with open(path, "r") as f:
+            data = json.load(f)
+        self._textures = data.get("textures") or {}
 
     def _load_localizations(self,locals_path: Path):
         with open(locals_path, "r") as f:
@@ -462,6 +507,13 @@ class Packdump:
                 "places": self._places_block,
                 "forms": self._forms,
                 "classes": self._block_classes,
+            })
+
+        if self._textures:
+            write_json(attr_dir / "textures.json", {
+                "schema_version": self._schema,
+                "type": "textures",
+                "textures": self._textures,
             })
 
         log.info(f"Packdump saved to {snapshot_path}")
@@ -573,6 +625,12 @@ class Packdump:
     def _has_block_class(self, registry_type: str) -> bool:
         return bool(self._block_classes.get(registry_type))
 
+    def _read_texture(self, registry_type: str, entry_id: str):
+        return self._textures.get(registry_type, {}).get(entry_id)
+
+    def _has_texture(self, registry_type: str) -> bool:
+        return bool(self._textures.get(registry_type))
+
     def is_block_item(self, entry_id: str) -> bool:
         """Whether this `minecraft:item` places a block.
 
@@ -589,6 +647,20 @@ class Packdump:
         """Whether this snapshot was dumped by a mod that recorded any of this at all."""
         return bool(self._places_block)
 
+    def knows_textures(self) -> bool:
+        """Whether this snapshot carries block textures at all.
+
+        Worth asking before treating a `None` texture as "this block has none". Textures are
+        client data, so a dump taken on a dedicated server carries none of them however new
+        the mod is — and a caller that generates models from this would otherwise emit
+        thousands of blocks pointing at nothing, silently and all at once.
+
+        A block that IS here and reads `minecraft:missingno` is the opposite case and is
+        recorded deliberately: the game looked and found no texture, which is exactly the
+        state of a generated block whose art has not been drawn yet.
+        """
+        return bool(self._textures)
+
     # name -> (read it for one entry, does this registry carry it at all). The two live
     # together because they are the same fact asked at different scales, and a reader
     # without a prober is how a column ends up offered for a registry that has no values
@@ -599,6 +671,7 @@ class Packdump:
         "places_block": (_read_places_block, _has_places_block),
         "form": (_read_form, _has_form),
         "block_class": (_read_block_class, _has_block_class),
+        "texture": (_read_texture, _has_texture),
     }
 
     @classmethod

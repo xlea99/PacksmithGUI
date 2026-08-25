@@ -85,7 +85,10 @@ def binding_name(slot, bound, *, tag_store=None, blueprint_store=None):
     Returns None when the id points at something that no longer exists, which is a real
     state the UI has to show rather than crash on.
     """
-    if bound is None or slot.kind in ("registry_entry", "pack"):
+    # `folder` belongs here rather than in the legacy-string branch below: a tracked root is
+    # bound BY NAME on purpose (design 6.6 — `pack.filesystem.resolve(root=…)` takes a name),
+    # so this is the designed shape and not a value that predates ids.
+    if bound is None or slot.kind in ("registry_entry", "pack", "folder"):
         return bound
     if isinstance(bound, str):
         return bound                       # legacy name, written before ids

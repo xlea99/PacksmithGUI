@@ -63,6 +63,13 @@ class ConfigParam:
     description: str = ""
 
 
+# Every key an `[[actions]]` entry may carry. Kept beside the dataclass it mirrors so a
+# field added there without a line here fails loudly on the first manifest that uses it,
+# rather than being dropped.
+_ACTION_KEYS = {"id", "file", "function", "name", "description", "mappings",
+                "configuration"}
+
+
 @dataclass
 class ActionManifest:
     """One declared action (the ``[[actions]]`` entry)."""
@@ -121,6 +128,15 @@ def load_package(package_dir) -> Package:
         for required in ("id", "file", "function"):
             if required not in entry:
                 raise ValueError(f"Action in package '{name}' missing '{required}': {entry}")
+        # A key nobody reads used to be dropped in silence, which turns a typo into an
+        # action that loads clean and then fails at RUN time — with a message about a
+        # missing binding rather than about the manifest that failed to declare it.
+        # Writing `config` instead of `configuration` costs a job run to discover.
+        unknown = set(entry) - _ACTION_KEYS
+        if unknown:
+            raise ValueError(
+                f"Action '{entry['id']}' in package '{name}' has unknown key(s) "
+                f"{', '.join(sorted(unknown))}. Expected: {', '.join(sorted(_ACTION_KEYS))}")
         actions.append(ActionManifest(
             package_name=name,
             action_id=entry["id"],

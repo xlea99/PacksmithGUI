@@ -172,7 +172,11 @@ class RunReportTab(QWidget):
     status = Signal(str)
     diff_requested = Signal(object)     # a file change record
     file_open_requested = Signal(str)   # instance-relative path
-    reveal_requested = Signal(str)      # instance-relative path
+    # (tracked root name, root-relative path). The root travels with the path because under
+    # §6.6 the same relative path names a different file in every root, so a bare path is
+    # only unambiguous while there is exactly one — which stopped being true the moment a
+    # step could be bound to a folder.
+    reveal_requested = Signal(str, str)
     rollback_requested = Signal(int)    # step_runs id
 
     def __init__(self, report, parent=None):
@@ -342,8 +346,11 @@ class RunReportTab(QWidget):
         menu.addAction("Show what changed", lambda: self.diff_requested.emit(change))
         menu.addSeparator()
         open_file = menu.addAction("Open file", lambda: self.file_open_requested.emit(path))
+        # Defaulted, not required: a report re-opened from `step_runs` may predate roots
+        # entirely, and every change recorded then was the instance by construction.
+        root = change.get("root") or "minecraft"
         reveal = menu.addAction("Reveal in File Explorer",
-                                lambda: self.reveal_requested.emit(path))
+                                lambda: self.reveal_requested.emit(root, path))
         # A run that DELETED a file leaves nothing to open or reveal — `after` is None for
         # absence (§3.3's change record), so the record itself says so and no disk check is
         # needed. Disabled rather than hidden: a menu that changes shape row to row is

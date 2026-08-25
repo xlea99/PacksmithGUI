@@ -329,3 +329,41 @@ def test_a_postponed_rebuild_is_tried_again(window, monkeypatch):
     window._check_for_new_packdump()
     assert not window._rebuild_pending
     assert window._packdump is not old
+
+
+# --- the timeline shown after an import ---------------------------------------------------
+
+def snapshot_rows(win):
+    """(name, timestamp) for every row of the packdump panel's snapshot list."""
+    from packsmith.gui.shell.bottom_views import PackdumpView
+
+    view = win._bottom.panel("packdump")
+    assert isinstance(view, PackdumpView), view
+    win._refresh_packdump_panel()
+    return [(view._tree.topLevelItem(i).text(0), view._tree.topLevelItem(i).text(1))
+            for i in range(view._tree.topLevelItemCount())]
+
+
+def test_the_dump_just_imported_is_the_top_row(window):
+    """The panel fed itself from `list_snapshots`, which reads `history/` alone — so every
+    row was a DISPLACED dump and the newest was whichever one the import pushed aside.
+    Importing at 13:00 made the list's top entry read 12:00, which is indistinguishable
+    from "nothing has been imported since 12:00" and means the exact opposite.
+    """
+    new_dump_arrives(window)
+
+    rows = snapshot_rows(window)
+    assert rows, "the panel lists no snapshots at all"
+    name, timestamp = rows[0]
+    assert timestamp.startswith("2026-08-09 13:00"), \
+        f"top row is {timestamp}, but the dump just imported was generated at 13:00: {rows}"
+    assert name == "latest"
+
+
+def test_the_displaced_dump_is_still_listed_below_it(window):
+    """The other half — archiving must not drop the old snapshot off the list, or reverting
+    to it stops being reachable."""
+    new_dump_arrives(window)
+
+    rows = snapshot_rows(window)
+    assert any(t.startswith("2026-08-09 12:00") for _, t in rows[1:]), rows

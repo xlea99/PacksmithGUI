@@ -919,32 +919,55 @@ class BlueprintStore:
     # are the user's own act.
     def find_binding_orphans(self, packdump) -> list:
         """Every binding pointing at a registry entry or instance that no longer exists."""
+        return [orphan for name in self.names()
+                for orphan in self.binding_orphans(name, packdump)]
+
+    def binding_orphans(self, blueprint: str, packdump) -> list:
+        """The same, for ONE blueprint — what a view rendering that blueprint can afford.
+
+        Split out because the grid needs it on every repaint and the whole-profile sweep is
+        the wrong shape to ask for forty-six times. It is built on `all_bindings` for the
+        reason that method exists at all: the per-instance `bindings()` rebuilds the slot
+        tree each call, which is fine once and catastrophic per frame.
+
+        Registry members are collected into a **set** per registry type, matching what
+        `find_orphans` does for tags and for the same measured reason — `values` is a list
+        in the dump, so the membership test was a linear scan over every item in the pack,
+        once per binding.
+        """
         # Blueprint slots store the target's ID, so "does it still exist" is an id lookup.
-        labels = self._instance_labels()
+        labels = None                      # built lazily; only blueprint slots need it
+        members = {}                       # registry_type -> set of ids, or None if absent
+        slots = {s.path: s for s in self.value_slots(blueprint)}
+        every = self.all_bindings(blueprint)
         orphans = []
-        for name in self.names():
-            slots = {s.path: s for s in self.value_slots(name)}
-            for instance in self.instances(name):
-                for path, binding in self.bindings(name, instance.name).items():
-                    slot = slots.get(path)
-                    if slot is None:
-                        continue
-                    if slot.type == "registry":
+        for instance in self.instances(blueprint):
+            for path, binding in every.get(instance.name, {}).items():
+                slot = slots.get(path)
+                if slot is None:
+                    continue
+                if slot.type == "registry":
+                    if slot.registry_type not in members:
                         registry = (packdump.registry.get(slot.registry_type)
                                     if packdump is not None else None)
-                        if registry is None or binding.value not in registry["values"]:
-                            orphans.append(BindingOrphan(
-                                name, instance.name, path, binding.value,
-                                slot.registry_type, "missing_entry"))
-                    elif slot.type == "blueprint":
-                        try:
-                            target = int(binding.value)
-                        except (TypeError, ValueError):
-                            target = None
-                        if target not in labels:
-                            orphans.append(BindingOrphan(
-                                name, instance.name, path, binding.value,
-                                slot.ref_blueprint, "missing_instance"))
+                        members[slot.registry_type] = (
+                            set(registry["values"]) if registry is not None else None)
+                    known = members[slot.registry_type]
+                    if known is None or binding.value not in known:
+                        orphans.append(BindingOrphan(
+                            blueprint, instance.name, path, binding.value,
+                            slot.registry_type, "missing_entry"))
+                elif slot.type == "blueprint":
+                    if labels is None:
+                        labels = self._instance_labels()
+                    try:
+                        target = int(binding.value)
+                    except (TypeError, ValueError):
+                        target = None
+                    if target not in labels:
+                        orphans.append(BindingOrphan(
+                            blueprint, instance.name, path, binding.value,
+                            slot.ref_blueprint, "missing_instance"))
         return orphans
 
     # === INSTANCE CYCLES (design 3.2.2 Live Questions — resolved: reject at bind time) ===

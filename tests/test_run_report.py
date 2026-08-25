@@ -307,15 +307,33 @@ def test_each_entry_asks_for_the_row_that_was_clicked(qapp):
     menu, actions = _menu_labels(tab, change)
     opened, revealed, diffed = [], [], []
     tab.file_open_requested.connect(opened.append)
-    tab.reveal_requested.connect(revealed.append)
+    # Reveal carries the ROOT as well as the path: under §6.6 the same relative path names
+    # a different file in every tracked folder, so the path alone stopped being an address.
+    tab.reveal_requested.connect(lambda root, path: revealed.append((root, path)))
     tab.diff_requested.connect(diffed.append)
 
     for label in ("Open file", "Reveal in File Explorer", "Show what changed"):
         actions[label].trigger()
 
     assert opened == ["config/quark-common.toml"]
-    assert revealed == ["config/quark-common.toml"]
+    assert revealed == [("minecraft", "config/quark-common.toml")]
     assert diffed[0]["path"] == "config/quark-common.toml"
+
+
+def test_reveal_carries_the_root_a_file_was_actually_written_to(qapp):
+    """A step bound to a tracked folder writes outside the instance, and the change record
+    says so. Dropping that on the way to the file manager would open the instance at the
+    same relative path — a real folder, holding a different file or none."""
+    change = file_change(path="src/main/resources/pack.mcmeta")
+    change["root"] = "deep_end_assets"
+    tab, _view = _file_view(qapp, change)
+    _menu, actions = _menu_labels(tab, change)
+
+    revealed = []
+    tab.reveal_requested.connect(lambda root, path: revealed.append((root, path)))
+    actions["Reveal in File Explorer"].trigger()
+
+    assert revealed == [("deep_end_assets", "src/main/resources/pack.mcmeta")]
 
 
 def test_a_deleted_file_cannot_be_opened_or_revealed(qapp):

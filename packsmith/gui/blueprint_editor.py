@@ -955,6 +955,20 @@ class BlueprintEditorTab(QWidget):
             self._instances = [by_name[n] for n in names if n in by_name]
             self._orphans = {o.instance: o for o in
                              self._store.orphans(self.blueprint_name)}
+            # Bindings pointing at something the packdump no longer has. Derived here on
+            # every reload rather than stored, for the reason `find_binding_orphans` gives:
+            # it is the dump changing underneath the data, so a cached answer would be
+            # wrong the moment a dump is imported — and `set_packdump` calls straight
+            # through to `reload`, which is what makes this the right place to compute it.
+            #
+            # With no dump at all every registry binding reports as dangling, which is the
+            # right answer for the Errors panel — it cannot verify any of them — and the
+            # wrong one to PAINT. A grid tinted end to end says "these are all broken" when
+            # the truth is "nothing has been checked", so the tint stays off until there is
+            # something to check against.
+            self._dangling = {(o.instance, o.slot_path): o for o in
+                              self._store.binding_orphans(self.blueprint_name, self._dump)
+                              } if self._dump is not None else {}
             self._build_tree()
             self._build_grid()
             self._apply_column_visibility()
@@ -1060,6 +1074,15 @@ class BlueprintEditorTab(QWidget):
                     item.setToolTip(
                         item.toolTip() +
                         f"\nmanaged by '{binding.action_ref}' — double-click to take it over")
+                # Painted last and as a BACKGROUND, so it survives the ownership branch
+                # above instead of competing with it: ownership is carried by the
+                # foreground, and an action-owned cell whose entry vanished has to be able
+                # to say both things at once. The cell stays editable — the fix for a
+                # dangling binding is usually to type a new value into it.
+                dangling = self._dangling.get((instance.name, slot.path))
+                if dangling is not None:
+                    item.setBackground(style.qt_colour(style.DANGLING))
+                    item.setToolTip(f"{item.toolTip()}\n⚠ {dangling.detail}")
                 if orphaned:
                     item.setFlags(Qt.ItemIsEnabled)
                 self._grid.setItem(row, column, item)

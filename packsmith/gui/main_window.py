@@ -35,7 +35,7 @@ from packsmith.integrations import PACK_LOADERS
 from packsmith.core.packdump import (
     ACTIVE_SNAPSHOT, auto_adopt_enabled, check_packdump, compare_snapshots,
     current_packdump,
-    import_packdump, list_snapshots, previous_snapshot, revert_to_snapshot,
+    import_packdump, previous_snapshot, revert_to_snapshot,
     snapshot_timeline)
 from packsmith.common.logging import log
 from packsmith.gui.table.edit_commands import UndoBlocked
@@ -1052,16 +1052,19 @@ class MainWindow(QMainWindow):
         if view is None or not isinstance(view, PackdumpView):
             return
         result = getattr(self, "_import_result", None)
-        snapshots = []
-        for entry in list_snapshots(self._profile):
-            snapshots.append({**entry, "name": entry["path"].name})
+        # The TIMELINE, not `list_snapshots` — the latter reads `history/` alone, so every
+        # row it produces is by construction a dump that is no longer in effect. The newest
+        # of them is whichever snapshot the most recent import DISPLACED, which reads as
+        # "nothing has been imported since then" and means precisely the opposite.
+        snapshots = snapshot_timeline(self._profile)
         view.show_state(
             summary=self._packdump_summary(),
             at_risk=self._packdump_at_risk(),
             # Pending only ever happens with auto-adopt turned off: the dump differs and
             # nothing has been written.
             pending=bool(result is not None and result.status == "changed"),
-            snapshots=snapshots)
+            snapshots=snapshots,
+            active=ACTIVE_SNAPSHOT)
 
     def _open_packdump_diff(self):
         """Open the comparison as its own tab.

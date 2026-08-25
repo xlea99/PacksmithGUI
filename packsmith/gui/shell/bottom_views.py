@@ -736,6 +736,9 @@ class PackdumpView(_SummaryView):
         """
         self._summary = summary
         self._pending = pending
+        # Kept, not just used for colouring: the row for the dump in effect must not offer
+        # to revert to itself or diff against itself (see `_menu_for`).
+        self._active = active
         # Blessing is only offered when there is something to bless. With auto-adopt on
         # (the default) that is never, and a permanently disabled button would be a
         # standing invitation to wonder what it does.
@@ -790,8 +793,14 @@ class PackdumpView(_SummaryView):
         # in effect now). The second is usually why you are looking at history at all.
         menu.addAction("See what changed in this snapshot",
                        lambda: self.snapshot_diff_requested.emit(name))
-        menu.addAction("Compare with the active dump",
-                       lambda: self.snapshot_vs_active_requested.emit(name))
-        menu.addSeparator()
-        menu.addAction(f"Revert to {name}", lambda: self.revert_requested.emit(name))
+        # The active row gets the first question and neither of the others. "Compare with
+        # the active dump" would diff it against itself, and "revert" would restore the
+        # snapshot already in effect — two menu entries that read as available operations
+        # and do nothing. Omitted rather than disabled: a greyed-out item invites the user
+        # to work out what would enable it, and nothing ever will.
+        if name != getattr(self, "_active", None):
+            menu.addAction("Compare with the active dump",
+                           lambda: self.snapshot_vs_active_requested.emit(name))
+            menu.addSeparator()
+            menu.addAction(f"Revert to {name}", lambda: self.revert_requested.emit(name))
         return menu

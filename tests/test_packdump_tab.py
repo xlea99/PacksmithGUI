@@ -224,3 +224,67 @@ def test_empty_space_offers_nothing_to_revert(qapp):
     view = PackdumpView()
     view.show_state(summary=DiffSummary())
     assert view._menu_for(None) is None
+
+
+# --- the snapshot list must include the dump in effect -----------------------------------
+#
+# `list_snapshots` reads `history/` alone, so every row it yields is a dump that has been
+# DISPLACED. Feeding the panel from it meant the newest row was always the snapshot the most
+# recent import pushed aside — so importing a dump made the list show the *previous* one's
+# timestamp as its top entry, which reads as "nothing has been imported since then" and
+# means exactly the opposite. `snapshot_timeline` is the function that includes `latest`.
+
+def rows(view):
+    return [(view._tree.topLevelItem(i).text(0), view._tree.topLevelItem(i).text(1))
+            for i in range(view._tree.topLevelItemCount())]
+
+
+def timeline():
+    """What `snapshot_timeline` returns: the archived dumps, plus the active one."""
+    return [
+        {"name": "latest", "timestamp": "2026-08-24T20:56:53", "mod_count": 304,
+         "active": True},
+        {"name": "2026-08-24_05-56-33", "timestamp": "2026-08-24T05:56:33",
+         "mod_count": 304, "active": False},
+    ]
+
+
+def test_the_active_dump_is_listed_at_all():
+    view = PackdumpView()
+    view.show_state(summary=summary_with(), snapshots=timeline(), active="latest")
+
+    assert "latest" in [name for name, _ in rows(view)], \
+        "the dump actually in effect is missing from the list of dumps"
+
+
+def test_the_newest_row_is_the_active_one_not_the_one_it_replaced():
+    """The symptom as reported: the list's top entry was the displaced snapshot's
+    timestamp, so an import that had just succeeded looked like it had never happened."""
+    view = PackdumpView()
+    view.show_state(summary=summary_with(), snapshots=timeline(), active="latest")
+
+    top_name, top_time = rows(view)[0]
+    assert top_name == "latest"
+    assert top_time.startswith("2026-08-24 20:56"), \
+        "the newest timestamp shown is not the newest import"
+
+
+def test_the_active_row_offers_neither_revert_nor_compare_with_itself():
+    """Both would be no-ops dressed as operations: diffing the active dump against the
+    active dump, and reverting to the snapshot already in effect."""
+    view = PackdumpView()
+    view.show_state(summary=summary_with(), snapshots=timeline(), active="latest")
+
+    active_item = view._tree.topLevelItem(0)
+    labels = [a.text() for a in view._menu_for(active_item).actions() if a.text()]
+    assert labels == ["See what changed in this snapshot"], labels
+
+
+def test_an_archived_row_still_offers_everything():
+    view = PackdumpView()
+    view.show_state(summary=summary_with(), snapshots=timeline(), active="latest")
+
+    archived = view._tree.topLevelItem(1)
+    labels = [a.text() for a in view._menu_for(archived).actions() if a.text()]
+    assert "Compare with the active dump" in labels
+    assert any(label.startswith("Revert to") for label in labels)

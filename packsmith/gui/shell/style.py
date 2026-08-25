@@ -90,6 +90,13 @@ SUCCESS = "#7ea87e"
 # reads as absence rather than alarm (design 3.2.2).
 GAP = "#3a3a48"
 
+# A binding whose registry entry left with the packdump — `WARNING`'s background
+# counterpart, and deliberately in the same amber family rather than a red: uninstalling a
+# mod is a thing the user meant to do, so the cell should look spoiled, not accusatory.
+# Applied as a background so it composes with the FOREGROUND that carries ownership: an
+# action-owned cell that went dangling has to be able to say both at once.
+DANGLING = "#4a3a28"
+
 
 # Wide to grab, thin to look at. The handle itself is transparent and only its inner edge
 # is drawn, so the seam reads as a 1px line while the draggable strip around it is 9px. On

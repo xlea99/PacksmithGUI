@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
 from packsmith.core.bindings import (
     best_guess_bindings, binding_id, binding_name, mapping_mismatches, record_names,
     stale_bindings, step_problems)
+from packsmith.core.roots import INSTANCE_ROOT
 from packsmith.core.shapes import describe_shape
 from packsmith.gui.shell import icons, style
 from packsmith.gui.shell.picker import Choice, PickerPopup, _token_match
@@ -425,6 +426,33 @@ class StepForm(QWidget):
             _select_stored(combo, current)
             return combo
 
+        if slot.kind == "folder":
+            # §6.6's SECOND consent, and the only place it is given. Adding a tracked folder
+            # makes it browsable; picking it here is what lets this one action write into
+            # that one tree. Same picker gesture as a pack, for the same reason — "where
+            # does this go" is one question however it is asked.
+            #
+            # The stored value is the root's NAME, not its id: `resolve_step` checks it
+            # against `file_roots.names()` and `pack.filesystem.resolve(root=…)` takes a
+            # name, so an id here would have to be translated twice and could disagree once.
+            roots = self._file_roots.names() if self._file_roots is not None else []
+            # The instance is excluded deliberately. Unqualified paths already mean it
+            # (§6.6), so an action that wanted the instance would not have declared a folder
+            # mapping at all — offering it invites binding a step to the one root whose
+            # paths are supposed to be universal.
+            roots = [name for name in roots if name != INSTANCE_ROOT]
+            for name in roots:
+                combo.addItem(name, name)
+            if not roots:
+                combo.addItem("(no tracked folders yet — add one in Files ▸ Tracked Folders)",
+                              None)
+                combo.setEnabled(False)
+            combo.setToolTip(
+                "This action may write into the folder you pick, and no other.\n"
+                "Add folders in Files ▸ Tracked Folders.")
+            _select_stored(combo, current)
+            return combo
+
         if slot.kind == "registry_entry":
             return _EntryField(slot.registry_type,
                                self._registry_entries(slot.registry_type), current)
@@ -483,6 +511,9 @@ class StepForm(QWidget):
             return [(e, e, []) for e in self._registry_entries(slot.registry_type)]
         if slot.kind == "pack":
             return [(p, p, []) for p in (self._packs_for(slot) or [])]
+        if slot.kind == "folder":
+            roots = self._file_roots.names() if self._file_roots is not None else []
+            return [(r, r, []) for r in roots if r != INSTANCE_ROOT]
         if self._blueprints is None:
             return []
         if slot.kind == "blueprint_instance":
@@ -1035,7 +1066,14 @@ class JobEditorTab(QWidget):
         self._panel = StepPanel(job_store=job_store, tag_store=tag_store,
                                 package_index=package_index,
                                 blueprint_store=blueprint_store, packdump=packdump,
-                                pack_targets=pack_targets)
+                                pack_targets=pack_targets,
+                                # Dropped here once, and only here: this tab already holds
+                                # `file_roots` and hands it to `best_guess_bindings` and
+                                # `step_problems`. Missing from the PANEL, the guess still
+                                # picked the right folder and the picker it was shown in had
+                                # nothing to offer — a binding that was correct and
+                                # unselectable at the same time.
+                                file_roots=file_roots)
         self._panel.changed.connect(self._on_panel_changed)
         self._panel.status.connect(self.status)
         self._panel.picked.connect(self._on_picked)
