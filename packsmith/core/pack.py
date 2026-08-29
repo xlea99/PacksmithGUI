@@ -501,9 +501,146 @@ class _FileHandle:
         return self._staging.ownership(self._path, root=self._root)
 
 
+# An action may not rewrite its own provenance. §3.3.1's rules about where code came from
+# and what it declares are enforced against files on disk; an action that could edit its own
+# manifest or sources could grant itself mappings, change its id, or make the code that ran
+# differ from the code the user reviewed.
+#
+# Module-level rather than class attributes, and that is not cosmetic: anything public on a
+# `Pack` namespace IS the author-facing surface — `test_pack_surface` says so and caught this
+# — and the boundary is not a capability. The refusal crosses into Starlark as an error with
+# a reason; the shape of the cage does not.
+_PROTECTED_SUFFIXES = (".star",)
+_PROTECTED_NAMES = ("manifest.json5", "manifest.json")
+
+
+class _Package:
+    """``pack.package`` — the action's own folder, for content that is nobody else's.
+
+    **Why this exists at all** (2026-08-29). §3.3.4 banned scratch files, and the ban was
+    over-broad: it forbade a *location* when its real content was about a *pattern*. Both
+    costs it named are absent here. A package lives under `userdata/`, which §6.6 makes
+    structurally unreachable from every tracked root in both directions — so nothing here
+    can ship inside a compiled artifact. And two actions cannot collide on a path, because
+    containment stops at the package root and cross-package access does not exist; two
+    actions inside ONE package are one author's files in one versioned directory.
+
+    So a file here has everything the ban said a scratch file lacked: an owner (the
+    package), a lifecycle (the package's), and a home that travels with the code that reads
+    it.
+
+    **What the ban still means, undiluted:** *derive, do not collect.* A comfortable place
+    to put a handoff is not a reason to invent one. `mods.toml` was right to be derived and
+    would still be right today; the only thing that has changed is where legitimate state
+    may live, not what counts as legitimate.
+
+    Two uses, and they point opposite ways:
+
+    * **Read** — content the USER authors for the action. In Control rules that no tag can
+      express, a curated list, a template. Declared in the manifest so the GUI can surface
+      it (§3.3.2's "slots to fill"), because a file nobody knows about is not a feature.
+    * **Write** — state the action genuinely cannot derive, which is history rather than a
+      cache: *what I wrote last time* exists nowhere else and passes §3.3.4's escape-hatch
+      test outright.
+    """
+
+    def __init__(self, package_dir, action_ref, user_authored=()):
+        self._dir = Path(package_dir).resolve() if package_dir else None
+        self._action_ref = action_ref
+        # Paths the manifest declared as the USER's. Refused to `write`, which is what
+        # keeps "Packsmith never writes your file" a rule rather than a courtesy — the
+        # promise-instead-of-protection trade the ownership system exists to avoid.
+        self._user_authored = {self._norm(p) for p in user_authored}
+
+    @staticmethod
+    def _norm(path) -> str:
+        return str(path).replace("\\", "/").strip("/")
+
+    def _resolve(self, path) -> Path:
+        if self._dir is None:
+            raise RuntimeError(
+                "pack.package needs the action's package folder, which this step was not "
+                "given — see run_action(package_dir=...)")
+        target = (self._dir / str(path)).resolve()
+        if target != self._dir and not target.is_relative_to(self._dir):
+            raise ValueError(f"'{path}' escapes the package folder")
+        return target
+
+    def exists(self, path) -> bool:
+        """Whether this file is in the package. Useful for telling "the user has not
+        written their rules yet" from "they wrote an empty list on purpose"."""
+        return self._resolve(path).is_file()
+
+    def read(self, path):
+        """The file's text, or None when it is not there.
+
+        None rather than raising, because the common case is a user file nobody has written
+        yet and an action should be able to say `or []` rather than guard every call. A path
+        that escapes the package is still an error — that is a bug, not an absence.
+        """
+        target = self._resolve(path)
+        return target.read_text(encoding="utf-8") if target.is_file() else None
+
+    def read_json(self, path):
+        """The file parsed as JSON5, or None when it is not there.
+
+        **JSON5, not JSON**, and the difference is comments. This file is read by Packsmith
+        and by nobody else — whatever the action does with the result is its own business —
+        so there is no downstream parser to keep happy, and a config a human hand-writes
+        without being able to explain a line to themselves is a worse config. It is the same
+        reason `manifest.json5` is json5 (§3.3.1's decision record).
+
+        A superset, so every valid JSON file still parses unchanged.
+        """
+        raw = self.read(path)
+        # Blank counts as absent, and that is not laziness: `Create` makes an empty file
+        # when the author declared no template, so the very next run would otherwise fail
+        # with "not valid JSON" on a file Packsmith had just made for the user.
+        if raw is None or not raw.strip():
+            return None
+        try:
+            return _loads_json5(raw)
+        except (ValueError, TypeError) as e:
+            raise ValueError(f"'{path}' in the package is not valid JSON5: {e}") from e
+
+    def write(self, path, content):
+        """Write into the action's own folder. Refused for the two things it must not touch.
+
+        **Not staged, and deliberately.** File staging is the instance's ownership engine —
+        dry run, hard-block, rollback — and it answers "may this action write over somebody
+        else's work". Inside its own package there is nobody else: the boundaries below are
+        structural rather than negotiated, so routing this through staging would report a
+        package's private state as a change to the user's pack.
+        """
+        clean = self._norm(path)
+        if clean in self._user_authored:
+            raise ValueError(
+                f"'{path}' is declared user_authored — the file this action asked the user "
+                f"to write is not the action's to write. Read it instead.")
+        name = clean.rsplit("/", 1)[-1]
+        if name in _PROTECTED_NAMES or name.endswith(_PROTECTED_SUFFIXES):
+            raise ValueError(
+                f"'{path}' is the package's own code or manifest, which an action may not "
+                f"rewrite — that is how it would change what it declared after you read it")
+        target = self._resolve(path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content if isinstance(content, str) else str(content),
+                          encoding="utf-8")
+        return clean
+
+    def write_json(self, path, value):
+        """Write JSON into the action's own folder, under the same refusals as `write`.
+
+        Sorted and indented, because this is state an action rewrites every run and an
+        unstable key order would make every diff of it noise."""
+        return self.write(path, json.dumps(value, indent=2, sort_keys=True) + "\n")
+
+
 class _Filesystem:
     """``pack.filesystem`` — whole-file access within the instance root. Raises if
-    the step wasn't given a filesystem provider (no instance / file store)."""
+    the step wasn't given a filesystem provider (no instance / file store).
+
+    Not to be confused with :class:`_Package`, which reaches the action's OWN folder."""
 
     def __init__(self, staging, action_ref, package_dir=None):
         self._staging = staging
@@ -703,7 +840,7 @@ class Pack:
     def __init__(self, *, staging, tag_store, packdump, action_ref,
                  file_staging=None, mappings=None, config=None, conflict_policies=None,
                  blueprint_staging=None, blueprint_store=None, pack_targets=None,
-                 package_dir=None):
+                 package_dir=None, user_authored=()):
         self.action_ref = action_ref
         self._log = []
         # Set by fail(); None means "no deliberate failure was requested".
@@ -715,6 +852,7 @@ class Pack:
                                       conflict_policies=conflict_policies, log=self.log) \
             if blueprint_store is not None else None
         self.filesystem = _Filesystem(file_staging, action_ref, package_dir)
+        self.package = _Package(package_dir, action_ref, user_authored=user_authored)
         # Provider-routed (§7.3): the same two namespaces exist whether or not a loader is
         # installed, and refuse with a message naming what is missing rather than being
         # absent — `pack.datapacks` raising AttributeError would tell the author nothing.

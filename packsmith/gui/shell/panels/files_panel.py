@@ -71,6 +71,21 @@ def _parent_of(rel: str) -> str:
     return rel.rsplit("/", 1)[0] if "/" in rel else ""
 
 
+def open_containing(path):
+    """Show a file's folder in the OS file manager.
+
+    The containing folder rather than the file itself, which is the one behaviour that
+    works the same on all three platforms — selecting the file needs a different incantation
+    per OS, and two of them are shell invocations that fail silently on a path with a quote
+    in it. A modpack is full of names nobody sanitised.
+
+    One function because "where is this" has one answer however it was asked: the browser's
+    context menu, the run report, and a tab's own menu all land here rather than each
+    keeping a copy of the same two lines.
+    """
+    QDesktopServices.openUrl(QUrl.fromLocalFile(str(Path(path).parent)))
+
+
 def _norm(path: str) -> str:
     """The store's own canonical key — one definition, so the browser can never disagree
     with the hard-block about which record belongs to which file."""
@@ -746,8 +761,44 @@ class FileBrowser(Panel):
         browser only knows which one it is looking at — one implementation, told where,
         rather than two answers to "where is this file".
         """
-        target = (store.root / rel).parent
-        QDesktopServices.openUrl(QUrl.fromLocalFile(str(target)))
+        open_containing(store.root / rel)
+
+    def select(self, rel) -> bool:
+        """Expand down to `rel`, put the cursor on it, and scroll it into view.
+
+        The tree is lazy — a folder's children do not exist until it is expanded — so
+        getting to a file five levels down means expanding each level in turn and letting
+        `_on_expanded` populate as it goes. That is exactly what restoring expansion state
+        already does, so this hands `_restore_expanded` the chain of ancestors and lets the
+        same walk do the work; a second traversal that also loaded children would be a
+        second place for "how this tree fills in" to be written down.
+
+        Returns whether it was found. A miss is ordinary rather than an error: Smart mode
+        does not contain every path, a tracked root's file is not under the instance, and a
+        caller that cannot say so is a caller that silently does nothing.
+        """
+        rel = _norm(rel)
+        if not rel:
+            return False
+        parts = rel.split("/")
+        self._restore_expanded({"/".join(parts[:i + 1]) for i in range(len(parts) - 1)})
+
+        def find(item):
+            for i in range(item.childCount()):
+                child = item.child(i)
+                if _norm(child.data(0, _ROLE_PATH) or "") == rel:
+                    return child
+                found = find(child)
+                if found is not None:
+                    return found
+            return None
+
+        item = find(self._tree.invisibleRootItem())
+        if item is None:
+            return False
+        self._tree.setCurrentItem(item)
+        self._tree.scrollToItem(item, QAbstractItemView.PositionAtCenter)
+        return True
 
 
 _TAB_ORDER = ("basic", "smart", "folders")
@@ -839,6 +890,26 @@ class FilesPanel(Panel):
     def show_tab(self, key: str):
         if key in _TAB_TITLES and self._child(key) is not None:
             self._tabs.setCurrentIndex(self._tabs.indexOf(self._child(key)))
+
+    def show_file(self, root, rel) -> bool:
+        """Bring one file into view in the browser: right tab, right root, cursor on it.
+
+        **Basic, always.** Smart is the pack loader's own arrangement (§8.1) and describes
+        the instance's datapack and resourcepack folders — a `config/` or `mods/` path is
+        simply not in that tree, so sending someone there would land them on a view that
+        cannot show what they asked for. `show_root` handles the tracked-root case for the
+        same reason it does for the panel: one browser, told which root.
+
+        Returns whether the file was actually found, so a caller can say "not in the
+        browser" rather than switching tabs and appearing to have done nothing.
+        """
+        if not rel:
+            return False
+        if root and self._roots is not None and self._roots.has(root):
+            self.show_root(root)        # switches to Basic and points it at that root
+        else:
+            self.show_tab("basic")
+        return self.basic.select(rel)
 
     def reveal(self, root, rel):
         """Open the folder holding one file, in the OS file manager.

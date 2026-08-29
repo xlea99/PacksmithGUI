@@ -240,8 +240,18 @@ class PackagesPanel(Panel):
             nodes[path] = item
 
         counts = {}
+        # Which files an action DECLARED as the user's to write (design 3.3.1). Marked
+        # because "the author's code" and "the thing this package is asking YOU for" are the
+        # two kinds of file in here and they look identical in a tree — and the second is
+        # the one a stranger has no other way to discover.
+        declared = {}
+        for action in package.actions:
+            for spec in getattr(action, "files", {}).values():
+                declared.setdefault(spec.path.replace("\\", "/").strip("/"), spec)
+
         for name in files:
             users = [a.action_id for a in package.actions if a.file == name]
+            mine = declared.get(name.replace("\\", "/").strip("/"))
             child = QTreeWidgetItem([name.rsplit("/", 1)[-1], ""])
             # The Files panel's vocabulary, unchanged (§6.2) — a `.json` is a `.json`
             # wherever you found it. The manifest is the one file with a role rather than
@@ -260,6 +270,13 @@ class PackagesPanel(Panel):
                 child.setText(1, str(len(users)))
             elif name != MANIFEST_NAME:
                 tip += "\n\nno action points at this file"
+            if mine is not None and mine.user_authored:
+                # Same treatment the Files panel gives a user-owned file, for the same
+                # reason: ownership is carried by the foreground, and "this one is yours"
+                # is exactly what the colour there means.
+                child.setForeground(0, style.qt_colour(style.OWNER_USER_ICON))
+                tip += "\n\nyours to write" + (
+                    f" — {mine.description}" if mine.description else "")
             child.setToolTip(0, tip)
             nodes.get(_parent_of(name), root).addChild(child)
             folder = _parent_of(name)

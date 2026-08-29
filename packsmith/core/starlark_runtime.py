@@ -315,6 +315,16 @@ pack = struct(
         unbind = _bp_unbind,
     ),
     filesystem = struct(resolve = _resolve, owned = _fs_owned),
+    # The action's OWN folder, not the user's pack (design 3.3.1). No handle struct
+    # here on purpose: a package path has no root to pre-bind and no ownership to
+    # ask about, so a handle would be four methods pretending to be a file world.
+    package = struct(
+        exists = _pkg_exists,
+        read = _pkg_read,
+        read_json = _pkg_read_json,
+        write = _pkg_write,
+        write_json = _pkg_write_json,
+    ),
     datapacks = struct(resolve = _datapack_resolve, owned = _datapack_owned),
     resourcepacks = struct(resolve = _resourcepack_resolve, owned = _resourcepack_owned),
     capabilities = struct(
@@ -380,6 +390,13 @@ def _inject(module: Module, pack):
         "_fs_delete": lambda path, root: pack.filesystem.resolve(path, root).delete(),
         "_fs_exists": lambda path, root: pack.filesystem.resolve(path, root).exists(),
         "_fs_ownership": lambda path, root: pack.filesystem.resolve(path, root).ownership(),
+        # The package namespace crosses as plain callables — its paths are strings
+        # relative to one fixed folder, so there is nothing to pre-bind.
+        "_pkg_exists": pack.package.exists,
+        "_pkg_read": pack.package.read,
+        "_pkg_read_json": pack.package.read_json,
+        "_pkg_write": pack.package.write,
+        "_pkg_write_json": pack.package.write_json,
         # Provider-routed resolvers hand back the routed PATH, not a handle: the prelude
         # rebuilds the handle with `_resolve` so every resolver produces one shape (7.3).
         # A missing loader or an unknown pack raises here, on the host side, with the

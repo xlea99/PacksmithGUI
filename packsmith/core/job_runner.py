@@ -412,6 +412,7 @@ def _run_action_step(step, ctx) -> StepResult:
         mappings=mappings, config=config, file_store=ctx.file_store, history=ctx.history,
         blueprint_store=ctx.blueprint_store, pack_targets=ctx.pack_targets,
         package_dir=_package_dir(ctx, manifest),
+        user_authored=manifest.user_authored_paths,
         conflict_policies=conflict_policies_for(manifest, mappings),
         buffers=ctx.buffers, commit=ctx.buffers is None,
         history_context={"job_run_id": ctx.job_run_id, "step_id": step.id,

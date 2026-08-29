@@ -67,7 +67,52 @@ class ConfigParam:
 # field added there without a line here fails loudly on the first manifest that uses it,
 # rather than being dropped.
 _ACTION_KEYS = {"id", "file", "function", "name", "description", "mappings",
-                "configuration"}
+                "configuration", "files"}
+
+
+@dataclass
+class PackageFile:
+    """A file inside the action's own package that the action reads (design 3.3.1).
+
+    **Declared so the GUI can surface it**, which is the whole reason this exists rather
+    than the author simply hardcoding a path. A file the user is expected to write is a
+    slot the action needs filled — structurally the same as a mapping or a config value —
+    and §3.3.2 says those are one list: *"they just fill in what the action asks for."* An
+    undeclared file is one nobody outside the author's head knows about.
+
+    **Not a mapping**, despite filling a slot. §3.3's test for slottable is *does the user
+    own and name it?* — a datapack is one of several and which one matters, so it binds; a
+    path inside the action's own package is the `config/quark-common.toml` case, where one
+    exists and the author knows it. Literal, not bound.
+    """
+    name: str
+    path: str
+    description: str = ""
+    # Whether the USER writes this, or the action does. The GUI offers to create the first
+    # kind and `pack.package.write` refuses it — which is what makes "Packsmith never
+    # overwrites your file" structural rather than a courtesy the action extends.
+    user_authored: bool = True
+    # Seeded on first create, so "make one for me" produces something worth editing rather
+    # than an empty file and a guess about what goes in it.
+    template: str = ""
+
+
+def _parse_files(raw: dict) -> dict:
+    found = {}
+    for name, spec in (raw or {}).items():
+        if not isinstance(spec, dict) or not spec.get("path"):
+            raise ValueError(f"Declared file '{name}' needs a 'path'")
+        unknown = set(spec) - {"path", "description", "user_authored", "template"}
+        if unknown:
+            raise ValueError(
+                f"Declared file '{name}' has unknown key(s) {', '.join(sorted(unknown))}")
+        found[name] = PackageFile(
+            name=name, path=str(spec["path"]),
+            description=spec.get("description", ""),
+            user_authored=bool(spec.get("user_authored", True)),
+            template=str(spec.get("template", "")),
+        )
+    return found
 
 
 @dataclass
@@ -81,6 +126,12 @@ class ActionManifest:
     description: str = ""
     mappings: dict = field(default_factory=dict)   # dict[str, MappingSlot]
     config: dict = field(default_factory=dict)      # dict[str, ConfigParam]
+    files: dict = field(default_factory=dict)       # dict[str, PackageFile]
+
+    @property
+    def user_authored_paths(self) -> list:
+        """Package-relative paths this action declared as the user's to write."""
+        return [f.path for f in self.files.values() if f.user_authored]
 
     @property
     def ref(self) -> str:
@@ -146,6 +197,7 @@ def load_package(package_dir) -> Package:
             description=entry.get("description", ""),
             mappings=_parse_mappings(entry.get("mappings", {})),
             config=_parse_config(entry.get("configuration", {})),
+            files=_parse_files(entry.get("files", {})),
         ))
 
     provenance = meta.get("provenance", "authored")

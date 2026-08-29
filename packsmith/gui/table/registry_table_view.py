@@ -21,6 +21,10 @@ class RegistryTableView(QTableView):
         # and invisible until then.
         self.setContextMenuPolicy(Qt.CustomContextMenu)
         self.customContextMenuRequested.connect(self._on_context_menu)
+        # Set by the window that owns this table. None is a legitimate state — a table
+        # built without one simply offers no texture actions, which is what every test
+        # constructing a bare view gets.
+        self.texture_menu = None
 
     def _on_context_menu(self, pos):
         index = self.indexAt(pos)
@@ -54,7 +58,31 @@ class RegistryTableView(QTableView):
                 clear.triggered.connect(self._bulk_clear)
         copy = menu.addAction("Copy")
         copy.triggered.connect(self._copy_selection)
+        self._add_texture_actions(menu, index)
         return menu
+
+    def _add_texture_actions(self, menu, index):
+        """Offer the texture verbs when the clicked row's entry has one.
+
+        **The row, not the column.** Every column of a row describes the same entry, so a
+        texture is a property of the row and asking on the id column but not the tag column
+        would be a distinction the user has no model for — unlike "Clear assignment", which
+        genuinely only exists where there is an assignment.
+
+        The separator is added first and taken back if nothing follows it, because the
+        alternative is asking the provider twice: once to find out whether to draw the line
+        and once to draw the items. A stray trailing line is exactly how you would find out
+        the actions had silently stopped appearing.
+        """
+        model = self.model()
+        if self.texture_menu is None or model is None:
+            return
+        entry_id = model.entry_at_row(index.row())
+        if not entry_id:
+            return
+        separator = menu.addSeparator()
+        if not self.texture_menu.extend(menu, model.registry_type, entry_id):
+            menu.removeAction(separator)
 
     @staticmethod
     def _clear_label(count: int, defaulted: bool) -> str:

@@ -160,6 +160,12 @@ class RegistryTableModel(QAbstractTableModel):
             return None
         return self._tag_store.definition(self._registry_type, name)
 
+    @property
+    def registry_type(self) -> str:
+        """Which registry these rows are entries of. Fixed for the life of the model — the
+        query's scope decides it, and changing scope is a new view rather than a filter."""
+        return self._registry_type
+
     def entry_at_row(self, row: int):
         if 0 <= row < len(self._result.rows):
             return self._result.rows[row].entry_id

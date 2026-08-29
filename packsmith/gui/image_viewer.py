@@ -137,6 +137,12 @@ class ImageViewerTab(QWidget):
     def __init__(self, data: bytes, label: str, parent=None):
         super().__init__(parent)
         self.label = label
+        # The bytes as they arrived, beside the decoded image. Copying this texture has to
+        # hand over the ORIGINAL file — re-encoding the QImage would produce a different
+        # PNG, silently dropping whatever the source encoded that Qt does not round-trip
+        # (an `.mcmeta`-paired animation strip is still just pixels, but colour type, bit
+        # depth and palette are all things a re-save is free to change).
+        self.data = data
         self._image = QImage.fromData(data)
         self._zoom_index = 0
         self._pending = None      # (image_x, image_y, anchor) awaiting a scroll

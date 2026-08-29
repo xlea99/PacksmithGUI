@@ -281,6 +281,31 @@ def _compile_filter(node, catalog):
 
 
 def _compile_cmp(node, res):
+    """How an operator behaves on an entry that has **no value** (2026-08-29).
+
+    The rule: **an operator that asserts something about a value excludes unset; one that
+    asserts the absence of a match includes it.** So `eq`, `in`, `contains`, `matches` and
+    every ordered comparison skip an entry with nothing there, while `neq` and `not_in`
+    match it.
+
+    This was SQL's three-valued logic — unset excluded from *both* sides — and it was wrong
+    here for two reasons.
+
+    **It broke De Morgan, measurably.** On a real profile, `t:type != "Other"` returned 918
+    rows while `not t:type == "Other"` returned 1,263. Two spellings of one predicate
+    disagreeing is not a semantics, it is a bug with a rationale.
+
+    **And unset does not mean "unknown" in Packsmith.** SQL's rule is right for SQL because
+    NULL is an absent fact. Here it means *nobody has decided yet* (§3.2.1 keeps pristine
+    distinct from every value on purpose), which is a fact — and usually the most actionable
+    one, since the un-curated rows are the work. A filter that silently swallowed exactly
+    those hid 345 entities from a view and said nothing, which is the failure mode this
+    project treats as the worst kind everywhere else.
+
+    Ordered comparisons keep excluding unset, and that is not an inconsistency: `<= 5`
+    asserts a value is at most five, and nothing is not at most five. Explicit `not` is
+    still available there and still negates the whole predicate.
+    """
     op, val, ci = node.op, node.value, node.ci
     if op not in VALID_OPS:
         raise QueryError(f"unknown op: {op!r}")
@@ -289,7 +314,9 @@ def _compile_cmp(node, res):
         want = (op == "eq")
         def f(e):
             v = res(e)
-            return False if v is None else (_equal(v, val, ci) == want)
+            # No value: not equal to anything, so `eq` is false and `neq` is TRUE.
+            # See `_compile_cmp`'s note on unset — this used to be false for both.
+            return (not want) if v is None else (_equal(v, val, ci) == want)
         return f
 
     if op in ("gt", "lt", "gte", "lte"):
@@ -310,8 +337,9 @@ def _compile_cmp(node, res):
         want = (op == "in")
         def f(e):
             v = res(e)
+            # Same rule as eq/neq: no value is in no list, so `not in` matches it.
             if v is None:
-                return False
+                return not want
             member = any(_equal(v, x, ci) for x in val)
             return member == want
         return f

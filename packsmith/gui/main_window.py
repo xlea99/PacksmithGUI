@@ -14,10 +14,10 @@ from pathlib import Path
 
 from PySide6.QtWidgets import (
     QMainWindow, QVBoxLayout, QHBoxLayout, QWidget, QLabel, QPushButton,
-    QHeaderView, QSplitter, QInputDialog, QMessageBox, QApplication,
+    QHeaderView, QSplitter, QInputDialog, QMessageBox, QApplication, QMenu,
 )
-from PySide6.QtCore import Qt, QEvent, QTimer
-from PySide6.QtGui import QShortcut, QKeySequence, QFont
+from PySide6.QtCore import Qt, QEvent, QTimer, QMimeData, QUrl
+from PySide6.QtGui import QShortcut, QKeySequence, QFont, QImage
 
 from packsmith.common.setup import (
     GLOBAL_PATHS, load_state, load_ui_state, save_state, save_ui_state)
@@ -83,12 +83,12 @@ from packsmith.gui.shell.panels.registry_panel import RegistryPanel
 from packsmith.gui.shell.panels.views_panel import ViewsPanel
 from packsmith.gui.shell.panels.tags_panel import TagsPanel
 from packsmith.gui.shell.panels.jobs_panel import JobsPanel
-from packsmith.gui.shell.panels.files_panel import FilesPanel
+from packsmith.gui.shell.panels.files_panel import FilesPanel, open_containing
 from packsmith.gui.editor.host import (
     DiffTab, EditorHost, EditorTab, UnsupportedFileTab)
 from packsmith.gui.editor.sources import (
-    InstanceFileSource, JarMemberSource, PackageFileSource, is_overridable, member_path,
-    split_member)
+    MEMBER_SEPARATOR, InstanceFileSource, JarMemberSource, PackageFileSource,
+    is_overridable, member_path, split_member)
 from packsmith.gui.shell.panels.actions_panel import ActionsPanel
 from packsmith.gui.shell.panels.packages_panel import PackagesPanel
 from packsmith.gui.shell.panels.automation_panel import AutomationPanel
@@ -102,6 +102,9 @@ from packsmith.gui.action_editor import (
 )
 from packsmith.gui.image_viewer import ImageViewerTab
 from packsmith.gui.override_dialog import OverrideTargetDialog
+from packsmith.gui.texture_menu import TextureMenu
+from packsmith.core.textures import (
+    GeneratedPacks, TextureIndex, blank_png, staged_copy)
 from packsmith.gui.packdump_diff import PackdumpDiffTab
 from packsmith.gui.jar_viewer import JarViewerTab
 from packsmith.gui.nbt_viewer import NbtViewerTab
@@ -388,6 +391,13 @@ class MainWindow(QMainWindow):
         # §8.1: the loader detected in this pack, or None. It is what gives Smart Mode
         # its categories — with no loader mod there are no global datapacks to categorise.
         self._loaders = self._resolve_loaders()
+        # The edge from a registry entry to its PNG (§6.5). Built once and handed to every
+        # view that shows entries; it reads the packdump through a getter rather than
+        # holding one, so it cannot go stale across an import.
+        self._texture_menu = TextureMenu(lambda: self._packdump,
+                                         self._view_texture, self._write_texture,
+                                         self._copy_texture)
+        self._texture_index = None       # built on first use — see `_texture_sources`
         active_loader = self._loaders.provider_for(DATAPACKS_WRITE)
         self._files_panel = FilesPanel(self._file_store, loader=active_loader,
                                        roots=self._roots)
@@ -472,6 +482,7 @@ class MainWindow(QMainWindow):
 
         self._workspace = Workspace()
         self._workspace.tab_closed.connect(self._on_tab_closed)
+        self._workspace.tab_menu_requested.connect(self._on_tab_menu)
         self._workspace.tab_activated.connect(self._on_tab_activated)
         # Opening a tab selects it, so activation covers opens and switches between them;
         # tab_closed covers the rest. Both go through the debounce rather than writing.
@@ -698,6 +709,7 @@ class MainWindow(QMainWindow):
                                  job_impact=lambda projected, mutation, q=query:
                                      self._schema_change_impact(q.scope.name, projected,
                                                                 mutation))
+        tab.texture_menu = self._texture_menu
         tab.changed.connect(self._after_blueprint_change)
         tab.status.connect(self._set_status)
         tab.save_requested.connect(lambda t=tab: self._save_blueprint_view(t))
@@ -1365,6 +1377,10 @@ class MainWindow(QMainWindow):
         # §8.1: a mod update can install or remove the pack loader itself, so the resolution
         # table is derived from the dump and has to be recomputed rather than kept.
         self._loaders = self._resolve_loaders(dump)
+        # Same reasoning one line down: a dump lands because the pack changed, and the pack
+        # changing is exactly when a mod jar or resource pack appeared or went away. A
+        # stale index would keep answering out of a jar that is no longer installed.
+        self._texture_index = None
         if getattr(self, "_files_panel", None) is not None:
             self._files_panel.set_loader(self._loaders.provider_for(DATAPACKS_WRITE))
         self._refresh_header()
@@ -1669,6 +1685,7 @@ class MainWindow(QMainWindow):
                                    blueprint_store=self._blueprints)
 
         table = RegistryTableView()
+        table.texture_menu = self._texture_menu
         # The model sorts itself, so there is no proxy: a QSortFilterProxyModel compares
         # pairwise through Python, which measured 2.2s per sort on an 18,638-row registry
         # against 3ms for a key sort in the model. It was doing nothing else — filtering
@@ -1834,6 +1851,34 @@ class MainWindow(QMainWindow):
     def _open_file(self, rel_path):
         """A file from the Files panel — an instance file, governed by ownership."""
         return self._open_document("instance", rel_path)
+
+    def _open_declared_package_file(self, rel, template):
+        """Create a declared package file if it isn't there, then open it (design 3.3.1).
+
+        The "make one for me" half of **recommended userdata** (§3.3), pointed at a file
+        rather than a tag or a pack. The template is what makes it worth pressing: an empty
+        file and a guess about what belongs in it is barely better than the path on its own,
+        while a seeded example is something you can edit into shape.
+
+        Missing template, or none declared, still creates — an author who forgot one should
+        not cost the user the button, and an empty file is a legible starting point in a way
+        that a silent no-op is not.
+        """
+        base = Path(self._profile.packages_dir)
+        target = base / rel
+        if not target.exists():
+            seed = base / template if template else None
+            try:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(seed.read_bytes() if seed and seed.is_file() else b"")
+            except OSError as e:
+                QMessageBox.warning(self, "Could not create it", str(e))
+                return None
+            self._set_status(f"Created {rel}"
+                             + (f" from {Path(template).name}" if seed
+                                and seed.is_file() else ""))
+            self._packages_panel.refresh()
+        return self._open_package_document(rel)
 
     def _open_package_document(self, path):
         """A package source or manifest from the Actions panel — governed by provenance.
@@ -2067,12 +2112,30 @@ class MainWindow(QMainWindow):
         self._workspace.set_tab_title(tab, f"● {name}" if dirty else name)
 
     def _save_as_override(self, archive_rel, member):
-        """Copy a file out of a mod jar into a datapack or resource pack (design 6.5).
+        """Copy a file out of a mod jar into a datapack or resource pack (design 6.5)."""
+        rel = self._override_into_pack(
+            member,
+            lambda: read_member(self._file_store.root / archive_rel, member),
+            doing=f"Overriding {member}",
+            replacing=f"Replace it with the copy from {Path(archive_rel).name}? "
+                      f"Anything you changed in it will be lost.")
+        return self._open_file(rel) if rel else None
+
+    def _override_into_pack(self, member, read_data, *, doing, replacing):
+        """Put bytes at `member`'s path inside a pack the loader will load (design 6.5/8.1).
 
         "Packsmith doesn't do anything clever here — it just writes the file to the right
         place and lets Minecraft's pack layering do the rest" (§8.1). The path inside the
         pack is the path inside the jar, unchanged: that is the entire mechanism, and
         altering it would produce a file the game never looks at.
+
+        **Where the bytes come from is the only thing that varies**, which is why it arrives
+        as a callable rather than as data. A jar member, a texture copied out of whichever
+        pack currently wins, and a blank PNG for art nobody has drawn are three sources for
+        one destination — and reading late means a jar is not opened for a dialog the user
+        cancels, nor before they have decided whether to overwrite.
+
+        Returns the written path relative to the instance, or None if the user backed out.
         """
         kind = override_kind(member)
         if kind is None:
@@ -2111,26 +2174,269 @@ class MainWindow(QMainWindow):
 
         if target.exists() and QMessageBox.question(
                 self, "Overwrite existing override",
-                f"'{pack}' already overrides {member}.\n\nReplace it with the copy from "
-                f"{Path(archive_rel).name}? Anything you changed in it will be lost.",
+                f"'{pack}' already overrides {member}.\n\n{replacing}",
                 QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
-            return
+            return None
 
         try:
-            data = read_member(self._file_store.root / archive_rel, member)
             # Bytes, not text: an override is as often a PNG as a JSON, and the ownership
             # record matters either way — this file is now the user's.
-            self._file_store.write_bytes(rel, data, owner="user")
+            self._file_store.write_bytes(rel, read_data(), owner="user")
         except (ArchiveError, OSError) as e:
             QMessageBox.warning(self, "Save as override", f"Could not write it: {e}")
-            return
+            return None
 
         # Sticky per profile (§8.1), so the next override goes where the last one did.
         self._profile.settings[setting] = pack
         self._profile.save()
-        pass  # experiment
-        self._set_status(f"Overriding {member} in '{pack}' — {loader.name} will load it")
-        return self._open_file(rel)
+        self._set_status(f"{doing} in '{pack}' — {loader.name} will load it")
+        return rel
+
+    def _tab_file(self, widget):
+        """The file on disk a tab is showing, as ``(root, rel)``, or None.
+
+        **A member inside an archive gives back the archive.** A jar is one file to the
+        operating system and to the file browser alike, so "reveal `assets/x/y.png` inside
+        twigs.jar" has no answer either could act on — and inventing one (extracting to a
+        temp folder to have something to point at) is precisely the scratch-file habit §6.5
+        exists to remove. The honest target is the jar.
+
+        Tabs that are not files at all — a View, a job editor, a packdump diff — answer
+        None, which is how the menu knows to offer nothing rather than a dead entry.
+        """
+        hint = getattr(widget, "packsmith_file", None)
+        if hint is not None:
+            return hint
+        for key, tab in self._open_tabs.items():
+            if tab is not widget or not isinstance(key, tuple) or key[0] != "doc":
+                continue
+            source, path = self._editor_host.split_key(key[1])
+            archive, separator, _member = str(path).partition(MEMBER_SEPARATOR)
+            rel = archive if separator else str(path)
+            # Package sources live outside every tracked root — provenance rather than
+            # ownership (§3.3.1) — so they have no root to name and no browser row. A None
+            # root means the second half is an ABSOLUTE path instead of a relative one,
+            # which is the only honest way to describe a file no root contains.
+            if source == "package":
+                return None, str(Path(self._profile.packages_dir) / rel)
+            return "minecraft", rel
+        return None
+
+    def _tab_menu(self, widget):
+        """The right-click menu for one tab, or None when the tab is not a file.
+
+        Split from the handler for the reason §5.1's table menu is: everything worth
+        testing about a context menu happens before `exec`, and `exec` never returns until
+        someone clicks it. This one shipped broken *because* it had no seam — the handler
+        could only be run by a human with a mouse, so a missing import inside it survived
+        a green suite.
+        """
+        found = self._tab_file(widget)
+        if found is None:
+            return None
+        root, rel = found
+        menu = QMenu(self)
+        # First, and only for an image. This is the tab you are most likely to have opened
+        # in order to get at the file rather than to look at it — a texture reached from a
+        # cell has no path the user could have typed, so the tab IS the handle on it.
+        if isinstance(widget, ImageViewerTab) and getattr(widget, "data", None):
+            menu.addAction("Copy Texture",
+                           lambda: self._copy_tab_image(widget, rel))
+            menu.addSeparator()
+        menu.addAction("Reveal in Explorer", lambda: self._reveal_tab_file(root, rel))
+        # Offered only for a file some root contains. A package lives outside every one of
+        # them, so the browser has no row to put the cursor on and the action would switch
+        # tabs to prove it.
+        if root is not None:
+            menu.addAction("Show in Files Tab", lambda: self._show_tab_file(root, rel))
+        return menu
+
+    def _on_tab_menu(self, widget, where):
+        menu = self._tab_menu(widget)
+        if menu is not None:
+            menu.exec(where)
+
+    def _copy_tab_image(self, widget, rel):
+        """Copy the image a tab is showing, using the bytes it was opened with.
+
+        Its own bytes rather than a re-read off `rel`, because for a texture opened from a
+        cell `rel` names the JAR the member came out of, not the member — re-reading it
+        would put a mod's entire jar on the clipboard.
+        """
+        name = getattr(widget, "label", None) or Path(rel).name
+        self._copy_file_to_clipboard(name, widget.data)
+        self._set_status(f"Copied {name}")
+
+    def _reveal_tab_file(self, root, rel):
+        if root is None:
+            open_containing(rel)
+            return
+        self._files_panel.reveal(root, rel)
+
+    def _show_tab_file(self, root, rel):
+        if not self._files_panel.show_file(root, rel):
+            # Said out loud rather than left as a tab switch that appears to have done
+            # nothing. A file under a root the browser is not showing, or one deleted since
+            # the tab opened, both land here and both are worth a sentence.
+            self._set_status(f"{rel} is not in the file browser")
+            return
+        self._set_status(f"{rel} — shown in Files")
+
+    def _texture_sources(self) -> list:
+        """Every place a PNG could come from, in the order the game resolves them.
+
+        Resource packs shadow mods and later packs shadow earlier ones, so the loader's
+        list is walked backwards: §8.1 hands it back in load order, and the winner is the
+        last one to speak. Getting this backwards would hand back the art a mod shipped
+        after the user had already replaced it — real bytes from the wrong file, which is
+        the failure mode with no symptom.
+
+        The vanilla jar goes last because it is the floor: it answers for every
+        `minecraft:` texture and would otherwise be the only source that never gets asked.
+        """
+        root = self._file_store.root
+        sources = []
+        try:
+            loader = self._loaders.require(RESOURCEPACKS_WRITE)
+        except CapabilityError:
+            loader = None
+        if loader is not None:
+            # `override_path` is the one honest way to ask where a pack lives — the loader
+            # owns that layout and reimplementing it here is how the two drift apart. A
+            # throwaway member is appended and then walked back off, one parent per segment.
+            probe = "assets/x/textures/x.png"
+            for name in reversed(list(loader.packs(root, "resourcepacks"))):
+                try:
+                    pack_root = loader.override_path(root, name, probe,
+                                                     kind="resourcepacks")
+                except (OSError, ValueError):
+                    continue
+                for _ in probe.split("/"):
+                    pack_root = pack_root.parent
+                sources.append(pack_root)
+
+        selectable = root / "resourcepacks"
+        if selectable.is_dir():
+            sources.extend(sorted(selectable.iterdir(), reverse=True))
+
+        # After the packs a person made and before the jars, which is where these actually
+        # sit: a mod that builds its textures at load time ships none of them, so no jar can
+        # answer — but an override the user has already written must still win over the
+        # generated original it was written to replace.
+        sources.append(GeneratedPacks(root / "debug" / "generated_resource_pack"))
+        mods = root / "mods"
+        if mods.is_dir():
+            sources.extend(sorted(mods.glob("*.jar")))
+        if self._client_jar is not None:
+            sources.append(Path(self._client_jar.path))
+        return sources
+
+    def _textures(self) -> TextureIndex:
+        """The search index, built on first use rather than at startup.
+
+        Reading 244 jar directories takes about half a second, which is nothing once and
+        everything on a window that has not been asked for a texture yet. Rebuilt whenever
+        the sources could have changed, which is the same moment the packdump changes.
+        """
+        if self._texture_index is None:
+            self._texture_index = TextureIndex(self._texture_sources())
+        return self._texture_index
+
+    def _view_texture(self, target):
+        """Open the PNG a block renders with (design 6.5, reached from a cell)."""
+        data, source = self._textures().find(target.member)
+        if data is None:
+            # The block renders, so something drew it — just not from a file. StoneZone
+            # composites its palettes at runtime and ships 25 PNGs for thousands of blocks,
+            # so this is a normal state rather than a broken pack, and saying which texture
+            # was looked for is what makes the next step (create it) obvious.
+            QMessageBox.information(
+                self, "Nothing to show",
+                f"{target.block_id} renders from {target.texture_id}, but no pack or mod "
+                f"ships that file — some mods build their textures at runtime.\n\n"
+                f"You can still create one: it will shadow whatever the game generates.")
+            return None
+        name = target.member.rsplit("/", 1)[-1]
+        key = ("texture", target.member)
+        existing = self._open_tabs.get(key)
+        if existing is not None and self._workspace.focus_widget(existing):
+            return existing
+        tab = ImageViewerTab(data, name)
+        # This tab holds BYTES, not a path — it was read straight out of whichever jar or
+        # pack won, and nothing was extracted (§6.5). So the file it came from is recorded
+        # here, or "Reveal in Explorer" would have nothing to point at. Relative to the
+        # instance when it lives there, absolute otherwise: the vanilla jar is outside every
+        # root and still worth being able to open.
+        source = Path(source)
+        try:
+            tab.packsmith_file = ("minecraft",
+                                  source.relative_to(self._file_store.root).as_posix())
+        except ValueError:
+            tab.packsmith_file = (None, str(source))
+        tab.status.connect(self._set_status)
+        self._workspace.add_tab(tab, name)
+        self._open_tabs[key] = tab
+        self._set_status(f"{target.texture_id} — from {Path(source).name}")
+        return tab
+
+    def _copy_texture(self, target):
+        """Put a block's PNG on the clipboard, as a file (design 6.5, reached from a cell)."""
+        data, source = self._textures().find(target.member)
+        if data is None:
+            QMessageBox.information(
+                self, "Nothing to copy",
+                f"{target.block_id} renders from {target.texture_id}, but no pack or mod "
+                f"ships that file — some mods build their textures at runtime.")
+            return None
+        name = target.member.rsplit("/", 1)[-1]
+        self._copy_file_to_clipboard(name, data)
+        self._set_status(f"Copied {name} — from {Path(source).name}")
+        return name
+
+    def _copy_file_to_clipboard(self, name, data):
+        """One texture on the clipboard, in both of the shapes a paste might want.
+
+        **A file URL and the pixels, together.** They are different clipboard formats and
+        different destinations: a file manager takes the URL and drops a real `.png` where
+        you paste it, an image editor takes the bitmap and pastes a layer. Offering one
+        would make the other silently do nothing, and which of the two someone wants is a
+        fact about the window they are about to click on rather than about the texture.
+
+        The receiving application picks; nothing here has to guess.
+        """
+        staged = staged_copy(name, data)
+        mime = QMimeData()
+        mime.setUrls([QUrl.fromLocalFile(str(staged))])
+        # `setImageData` after the urls, and only if it decodes — a font or an `.mcmeta`
+        # would reach here as bytes that are not an image, and a null QImage on the
+        # clipboard is a paste that produces an empty rectangle.
+        image = QImage.fromData(data)
+        if not image.isNull():
+            mime.setImageData(image)
+        QApplication.clipboard().setMimeData(mime)
+        return staged
+
+    def _write_texture(self, target):
+        """Override a block's texture, or create the one it has been asking for.
+
+        One action rather than two, because from where the user sits it is one gesture:
+        *get me the file for this block, in a pack I can edit*. Whether that starts from
+        the existing art or from an empty canvas is a fact about the pack, not a decision
+        worth a dialog — and the block that has no art is exactly the one you most want to
+        reach this way, since digging out its path by hand is the chore this removes.
+        """
+        data, source = self._textures().find(target.member)
+        if data is None:
+            data = blank_png()
+            doing = f"Created blank {target.texture_id}"
+            replacing = "Replace it with a blank one? Anything you drew will be lost."
+        else:
+            doing = f"Overriding {target.texture_id} (from {Path(source).name})"
+            replacing = (f"Replace it with the copy from {Path(source).name}? "
+                         f"Anything you changed in it will be lost.")
+        rel = self._override_into_pack(target.member, lambda: data,
+                                       doing=doing, replacing=replacing)
+        return self._open_file(rel) if rel else None
 
     def _open_jar_member(self, archive_rel, member):
         """Open one file from inside a jar (design 6.5, step two).
@@ -2439,7 +2745,6 @@ class MainWindow(QMainWindow):
         tab = self._open_tabs.get(("doc", key))
         if tab is not None:
             tab.sync_lock()
-        pass  # experiment
         self._set_status(f"You now own {self._editor_host.split_key(key)[1]}")
 
     def _on_file_claimed(self, rel_path):
@@ -2890,7 +3195,6 @@ class MainWindow(QMainWindow):
         self._refresh_after_tag_change()
         self._reload_blueprint_tabs()
         self._blueprints_panel.refresh()
-        pass  # experiment
         self._refresh_tab_icons()      # the run may have claimed a file you have open
         # An open editor's lock was decided when it opened. If the run took a file the user
         # had open, the tab has to stop looking editable — the save is refused either way
@@ -3072,6 +3376,7 @@ class MainWindow(QMainWindow):
             lambda j, step_id, dry, through: self._run_one_step(
                 j, step_id, dry_run=dry, through=through))
         tab.status.connect(self._set_status)
+        tab.package_file_requested.connect(self._open_declared_package_file)
         # The same page the Actions and Packages panels open, reached from the step that
         # uses it — one action, one tab, whichever door you came through.
         tab.action_info_requested.connect(self._open_action)

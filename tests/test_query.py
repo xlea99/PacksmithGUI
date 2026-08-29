@@ -140,15 +140,66 @@ def test_contains_case_insensitive(world):
     assert set(_ids(res)) == {"alexscaves:galena_ore", "minecraft:iron_ore"}
 
 
-# --- null semantics: comparisons only match entries with a value ------------
+# --- null semantics: a positive comparison needs a value, a negative one does not ---
 
-def test_unset_tag_excluded_from_comparisons(world):
+def test_a_positive_comparison_needs_a_value(world):
+    """`eq` asserts something about a value, so an entry with none cannot satisfy it."""
     dump, tags = world
     eq = Query(scope=Registry(REG), filter=Cmp(Tag("tier"), "eq", "mid"), select=[Id])
     assert set(_ids(evaluate(eq, packdump=dump, tag_store=tags))) == {"alexscaves:galena_ore"}
-    # neq excludes unset entries too — presence is expressed with Has, not neq
+
+
+def test_neq_matches_an_unset_tag(world):
+    """Changed 2026-08-29, and the reason is worth keeping.
+
+    This used to exclude unset — SQL's three-valued logic, where NULL is an unknown fact and
+    `NULL != x` is neither true nor false. It is wrong here because **unset does not mean
+    unknown**: §3.2.1 keeps pristine distinct from every value precisely because "nobody has
+    decided yet" is itself a fact, and usually the most actionable one.
+
+    Measured on a real profile when it bit: a view filtered `t:type != "Other"` silently hid
+    345 unclassified entities and said nothing about it.
+    """
+    dump, tags = world
     neq = Query(scope=Registry(REG), filter=Cmp(Tag("tier"), "neq", "mid"), select=[Id])
-    assert set(_ids(evaluate(neq, packdump=dump, tag_store=tags))) == {"minecraft:iron_ore"}
+    # `iron_ore` has a different value; the other three have none at all.
+    assert set(_ids(evaluate(neq, packdump=dump, tag_store=tags))) == {
+        "minecraft:iron_ore", "alexscaves:galena", "quark:rope", "minecraft:diamond"}
+
+
+def test_neq_agrees_with_not_eq(world):
+    """De Morgan, which the old rule broke — and this is the sharper reason it changed.
+
+    `a != b` and `not (a == b)` are two spellings of one predicate. Under SQL semantics they
+    returned different sets, because `Not` negates a whole filter (so unset came back) while
+    `neq` swallowed it. Two spellings disagreeing is not a semantics, it is a bug with a
+    rationale, and it is the kind nobody reports because both answers look plausible.
+    """
+    dump, tags = world
+    neq = Query(scope=Registry(REG), filter=Cmp(Tag("tier"), "neq", "mid"), select=[Id])
+    not_eq = Query(scope=Registry(REG), filter=Not(Cmp(Tag("tier"), "eq", "mid")),
+                   select=[Id])
+    assert set(_ids(evaluate(neq, packdump=dump, tag_store=tags))) == \
+        set(_ids(evaluate(not_eq, packdump=dump, tag_store=tags)))
+
+
+def test_not_in_matches_an_unset_tag(world):
+    """The same rule for the list form, so `not in` and `!=` do not disagree either."""
+    dump, tags = world
+    q = Query(scope=Registry(REG), filter=Cmp(Tag("tier"), "not_in", ["mid"]), select=[Id])
+    assert set(_ids(evaluate(q, packdump=dump, tag_store=tags))) == {
+        "minecraft:iron_ore", "alexscaves:galena", "quark:rope", "minecraft:diamond"}
+
+
+def test_ordered_comparisons_still_need_a_value(world):
+    """Deliberately NOT flipped. `<= 5` asserts a value is at most five, and nothing is not
+    at most five — there is no negation here to make symmetric. Explicit `not` still
+    negates the whole predicate for anyone who wants that."""
+    dump, tags = world
+    for op in ("gt", "lt", "gte", "lte"):
+        q = Query(scope=Registry(REG), filter=Cmp(Tag("tier"), op, "mid"), select=[Id])
+        assert "minecraft:diamond" not in set(_ids(evaluate(q, packdump=dump,
+                                                            tag_store=tags)))
 
 
 def test_missing_attribute_is_none_not_id(world):

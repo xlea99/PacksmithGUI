@@ -462,6 +462,9 @@ class BlueprintEditorTab(QWidget):
         # jobs and installed packages, and this tab has no business holding either. Takes
         # the projected slot list, returns a sentence naming the steps (or "").
         self._job_impact = job_impact or (lambda projected, mutation: "")
+        # Set by the window that owns this tab; None means the texture verbs are simply not
+        # offered, which is what a tab built in isolation gets.
+        self.texture_menu = None
         self._slots = []
         self._instances = []
         self._loading = False
@@ -1622,10 +1625,28 @@ class BlueprintEditorTab(QWidget):
         menu = QMenu(self)
         if cell is not None:
             menu.addAction("Suggestions…", lambda: self.show_suggestions(*cell))
+            self._add_texture_actions(menu, *cell)
             menu.addSeparator()
         menu.addAction("Rename instance…", lambda: self._rename_instance(instance))
         menu.addAction("Delete instance…", lambda: self._delete_instance(instance))
         return menu
+
+    def _add_texture_actions(self, menu, row, column):
+        """Texture verbs for whatever this cell is bound to.
+
+        A gap has nothing to offer and says so by absence — the whole point of a gap is that
+        no entry answers for it yet, so there is no block whose texture could be shown. The
+        cell's own text is the binding value, which is also what a dangling binding holds:
+        that resolves to no target and drops out on its own, without this needing to know
+        what dangling means.
+        """
+        if self.texture_menu is None:
+            return
+        slot = self.slot_for_column(column)
+        item = self._grid.item(row, column)
+        if slot is None or item is None or not item.text():
+            return
+        self.texture_menu.extend(menu, slot.registry_type, item.text())
 
     def _rename_instance(self, instance):
         name, ok = _ask(self, "Rename Instance", "New name", instance)

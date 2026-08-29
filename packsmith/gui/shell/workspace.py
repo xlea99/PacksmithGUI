@@ -64,6 +64,10 @@ class Workspace(QWidget):
 
     tab_closed = Signal(QWidget)
     tab_activated = Signal(QWidget)
+    # The widget and where to pop up, rather than a menu built here. What a tab *is* — a
+    # file, a jar member, a View with no file behind it at all — is the window's knowledge,
+    # and a workspace that had to answer it would need a map of every tab kind in the app.
+    tab_menu_requested = Signal(QWidget, object)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -116,6 +120,10 @@ class Workspace(QWidget):
         self._middle_press = -1
         self._tabs.tabBar().installEventFilter(self)
 
+        bar = self._tabs.tabBar()
+        bar.setContextMenuPolicy(Qt.CustomContextMenu)
+        bar.customContextMenuRequested.connect(self._on_tab_menu)
+
         self._stack.addWidget(self._empty)
         self._stack.addWidget(self._tabs)
         root.addWidget(self._stack)
@@ -145,6 +153,20 @@ class Workspace(QWidget):
                     self._close_tab(index)
                 return True
         return super().eventFilter(watched, event)
+
+    def _on_tab_menu(self, pos):
+        """Right-click on a tab, forwarded with the widget it belongs to.
+
+        The tab under the pointer, not the current one. Right-clicking a background tab and
+        acting on whichever tab happened to be in front is the same class of mistake as a
+        context menu that follows the selection instead of the click (§5.1) — and here it
+        would reveal the wrong file rather than merely offering the wrong verb.
+        """
+        bar = self._tabs.tabBar()
+        index = bar.tabAt(pos)
+        if index < 0:
+            return
+        self.tab_menu_requested.emit(self._tabs.widget(index), bar.mapToGlobal(pos))
 
     def _sync(self):
         self._stack.setCurrentWidget(self._tabs if self._tabs.count() else self._empty)

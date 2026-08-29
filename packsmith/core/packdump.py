@@ -21,10 +21,20 @@ from packsmith.core.profile import Profile
 #   4 — `textures.json`: the texture each block actually renders with, read from the baked
 #       model so resource packs are already applied. `<ns>:block/<path>` is a convention
 #       mods break freely. Client-only, so absent (not empty) on a dedicated-server dump.
+#   5 — `textures.json` gained `requested`: the texture name each block's model DECLARES,
+#       read from the unbaked model. Schema 4 says what a block renders as and reports
+#       `minecraft:missingno` for undrawn art — true, and useless for drawing it, because
+#       the substitution happens at bake time and takes the wanted name with it.
 #
 # Mirrored in the mod as `DumpSchema.VERSION`; bump both together.
-_VALID_SCHEMAS = {1, 2, 3, 4}
+_VALID_SCHEMAS = {1, 2, 3, 4, 5}
 _CURRENT_SCHEMA = max(_VALID_SCHEMAS)
+
+# What the `texture` attribute reads for a block the game could not draw. Named here rather
+# than spelled at each site because it is the hinge of the whole schema-5 story: it is the
+# exact value that means "ask `requested_texture` instead", and a caller that typos it gets
+# a silent wrong answer rather than an error.
+MISSING_TEXTURE = "minecraft:missingno"
 
 
 class DumpTooNewError(ValueError):
@@ -68,6 +78,14 @@ class Packdump:
         # already applied. Empty for older snapshots AND for any dump taken without a
         # client, which is why absence must not be read as "this block has no texture".
         self._textures = {}
+
+        # What each block's model ASKED for — schema 5, and a different question from the
+        # one above. `_textures` answers "what is drawn" and says `minecraft:missingno` when
+        # nothing is; this answers "what file would fix that", which the baked model cannot,
+        # because the missing-texture sprite is substituted during baking and the wanted
+        # name does not survive it. Same shape as `_textures`, and empty on the same two
+        # occasions: an older snapshot, or one dumped without a client.
+        self._requested_textures = {}
 
         # The translation key behind each display name: {registry_type: {entry_id: key}}.
         # NOT nested under locale, unlike the names above — `block.spawn.anthill` is the
@@ -152,6 +170,12 @@ class Packdump:
         if self._block_classes != other._block_classes:
             return False
         if self._textures != other._textures:
+            return False
+        # The line above is the one this file learned the hard way, and this is the same
+        # lesson a schema later: drawing a texture that was missing changes `_textures` too,
+        # so it would have been caught — but the FIRST schema-5 dump over a schema-4 profile
+        # changes only this field, and without it that import is skipped forever.
+        if self._requested_textures != other._requested_textures:
             return False
 
         return True
@@ -415,10 +439,16 @@ class Packdump:
         self._block_classes = data.get("classes") or {}
 
     def _load_textures(self, path: Path):
-        """`attributes/textures.json` — what the renderer resolved, not what a jar shipped."""
+        """`attributes/textures.json` — what the renderer resolved, not what a jar shipped.
+
+        Both maps are read independently, by presence rather than by version: a schema-4
+        file simply has no `requested` block, and the two answer different questions, so a
+        file carrying one and not the other should still give up the half it has.
+        """
         with open(path, "r") as f:
             data = json.load(f)
         self._textures = data.get("textures") or {}
+        self._requested_textures = data.get("requested") or {}
 
     def _load_localizations(self,locals_path: Path):
         with open(locals_path, "r") as f:
@@ -509,12 +539,19 @@ class Packdump:
                 "classes": self._block_classes,
             })
 
-        if self._textures:
-            write_json(attr_dir / "textures.json", {
+        if self._textures or self._requested_textures:
+            payload = {
                 "schema_version": self._schema,
                 "type": "textures",
                 "textures": self._textures,
-            })
+            }
+            # Omitted when empty, never emitted hollow. Re-saving a schema-4 snapshot must
+            # not grow a `requested: {}`, which would claim the mod looked and found nothing
+            # when the truth is it was never asked — the round-trip rule the whole schema
+            # history rests on.
+            if self._requested_textures:
+                payload["requested"] = self._requested_textures
+            write_json(attr_dir / "textures.json", payload)
 
         log.info(f"Packdump saved to {snapshot_path}")
 
@@ -631,6 +668,12 @@ class Packdump:
     def _has_texture(self, registry_type: str) -> bool:
         return bool(self._textures.get(registry_type))
 
+    def _read_requested_texture(self, registry_type: str, entry_id: str):
+        return self._requested_textures.get(registry_type, {}).get(entry_id)
+
+    def _has_requested_texture(self, registry_type: str) -> bool:
+        return bool(self._requested_textures.get(registry_type))
+
     def is_block_item(self, entry_id: str) -> bool:
         """Whether this `minecraft:item` places a block.
 
@@ -661,6 +704,47 @@ class Packdump:
         """
         return bool(self._textures)
 
+    def texture_source(self, registry_type: str, entry_id: str):
+        """Where this entry's texture lives, or would live if someone drew it.
+
+        `texture` and `requested_texture` answer different questions, and a caller that
+        wants to open or create the PNG wants **one** answer. The rule is not a preference:
+
+        **Resolved wins whenever there is one.** It is what the game draws with every
+        resource pack in the load order applied, and it is the only one of the two that
+        survives a mod replacing its baked model — measured on this pack, 211 blocks of
+        13,841 render with a texture their unbaked model does not name, because Forge
+        geometry loaders and CTM substitute the baked model and the JSON underneath stops
+        describing what is drawn. Consulting `requested_texture` there would hand back a
+        path the game never reads, and an override written to it would silently do nothing.
+
+        **`requested_texture` is consulted only when nothing renders**, which is the single
+        case `texture` cannot answer: `missingno` says there is no art without saying where
+        the art belongs.
+
+        `None` when neither knows — an older snapshot, one dumped without a client, or a
+        block whose model names no texture at all. Create's technical blocks
+        (`fake_track`, `water_wheel_structure`) are genuinely in that last state, and it is
+        not an error: there is nothing to draw and nowhere to draw it.
+        """
+        resolved = self._read_texture(registry_type, entry_id)
+        if resolved and resolved != MISSING_TEXTURE:
+            return resolved
+        requested = self._read_requested_texture(registry_type, entry_id)
+        if requested and requested != MISSING_TEXTURE:
+            return requested
+        return None
+
+    def knows_requested_textures(self) -> bool:
+        """Whether this snapshot carries the texture names models *declare* (schema 5).
+
+        Separate from `knows_textures()` rather than folded into it, because the two can
+        genuinely differ: a schema-4 snapshot answers the first and not the second, and a
+        caller that wants to CREATE missing art needs to know it is looking at a dump too
+        old to say where — which is a different message from "this block has its texture".
+        """
+        return bool(self._requested_textures)
+
     # name -> (read it for one entry, does this registry carry it at all). The two live
     # together because they are the same fact asked at different scales, and a reader
     # without a prober is how a column ends up offered for a registry that has no values
@@ -672,6 +756,7 @@ class Packdump:
         "form": (_read_form, _has_form),
         "block_class": (_read_block_class, _has_block_class),
         "texture": (_read_texture, _has_texture),
+        "requested_texture": (_read_requested_texture, _has_requested_texture),
     }
 
     @classmethod

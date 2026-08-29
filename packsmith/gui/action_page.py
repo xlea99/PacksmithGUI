@@ -106,6 +106,7 @@ class ActionPageTab(QWidget):
         self._build_identity()
         self._build_mappings()
         self._build_config()
+        self._build_files()
         self._build_used_by()
         self._build_source()
         self._body.addStretch(1)
@@ -290,6 +291,45 @@ class ActionPageTab(QWidget):
             column.addWidget(_heading_row(name, chips))
             if param.description:
                 column.addWidget(self._muted(param.description, italic=False))
+            holder.addWidget(block)
+
+    def _build_files(self):
+        """Files this action reads out of its own package (design 3.3.1).
+
+        A section of its own rather than a line in Configuration, because it answers a
+        different question. Configuration is *what you type*; a declared file is *what you
+        write*, and for someone deciding whether to install a package that is the more
+        important of the two — it is the work the action expects of them, and the one thing
+        no amount of reading a step editor tells you before you have added the step.
+
+        Absent entirely when nothing is declared, like every other section here: an empty
+        "Files" heading would read as a capability the action lacks rather than a shape it
+        never had.
+        """
+        files = getattr(self._manifest, "files", {})
+        if not files:
+            return
+        holder = self._stack("Files")
+        for name, declared in sorted(files.items()):
+            block = QFrame()
+            block.setStyleSheet(
+                f"QFrame {{ border: none; border-left: 2px solid {style.BORDER};"
+                f" background: transparent; }}")
+            column = QVBoxLayout(block)
+            column.setContentsMargins(12, 0, 0, 0)
+            column.setSpacing(5)
+
+            # "yours to write" is the chip that matters. It is the difference between a
+            # file the action maintains and a file the action is asking YOU for, and
+            # `pack.package.write` refuses the second — so the chip is a fact, not a hint.
+            chips = [("yours to write", True) if declared.user_authored
+                     else ("written by the action", False)]
+            if declared.template:
+                chips.append(("has a template", False))
+            column.addWidget(_heading_row(name, chips))
+            column.addWidget(self._muted(declared.path, italic=False))
+            if declared.description:
+                column.addWidget(self._muted(declared.description, italic=False))
             holder.addWidget(block)
 
     def _build_used_by(self):

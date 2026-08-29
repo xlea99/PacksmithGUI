@@ -9,6 +9,7 @@ the UI names the distinction.
 """
 import json
 from datetime import datetime, timezone
+from pathlib import Path
 
 from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QCursor
@@ -259,10 +260,15 @@ class StepForm(QWidget):
     # Emitted when a field is committed — a combo changed, a line edit finished, a box
     # ticked. Not on every keystroke: a half-typed number is not an edit yet.
     committed = Signal()
+    # (package-relative path, template path). The window creates-from-template if it is
+    # absent and opens it either way — this form knows the declaration, not the editor.
+    package_file_requested = Signal(str, str)
 
     def __init__(self, manifest, tag_store, step, parent=None, blueprint_store=None,
-                 packdump=None, pack_targets=None, file_roots=None):
+                 packdump=None, pack_targets=None, file_roots=None, package_dir=None):
         super().__init__(parent)
+        self._package_dir = Path(package_dir) if package_dir else None
+        self._file_widgets = {}
         self._dump = packdump
         self._pack_targets = pack_targets
         self._file_roots = file_roots
@@ -300,7 +306,20 @@ class StepForm(QWidget):
             self._labels[name] = (label, name, param.description, param.required)
             form.addRow(label, widget)
 
-        if not manifest.mappings and not manifest.config:
+        # Declared package files, in the same list as everything else. §3.3.2: "one unified
+        # panel of what this step needs… the architectural distinction is invisible to the
+        # user; they just fill in what the action asks for." A file the action reads is a
+        # slot to fill; that it is filled by editing rather than by picking is exactly the
+        # kind of distinction that line says not to surface.
+        for name, declared in getattr(manifest, "files", {}).items():
+            widget = self._file_widget(declared)
+            self._file_widgets[name] = widget
+            label = self._label_for(name, declared.description, False)
+            self._labels[name] = (label, name, declared.description, False)
+            form.addRow(label, widget)
+
+        if not manifest.mappings and not manifest.config and not getattr(
+                manifest, "files", {}):
             nothing = QLabel("This action needs nothing configured.")
             nothing.setStyleSheet(f"color: {style.TEXT_MUTED}; font-size: 11px;")
             form.addRow(nothing)
@@ -321,6 +340,68 @@ class StepForm(QWidget):
         self._wire_commits()
         self.committed.connect(self._refresh_labels)
         self._refresh_labels()
+
+    def _file_widget(self, declared):
+        """One declared package file: where it is, whether it is there, and a way in.
+
+        **The button is the whole feature.** Everything else about this design — the
+        manifest declaration, the template, `user_authored` — exists so that a stranger who
+        installed the package finds out there is a file to write without reading its source.
+        A row that only *named* the path would be documentation; a row with a button is a
+        slot, which is what §3.3.2 says this panel is a list of.
+
+        Two states, and the label follows the data rather than asking: **Create** seeds from
+        the declared template (the "make one for me" gesture §3.3 already uses for tags and
+        packs), **Edit** opens what is there. Nothing here mentions packages — the user is
+        answering "what does this action need from me", and the answer is a file.
+        """
+        holder = QWidget()
+        row = QVBoxLayout(holder)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(3)
+
+        where = QLabel(declared.path)
+        where.setStyleSheet(f"color: {style.TEXT_MUTED}; font-size: 11px;")
+        row.addWidget(where)
+
+        button = QPushButton()
+        button.setCursor(QCursor(Qt.PointingHandCursor))
+        button.clicked.connect(lambda _=False, d=declared: self.package_file_requested.emit(
+            d.path, d.template))
+        row.addWidget(button)
+
+        holder.declared = declared
+        holder.button = button
+        holder.where = where
+        self._sync_file_row(holder)
+        return holder
+
+    def _sync_file_row(self, holder):
+        """Label the button for what is actually on disk, now."""
+        declared = holder.declared
+        present = self._package_file(declared.path)
+        exists = present is not None and present.is_file()
+        holder.button.setText("Edit" if exists else "Create")
+        holder.button.setEnabled(present is not None)
+        if present is None:
+            holder.where.setText(f"{declared.path} — package folder unavailable")
+        elif exists:
+            holder.where.setText(declared.path)
+        else:
+            # Said plainly rather than left blank. "Not created yet" is the state the whole
+            # declaration exists to make visible.
+            holder.where.setText(f"{declared.path} — not created yet")
+
+    def _package_file(self, rel):
+        """Where a declared file lives, or None when this form has no package folder."""
+        if self._package_dir is None:
+            return None
+        return self._package_dir / rel
+
+    def refresh_files(self):
+        """Re-read what is on disk — called after a create, so the button becomes Edit."""
+        for holder in self._file_widgets.values():
+            self._sync_file_row(holder)
 
     def _wire_commits(self):
         """Every field reports when it settles, so the panel can write it through.
@@ -630,6 +711,9 @@ class StepPanel(QWidget):
     """
 
     changed = Signal()                      # the step was written; refresh the row
+    # (package-relative path, template path or ""). The window creates-from-template
+    # if absent and opens it either way — this form knows the declaration, not the editor.
+    package_file_requested = Signal(str, str)
     status = Signal(str)
     picked = Signal(str)                    # a value chosen in picking mode
     pick_cancelled = Signal()
@@ -646,6 +730,7 @@ class StepPanel(QWidget):
         self._file_roots = file_roots
         self._step_id = None
         self._form = None
+        self._current_manifest = None
         self._picker = None
         self._writing = False
 
@@ -802,6 +887,9 @@ class StepPanel(QWidget):
             self._subtitle.clear()
             return
 
+        # Kept so a file row can find its package folder after the fact — the row knows a
+        # package-relative path and nothing about which package it came from.
+        self._current_manifest = manifest
         self._title.setText(f"<b>{manifest.name or manifest.action_id}</b>"
                             f"<span style='color:{style.TEXT_FAINT}'>  {manifest.ref}</span>")
         self._subtitle.setText(manifest.description or "")
@@ -809,10 +897,33 @@ class StepPanel(QWidget):
 
         self._form = StepForm(manifest, self._tags, step, blueprint_store=self._blueprints,
                               packdump=self._dump, pack_targets=self._pack_targets,
-                              file_roots=self._file_roots)
+                              file_roots=self._file_roots,
+                              package_dir=self._package_dir_for(manifest))
         self._form.committed.connect(self._write)
+        self._form.package_file_requested.connect(self._on_package_file)
         self._host_layout.addWidget(self._form)
         self._show_relink_if_owed(step)
+
+    def _package_dir_for(self, manifest):
+        """Where this action's own folder is. None when no package index was given."""
+        directory = getattr(self._packages, "directory", None)
+        if directory is None:
+            return None
+        return Path(directory) / manifest.package_name
+
+    def _on_package_file(self, rel, template):
+        """Forward qualified by package name, which is the shape the window already opens.
+
+        `<package>/<path>`, relative to the packages directory — the same string
+        `_open_package_document` takes for a `.star` source. Absolute paths would have been
+        a second spelling of a location the editor already knows how to resolve.
+        """
+        manifest = self._current_manifest
+        if manifest is None:
+            return
+        where = manifest.package_name
+        self.package_file_requested.emit(
+            f"{where}/{rel}", f"{where}/{template}" if template else "")
 
     def _clear_form(self):
         if self._form is not None:
@@ -935,6 +1046,9 @@ class JobEditorTab(QWidget):
     # the one step alone — see `run_job` for why those answer different questions.
     step_run_requested = Signal(object, int, bool, bool)
     status = Signal(str)           # a line for the status bar, from the step panel
+    # (absolute path, absolute template or "") — a declared package file the user asked
+    # to create or edit. Straight through to the window, which owns opening tabs.
+    package_file_requested = Signal(str, str)
     action_info_requested = Signal(str)    # action ref — open its reference page
 
     def __init__(self, job, *, job_store, package_index, tag_store, parent=None,
@@ -1076,6 +1190,7 @@ class JobEditorTab(QWidget):
                                 file_roots=file_roots)
         self._panel.changed.connect(self._on_panel_changed)
         self._panel.status.connect(self.status)
+        self._panel.package_file_requested.connect(self.package_file_requested)
         self._panel.picked.connect(self._on_picked)
         self._panel.pick_cancelled.connect(self._end_pick)
         self._picking = None        # "action" | "job" while the panel is a chooser

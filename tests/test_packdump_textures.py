@@ -1,4 +1,6 @@
-"""The texture each block actually renders with — packdump schema 4.
+"""The texture each block renders with, and the one its model asked for.
+
+Packdump schema 4 and 5.
 
 `<namespace>:block/<path>` is a convention, not a rule, and the pack this exists for breaks
 it constantly: StoneZone registers blocks at `c/alexscaves/cut_guanostone`, Alex's Caves
@@ -31,7 +33,15 @@ TEXTURES = {
 }
 
 
-def write_dump(path, *, schema=4, textures=True):
+# What each block's model DECLARES — schema 5. Identical to what it renders as, except for
+# the one block whose art has not been drawn: that is the entire difference between the two
+# maps, and the only case where either says something the other cannot.
+REQUESTED = dict(TEXTURES)
+REQUESTED["deep_end_assets:polished_plainstone"] = \
+    "deep_end_assets:block/polished_plainstone"
+
+
+def write_dump(path, *, schema=4, textures=True, requested=False):
     (path / "registries").mkdir(parents=True, exist_ok=True)
     (path / "attributes").mkdir(parents=True, exist_ok=True)
     (path / "meta.json").write_text(json.dumps({
@@ -50,10 +60,12 @@ def write_dump(path, *, schema=4, textures=True):
     }), encoding="utf-8")
 
     if textures:
-        (path / "attributes" / "textures.json").write_text(json.dumps({
-            "schema_version": 4, "type": "textures",
-            "textures": {"minecraft:block": TEXTURES},
-        }), encoding="utf-8")
+        payload = {"schema_version": 5 if requested else 4, "type": "textures",
+                   "textures": {"minecraft:block": TEXTURES}}
+        if requested:
+            payload["requested"] = {"minecraft:block": REQUESTED}
+        (path / "attributes" / "textures.json").write_text(
+            json.dumps(payload), encoding="utf-8")
     return path
 
 
@@ -190,3 +202,175 @@ def test_two_identical_dumps_are_still_equal(tmp_path):
     and fill the snapshot history with copies of one pack."""
     assert Packdump.load(write_dump(tmp_path / "a")) == \
         Packdump.load(write_dump(tmp_path / "b"))
+
+
+# --- what the model asked for, schema 5 --------------------------------------------------
+#
+# `texture` answers "what is drawn" and reports `minecraft:missingno` for art nobody has
+# made. True, and useless for making it: the missing-texture sprite is substituted while
+# the model bakes, and the name the model wanted does not survive that. `requested_texture`
+# is read from the UNBAKED model, so it says where the PNG belongs. The two together mean
+# "this renders as nothing, and here is the file that would fix it" — neither alone does.
+
+def test_a_block_with_no_art_says_where_the_art_belongs(tmp_path):
+    dump = Packdump.load(write_dump(tmp_path / "d", schema=5, requested=True))
+    block = "deep_end_assets:polished_plainstone"
+
+    assert dump.attribute("minecraft:block", block, "texture") == "minecraft:missingno"
+    assert dump.attribute("minecraft:block", block, "requested_texture") == \
+        "deep_end_assets:block/polished_plainstone"
+
+
+def test_what_renders_beats_what_was_asked_for(tmp_path):
+    """The precedence rule, and it is not a preference.
+
+    These two disagree for real blocks that render perfectly well — 211 of 13,841 on the
+    pack this was built against, wherever a Forge geometry loader or CTM replaced the baked
+    model and left the JSON underneath describing something else. `texture` is what the game
+    actually draws, so it wins whenever it resolves; taking the declared name there would
+    hand back a path nothing reads, and an override written to it would silently do nothing.
+    """
+    path = write_dump(tmp_path / "d", schema=5, requested=True)
+    lying = dict(REQUESTED)
+    lying["twigs:polished_calcite"] = "twigs:block/some_model_forge_replaced"
+    (path / "attributes" / "textures.json").write_text(json.dumps({
+        "schema_version": 5, "type": "textures",
+        "textures": {"minecraft:block": TEXTURES},
+        "requested": {"minecraft:block": lying},
+    }), encoding="utf-8")
+    dump = Packdump.load(path)
+
+    assert dump.texture_source("minecraft:block", "twigs:polished_calcite") == \
+        "twigs:block/polished_calcite"
+
+
+def test_a_block_with_no_art_falls_back_to_where_it_belongs(tmp_path):
+    """The other half of the same rule — the one case `texture` cannot answer."""
+    dump = Packdump.load(write_dump(tmp_path / "d", schema=5, requested=True))
+
+    assert dump.texture_source("minecraft:block", "deep_end_assets:polished_plainstone") == \
+        "deep_end_assets:block/polished_plainstone"
+
+
+def test_a_block_that_names_no_texture_at_all_answers_none(tmp_path):
+    """A third state, and not an error. Create's `fake_track` renders as nothing AND names
+    nothing — there is no art to open and nowhere to create it, so the honest answer is
+    None rather than a path invented to fill the hole."""
+    path = write_dump(tmp_path / "d", schema=5, requested=True)
+    blocks = json.loads((path / "registries" / "minecraft_block.json").read_text())
+    blocks["values"].append("create:fake_track")
+    (path / "registries" / "minecraft_block.json").write_text(json.dumps(blocks))
+    both_missing = dict(TEXTURES)
+    both_missing["create:fake_track"] = "minecraft:missingno"
+    asked = dict(REQUESTED)
+    asked["create:fake_track"] = "minecraft:missingno"
+    (path / "attributes" / "textures.json").write_text(json.dumps({
+        "schema_version": 5, "type": "textures",
+        "textures": {"minecraft:block": both_missing},
+        "requested": {"minecraft:block": asked},
+    }), encoding="utf-8")
+    dump = Packdump.load(path)
+
+    assert dump.texture_source("minecraft:block", "create:fake_track") is None
+
+
+def test_an_old_snapshot_still_answers_for_blocks_that_render(tmp_path):
+    """A schema-4 dump knows what renders and not what was asked for, so `texture_source`
+    must still answer for everything that has art — degraded, not broken."""
+    old = Packdump.load(write_dump(tmp_path / "old"))
+
+    assert old.texture_source("minecraft:block", "minecraft:stone") == "minecraft:block/stone"
+    assert old.texture_source("minecraft:block",
+                              "deep_end_assets:polished_plainstone") is None
+
+
+def test_a_schema_4_dump_cannot_say_where_art_belongs(tmp_path):
+    """Absence must stay legible. A schema-4 snapshot knows what renders and not what was
+    asked for, so a caller offering to CREATE the missing PNG has to be able to tell "no
+    such block" from "this dump is too old to know" — one is a shrug, the other is a
+    re-dump."""
+    old = Packdump.load(write_dump(tmp_path / "old"))
+
+    assert old.knows_textures() is True
+    assert old.knows_requested_textures() is False
+    assert old.attribute("minecraft:block", "deep_end_assets:polished_plainstone",
+                         "requested_texture") is None
+
+    new = Packdump.load(write_dump(tmp_path / "new", schema=5, requested=True))
+    assert new.knows_requested_textures() is True
+
+
+def test_the_requested_column_is_offered_only_when_the_snapshot_holds_it(tmp_path):
+    old = Packdump.load(write_dump(tmp_path / "old"))
+    new = Packdump.load(write_dump(tmp_path / "new", schema=5, requested=True))
+
+    assert "requested_texture" not in old.attributes_for("minecraft:block")
+    assert "requested_texture" in new.attributes_for("minecraft:block")
+
+
+def test_schema_5_is_accepted(tmp_path):
+    assert 5 in _VALID_SCHEMAS
+    assert Packdump.load(write_dump(tmp_path / "d", schema=5, requested=True)).schema == 5
+
+
+def test_saving_and_reloading_keeps_the_requested_names(tmp_path):
+    dump = Packdump.load(write_dump(tmp_path / "d", schema=5, requested=True))
+    dump.save(tmp_path / "out")
+
+    again = Packdump.load(tmp_path / "out")
+    assert again.knows_requested_textures() is True
+    for block, texture in REQUESTED.items():
+        assert again.attribute("minecraft:block", block, "requested_texture") == texture
+
+
+def test_round_tripping_a_schema_4_dump_does_not_invent_requested(tmp_path):
+    """A schema-4 snapshot re-saved must not grow a `requested: {}`. An empty map would
+    claim the mod looked and found nothing, when the truth is it was never asked — and the
+    next reader would take that as "no block anywhere declares a texture"."""
+    old = Packdump.load(write_dump(tmp_path / "old"))
+    old.save(tmp_path / "out")
+
+    written = json.loads(
+        (tmp_path / "out" / "attributes" / "textures.json").read_text(encoding="utf-8"))
+    assert "requested" not in written
+    assert Packdump.load(tmp_path / "out").knows_requested_textures() is False
+
+
+def test_gaining_requested_names_makes_a_dump_UNEQUAL(tmp_path):
+    """The failure this guards is total and permanent — the same one textures hit first.
+
+    The FIRST schema-5 dump over a schema-4 profile changes nothing else. Same ids, same
+    names, same mod versions, and the same rendered textures, because nobody drew anything
+    by upgrading the mod. If that reads as a duplicate it is discarded, and re-dumping
+    produces the identical verdict forever: the data can never arrive.
+    """
+    without = Packdump.load(write_dump(tmp_path / "old"))
+    with_ = Packdump.load(write_dump(tmp_path / "new", schema=5, requested=True))
+
+    assert without != with_
+    assert with_ != without
+
+
+def test_a_model_repointed_alone_is_a_different_dump(tmp_path):
+    """A generator renaming the texture its model asks for changes no id, no display name
+    and nothing that renders — the block was missing art before and is missing art still.
+    If that is not a difference, Packsmith keeps offering to create the PNG at the old
+    path, and the file it makes is one the game never reads."""
+    a = Packdump.load(write_dump(tmp_path / "a", schema=5, requested=True))
+
+    moved = dict(REQUESTED)
+    moved["deep_end_assets:polished_plainstone"] = "deep_end_assets:block/plainstone_polished"
+    path = write_dump(tmp_path / "b", schema=5, requested=True)
+    (path / "attributes" / "textures.json").write_text(json.dumps({
+        "schema_version": 5, "type": "textures",
+        "textures": {"minecraft:block": TEXTURES},
+        "requested": {"minecraft:block": moved},
+    }), encoding="utf-8")
+    b = Packdump.load(path)
+
+    assert a != b
+
+
+def test_two_identical_schema_5_dumps_are_still_equal(tmp_path):
+    assert Packdump.load(write_dump(tmp_path / "a", schema=5, requested=True)) == \
+        Packdump.load(write_dump(tmp_path / "b", schema=5, requested=True))
