@@ -22,7 +22,7 @@ should be made to confirm intent before anything downstream proceeds.
 """
 import json
 from datetime import datetime, timezone
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 SCALAR_TYPES = ("string", "number", "bool", "enum")
 SLOT_TYPES = SCALAR_TYPES + ("registry", "blueprint")
@@ -52,10 +52,18 @@ class Slot:
     enum_values: tuple = ()
     parent_id: int = None
     depth: int = 0
+    # How many values this slot may hold: "one" or "many" (design 3.2.2, 2026-08-29).
+    # Default "one" because that is what every slot was before this existed — a statement
+    # of fact about the old data, not a guess.
+    cardinality: str = "one"
 
     @property
     def is_group(self) -> bool:
         return self.kind == "group"
+
+    @property
+    def is_many(self) -> bool:
+        return self.cardinality == "many"
 
     def describe(self) -> str:
         if self.is_group:
@@ -83,10 +91,34 @@ class Instance:
 
 @dataclass(frozen=True)
 class Binding:
+    """What one cell holds. `values` is always a tuple; `value` is the scalar shortcut.
+
+    **`value` raises on a many-slot, and that is the design** (2026-08-29). The alternative
+    was returning a list from `.value` when the slot happens to be plural — which changes
+    the *type* of a field depending on schema the reader may not have looked at, in a
+    language (Starlark) with no type checking. Five action files already do things like
+    `bound[path].startswith(...)`; under a silent list they would produce a wrong plan
+    rather than an error.
+
+    So the scalar accessor keeps its promise or refuses. Every existing consumer works
+    unchanged against the `one` slots that are 99% of them, and anything meeting a `many`
+    slot is told, by name, to use `values`.
+    """
     slot_path: str
-    value: str
+    values: tuple = ()
     owner: str = "user"
     action_ref: str = None
+    many: bool = False
+
+    @property
+    def value(self):
+        if self.many:
+            raise BlueprintError(
+                f"'{self.slot_path}' holds many values — read `.values`, not `.value`")
+        return self.values[0] if self.values else None
+
+    def __str__(self):
+        return ", ".join(self.values)
 
 
 @dataclass(frozen=True)
@@ -266,8 +298,18 @@ class BlueprintStore:
 
     def add_slot(self, blueprint: str, name: str, type: str, *, parent: str = None,
                  registry_type: str = None, ref_blueprint: str = None,
-                 enum_values=None) -> Slot:
-        """A bindable slot. All slots are strictly typed — no or-types (3.2.2)."""
+                 enum_values=None, cardinality: str = "one") -> Slot:
+        """A bindable slot. All slots are strictly typed — no or-types (3.2.2).
+
+        `cardinality` is "one" or "many". A many-slot holds an ORDERED list of values of the
+        declared type — it does not loosen the type, only the count. The case it exists for:
+        one organism represented by several entity ids, where `minecraft:frog` and
+        `minecraft:tadpole` are the same creature at two life stages and modelling them as
+        separate nodes would assert a descent that does not exist.
+        """
+        if cardinality not in ("one", "many"):
+            raise BlueprintError(
+                f"cardinality must be 'one' or 'many', not '{cardinality}'")
         if type not in SLOT_TYPES:
             raise BlueprintError(
                 f"Unknown slot type '{type}' (expected one of {', '.join(SLOT_TYPES)})")
@@ -282,11 +324,13 @@ class BlueprintStore:
         # ref_blueprint on a registry slot is not, and it creates a real foreign key that
         # later refuses to let the blueprint be deleted.
         return self._add_slot(blueprint, name, "value", parent=parent, type=type,
+                              cardinality=cardinality,
                               **_qualifiers(type, registry_type, ref_blueprint,
                                             enum_values))
 
     def _add_slot(self, blueprint, name, kind, *, parent=None, type=None,
-                  registry_type=None, ref_blueprint=None, enum_values=None) -> Slot:
+                  registry_type=None, ref_blueprint=None, enum_values=None,
+                  cardinality="one") -> Slot:
         _check_name("Slot", name)
         blueprint_row = self._require_blueprint(blueprint)
         parent_id = None
@@ -313,10 +357,11 @@ class BlueprintStore:
 
         self._db.execute(
             "INSERT INTO blueprint_slots (blueprint_id, parent_id, name, kind, type, "
-            "registry_type, ref_blueprint_id, enum_values, position) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "registry_type, ref_blueprint_id, enum_values, position, cardinality) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (blueprint_row["id"], parent_id, name, kind, type, registry_type, ref_id,
-             json.dumps(list(enum_values)) if enum_values else None, siblings["n"]))
+             json.dumps(list(enum_values)) if enum_values else None, siblings["n"],
+             cardinality))
         return self.slot(blueprint, f"{parent}.{name}" if parent else name)
 
     def slots(self, blueprint: str) -> list:
@@ -641,16 +686,32 @@ class BlueprintStore:
             self._apply_type(self._restore_target(blueprint, snapshot), snapshot["slots"][0])
 
         by_path = {s.path: s.id for s in self.slots(blueprint)}
+        # Renumbered on the way out. Limbo has no `position` of its own — it keeps rows in
+        # insertion order under its own autoincrement id — so a many-slot's values come back
+        # in the order they went in, and each cell is numbered from zero as it is restored.
+        # An upsert cannot serve here now that the key includes position: it would collide
+        # the second value of a list onto the first.
+        restored_at = {}
         for row in self._db.fetch_all(
-                "SELECT * FROM blueprint_limbo WHERE mutation_id = ?", (mutation["id"],)):
+                "SELECT * FROM blueprint_limbo WHERE mutation_id = ? ORDER BY id",
+                (mutation["id"],)):
             slot_id = by_path.get(row["slot_path"])
-            if slot_id is not None:
+            if slot_id is None:
+                continue
+            cell = (row["instance_id"], slot_id)
+            if cell not in restored_at:
+                # The first value of a cell replaces whatever survived the mutation; the
+                # rest append to it.
                 self._db.execute(
-                    "INSERT INTO instance_bindings (instance_id, slot_id, value, owner, "
-                    "action_ref) VALUES (?, ?, ?, ?, ?) "
-                    "ON CONFLICT(instance_id, slot_id) DO UPDATE SET value = excluded.value",
-                    (row["instance_id"], slot_id, row["value"], row["owner"],
-                     row["action_ref"]))
+                    "DELETE FROM instance_bindings WHERE instance_id = ? AND slot_id = ?",
+                    cell)
+                restored_at[cell] = 0
+            self._db.execute(
+                "INSERT INTO instance_bindings (instance_id, slot_id, position, value, "
+                "owner, action_ref) VALUES (?, ?, ?, ?, ?, ?)",
+                (row["instance_id"], slot_id, restored_at[cell], row["value"],
+                 row["owner"], row["action_ref"]))
+            restored_at[cell] += 1
         for row in self._db.fetch_all(
                 "SELECT id FROM blueprint_instances WHERE orphaned_by = ?",
                 (mutation["id"],)):
@@ -679,7 +740,7 @@ class BlueprintStore:
         """Preserved-but-hidden bindings. Deliberately never returned by
         :meth:`bindings` — "not exposed to actions" is structural here, not a flag."""
         row = self.instance(blueprint, instance)
-        return [Binding(slot_path=r["slot_path"], value=r["value"], owner=r["owner"],
+        return [Binding(slot_path=r["slot_path"], values=(r["value"],), owner=r["owner"],
                         action_ref=r["action_ref"])
                 for r in self._db.fetch_all(
                     "SELECT * FROM blueprint_limbo WHERE instance_id = ? ORDER BY slot_path",
@@ -709,7 +770,7 @@ class BlueprintStore:
         return [(row["name"], row) for row in self._db.fetch_all(
             "SELECT ib.*, i.name FROM instance_bindings ib "
             "JOIN blueprint_instances i ON i.id = ib.instance_id "
-            "WHERE ib.slot_id = ? ORDER BY i.name", (slot.id,))]
+            "WHERE ib.slot_id = ? ORDER BY i.name, ib.position", (slot.id,))]
 
     def _proposed(self, slot: Slot, type, registry_type, ref_blueprint, enum_values) -> Slot:
         if type not in SLOT_TYPES:
@@ -895,19 +956,52 @@ class BlueprintStore:
 
     def bind(self, blueprint: str, instance: str, path: str, value, *,
              owner: str = "user", action_ref: str = None):
-        """Bind a value into a slot, validating it against the slot's type."""
+        """Bind a value into a slot, validating it against the slot's type and cardinality.
+
+        **A `many` slot takes a list and a `one` slot takes a scalar, and mixing them is
+        refused rather than coerced** (2026-08-29). Accepting a bare string for a plural
+        slot would silently store a one-item list, and accepting a list for a singular one
+        would have to pick an element — both are the caller meaning something the schema
+        does not say, and guessing which is how a wrong binding gets written confidently.
+
+        A `many` bind REPLACES the whole list. That is the same promise `one` already
+        makes — a cell holds what you last put in it — and it keeps the operation
+        idempotent, which is what an action re-asserting its output every run needs.
+        """
         slot = self.slot(blueprint, path)
         if slot.is_group:
             raise BlueprintError(f"'{path}' is a group — groups hold slots, not values")
-        stored = self._validate(slot, value)
+
+        listed = isinstance(value, (list, tuple))
+        if slot.is_many and not listed:
+            raise BlueprintError(
+                f"'{path}' holds many values — bind a list, not a single {type(value).__name__}")
+        if not slot.is_many and listed:
+            raise BlueprintError(
+                f"'{path}' holds one value — bind it directly, not a list. Make the slot "
+                f"'many' if it should hold several.")
+
+        incoming = list(value) if listed else [value]
+        stored = [self._validate(slot, one) for one in incoming]
+        if len(set(stored)) != len(stored):
+            raise BlueprintError(f"'{path}' was given the same value twice")
         row = self.instance(blueprint, instance)
         if slot.type == "blueprint":
-            self._refuse_cycle(row.id, int(stored))
+            for one in stored:
+                self._refuse_cycle(row.id, int(one))
+
+        # Cleared and rewritten rather than upserted: the new list may be SHORTER than the
+        # old one, and an upsert keyed by position would leave the tail of the previous
+        # binding behind as rows nobody wrote.
         self._db.execute(
-            "INSERT INTO instance_bindings (instance_id, slot_id, value, owner, action_ref) "
-            "VALUES (?, ?, ?, ?, ?) ON CONFLICT(instance_id, slot_id) DO UPDATE SET "
-            "value = excluded.value, owner = excluded.owner, action_ref = excluded.action_ref",
-            (row.id, slot.id, stored, owner, action_ref))
+            "DELETE FROM instance_bindings WHERE instance_id = ? AND slot_id = ?",
+            (row.id, slot.id))
+        for position, one in enumerate(stored):
+            self._db.execute(
+                "INSERT INTO instance_bindings "
+                "(instance_id, slot_id, position, value, owner, action_ref) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (row.id, slot.id, position, one, owner, action_ref))
 
     # Bindings that point at something no longer present (design 3.2.2 Live Questions —
     # resolved by the doc's own steer: "this should probably mirror the tag orphan-detection
@@ -1088,7 +1182,8 @@ class BlueprintStore:
         self._db.execute(
             "UPDATE instance_bindings SET owner = 'user', action_ref = NULL "
             "WHERE instance_id = ? AND slot_id = ?", (row.id, slot.id))
-        return Binding(slot_path=path, value=binding.value, owner="user", action_ref=None)
+        return Binding(slot_path=path, values=binding.values, owner="user",
+                       action_ref=None, many=binding.many)
 
     def binding(self, blueprint: str, instance: str, path: str):
         """One cell's whole state — value *and* owner — or None when nothing is bound.
@@ -1112,14 +1207,23 @@ class BlueprintStore:
         row = self.instance(blueprint, instance)
         by_id = {s.id: s for s in self.slots(blueprint)}
         result = {}
+        # ORDER BY position, because a slot may now hold several rows and their order is
+        # part of the value — `[frog, tadpole]` is not the same binding as `[tadpole, frog]`.
         for binding in self._db.fetch_all(
-                "SELECT * FROM instance_bindings WHERE instance_id = ?", (row.id,)):
+                "SELECT * FROM instance_bindings WHERE instance_id = ? "
+                "ORDER BY slot_id, position", (row.id,)):
             slot = by_id.get(binding["slot_id"])
             if slot is None:
                 continue
-            result[slot.path] = Binding(slot_path=slot.path, value=binding["value"],
-                                        owner=binding["owner"],
-                                        action_ref=binding["action_ref"])
+            found = result.get(slot.path)
+            if found is None:
+                result[slot.path] = Binding(
+                    slot_path=slot.path, values=(binding["value"],),
+                    owner=binding["owner"], action_ref=binding["action_ref"],
+                    many=slot.is_many)
+            else:
+                result[slot.path] = replace(
+                    found, values=found.values + (binding["value"],))
         return result
 
     def all_bindings(self, blueprint: str) -> dict:
@@ -1140,16 +1244,23 @@ class BlueprintStore:
             "FROM instance_bindings bi "
             "JOIN blueprint_instances i ON i.id = bi.instance_id "
             "JOIN blueprints b ON b.id = i.blueprint_id "
-            "WHERE b.name = ?", (blueprint,))
+            # Ordered, so a many-slot's values arrive in the order they were bound rather
+            # than in whatever order SQLite hands back.
+            "WHERE b.name = ? ORDER BY i.name, bi.slot_id, bi.position", (blueprint,))
         by_id = {slot.id: slot for slot in self.slots(blueprint)}
         found = {}
         for row in rows:
             slot = by_id.get(row["slot_id"])
             if slot is None:
                 continue                      # a slot removed out from under a binding
-            found.setdefault(row["instance"], {})[slot.path] = Binding(
-                slot_path=slot.path, value=row["value"], owner=row["owner"],
-                action_ref=row["action_ref"])
+            cell = found.setdefault(row["instance"], {})
+            already = cell.get(slot.path)
+            if already is None:
+                cell[slot.path] = Binding(
+                    slot_path=slot.path, values=(row["value"],), owner=row["owner"],
+                    action_ref=row["action_ref"], many=slot.is_many)
+            else:
+                cell[slot.path] = replace(already, values=already.values + (row["value"],))
         return found
 
     def decode(self, slot: Slot, stored):
@@ -1271,7 +1382,11 @@ class BlueprintStore:
             kind=row["kind"], type=row["type"], registry_type=row["registry_type"],
             ref_blueprint=row["ref_name"],
             enum_values=tuple(json.loads(row["enum_values"]) if row["enum_values"] else ()),
-            parent_id=row["parent_id"], depth=depth)
+            parent_id=row["parent_id"], depth=depth,
+            # `keys()` rather than a bare lookup: a row read before the column existed has
+            # no such key, and this is read during the migration's own startup path.
+            cardinality=(row["cardinality"] if "cardinality" in row.keys()
+                         and row["cardinality"] else "one"))
 
 
 @dataclass(frozen=True)

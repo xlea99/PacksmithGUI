@@ -41,11 +41,16 @@ def column_name(field) -> str:
 class _Resolver:
     """A field bound to a scope: ``.type`` is the column type, calling it with an
     entry id yields that entry's value for the field."""
-    __slots__ = ("type", "_fn")
+    __slots__ = ("type", "_fn", "many")
 
-    def __init__(self, type: str, fn):
+    def __init__(self, type: str, fn, many: bool = False):
         self.type = type
         self._fn = fn
+        # Whether calling this yields a TUPLE rather than a scalar. Carried here so the
+        # operator compiler can refuse an ambiguous comparison when the query is BUILT,
+        # naming the field — rather than on the first row, which is a stack trace during a
+        # view someone just opened.
+        self.many = many
 
     def __call__(self, entry_id):
         return self._fn(entry_id)
@@ -76,8 +81,15 @@ class BlueprintFieldCatalog:
         self._bindings = blueprint_store.all_bindings(blueprint_name)
 
     def _bound(self, instance, path):
+        """The cell's value — a tuple for a many-slot, a scalar for a one-slot.
+
+        `Binding.value` deliberately raises on a many-slot (§3.2.2), so this asks by
+        cardinality rather than letting that error escape into a query.
+        """
         binding = self._bindings.get(instance, {}).get(path)
-        return binding.value if binding is not None else None
+        if binding is None:
+            return None
+        return binding.values if binding.many else binding.value
 
     def slot_paths(self) -> list:
         return list(self._slots)
@@ -90,6 +102,17 @@ class BlueprintFieldCatalog:
             slot = self._slots.get(field.name)
             if slot is None:
                 raise QueryError(f"'{blueprint}' has no slot '{field.name}'")
+            if slot.is_many:
+                def many(instance, slot=slot):
+                    # None, not (), for an unbound cell. `presence` asks `is not None`, and
+                    # an empty tuple is not None — so returning one made `has` true for
+                    # every instance, bound or not. An unbound many-slot is a gap, exactly
+                    # like an unbound one-slot.
+                    raw = self._bound(instance, slot.path)
+                    if raw is None:
+                        return None
+                    return tuple(self._store.decode(slot, one) for one in raw)
+                return _Resolver(_COLUMN_TYPES.get(slot.type, "string"), many, many=True)
             return _Resolver(_COLUMN_TYPES.get(slot.type, "string"),
                              lambda instance: self._store.decode(
                                  slot, self._bound(instance, slot.path)))

@@ -13,7 +13,8 @@ from packsmith.core import backup
 # machinery can be built the day a change needs it, but a database holding work you care
 # about that cannot say what shape it is has permanently lost the ability to be reasoned
 # about. Hence this landing long before there is anything to migrate.
-SCHEMA_VERSION = 3      # v3: tracked_roots + file_ownership keyed by (root, path)
+SCHEMA_VERSION = 4      # v4: blueprint slots may hold many values (instance_bindings
+                        #     keyed by (instance, slot, position); slots gain cardinality)
 
 
 class SchemaTooNewError(RuntimeError):
@@ -276,10 +277,15 @@ class UserDB:
             CREATE TABLE IF NOT EXISTS instance_bindings (
                 instance_id     INTEGER NOT NULL REFERENCES blueprint_instances(id) ON DELETE CASCADE,
                 slot_id         INTEGER NOT NULL REFERENCES blueprint_slots(id) ON DELETE CASCADE,
+                -- Position in the slot's list. 0 for a `one` slot, which is every slot
+                -- that existed before cardinality did. In the KEY rather than merely
+                -- stored, because a list of entity ids for one organism has a meaningful
+                -- order and a set would lose it on every round trip.
+                position        INTEGER NOT NULL DEFAULT 0,
                 value           TEXT NOT NULL,
                 owner           TEXT NOT NULL DEFAULT 'user' CHECK(owner IN ('user', 'action')),
                 action_ref      TEXT,
-                PRIMARY KEY (instance_id, slot_id)
+                PRIMARY KEY (instance_id, slot_id, position)
             );
 
             -- Saved Views (design 3.2.3): a View is a named (query, renderer, renderer
@@ -515,8 +521,60 @@ class UserDB:
         # what makes this safe to migrate: every step that existed before the column did
         # was, by definition, one that ran.
         self._add_column_if_missing("job_steps", "enabled", "INTEGER NOT NULL DEFAULT 1")
+        # How many values a slot may hold (design 3.2.2). Defaulting to 'one' is what makes
+        # this safe: every slot that existed before the column did held exactly one, by
+        # construction, so the default is a statement of fact rather than a guess.
+        self._add_column_if_missing("blueprint_slots", "cardinality",
+                                    "TEXT NOT NULL DEFAULT 'one'")
         self._root_the_file_ownership_table()
+        self._position_the_instance_bindings_table()
         self._conn.commit()
+
+    def _position_the_instance_bindings_table(self):
+        """Let one slot hold many values (design 3.2.2). A REBUILD, not an added column.
+
+        SQLite cannot alter a primary key, and the key is the change: `(instance_id,
+        slot_id)` permits exactly one row per cell, which is the limit being lifted. Adding
+        a column while keeping the old key would make the second value collide with the
+        first and be silently rejected.
+
+        **Every existing row becomes position 0**, which is not a default so much as a
+        restatement: a cell that could only hold one value was holding its first.
+
+        Ordering matters here and is why position is in the key rather than merely stored.
+        A list of entity ids for one organism — `minecraft:frog`, `minecraft:tadpole` — has
+        a meaningful order, and a set would lose it on every round trip.
+        """
+        columns = {row["name"] for row in
+                   self._conn.execute("PRAGMA table_info(instance_bindings)")}
+        if not columns or "position" in columns:
+            return
+        self._conn.execute("PRAGMA foreign_keys = OFF")
+        try:
+            self._conn.executescript("""
+                CREATE TABLE instance_bindings_positioned (
+                    instance_id INTEGER NOT NULL
+                                    REFERENCES blueprint_instances(id) ON DELETE CASCADE,
+                    slot_id     INTEGER NOT NULL
+                                    REFERENCES blueprint_slots(id) ON DELETE CASCADE,
+                    position    INTEGER NOT NULL DEFAULT 0,
+                    value       TEXT NOT NULL,
+                    owner       TEXT NOT NULL DEFAULT 'user'
+                                    CHECK(owner IN ('user', 'action')),
+                    action_ref  TEXT,
+                    PRIMARY KEY (instance_id, slot_id, position)
+                );
+                INSERT INTO instance_bindings_positioned
+                       (instance_id, slot_id, position, value, owner, action_ref)
+                    SELECT instance_id, slot_id, 0, value, owner, action_ref
+                      FROM instance_bindings;
+                DROP TABLE instance_bindings;
+                ALTER TABLE instance_bindings_positioned RENAME TO instance_bindings;
+            """)
+            self._conn.commit()
+            log.info("Migrated instance_bindings: a slot may now hold many values")
+        finally:
+            self._conn.execute("PRAGMA foreign_keys = ON")
 
     def _root_the_file_ownership_table(self):
         """Give `file_ownership` a root (design 6.6). A REBUILD, not an added column.

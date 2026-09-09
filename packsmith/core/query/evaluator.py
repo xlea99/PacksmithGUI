@@ -280,6 +280,24 @@ def _compile_filter(node, catalog):
     raise QueryError(f"not a filter: {node!r}")
 
 
+def _equal_any(values, wanted, ci) -> bool:
+    """Whether any element equals `wanted`. Exact, never substring."""
+    return any(_equal(one, wanted, ci) for one in values)
+
+
+def _compile_membership(res, val, ci):
+    """`contains` against a field holding many values: is one of them exactly this?
+
+    Exact equality per element, never substring. Substring is the natural reading of the
+    word and is wrong for ids, which nest — matching `ambientadditions:leaf_frog` against a
+    list holding only `ambientadditions:leaf_frog_tadpole` would say yes.
+    """
+    def f(e):
+        v = res(e)
+        return False if v is None else _equal_any(v, val, ci)
+    return f
+
+
 def _compile_cmp(node, res):
     """How an operator behaves on an entry that has **no value** (2026-08-29).
 
@@ -309,6 +327,30 @@ def _compile_cmp(node, res):
     op, val, ci = node.op, node.value, node.ci
     if op not in VALID_OPS:
         raise QueryError(f"unknown op: {op!r}")
+
+    # --- a field holding MANY values (2026-08-29) ---------------------------------------
+    #
+    # Only `contains` survives, and refusing the rest is the point rather than a gap.
+    #
+    # `==` was the live question. Exact-list-equivalence is the algebraically correct
+    # reading and almost never the one intended: somebody typing `t:mob == "minecraft:frog"`
+    # is asking whether the frog is in there, and answering "is the list exactly [frog]"
+    # is correct, silent, and about a different question. That is the same failure as the
+    # unset rule above, in better clothes.
+    #
+    # Membership-as-`==` was the other candidate — Mongo reads `{tags: "red"}` that way —
+    # and is refused for a different reason: a saved view is a string somebody reads months
+    # later, and `==` meaning membership or equality depending on a slot's cardinality is
+    # not visible in the query text.
+    #
+    # So `==` errors and names the fix. It stays upgradeable: exact-equivalence can be added
+    # later, and cannot be removed once views depend on it.
+    if getattr(res, "many", False):
+        if op != "contains":
+            raise QueryError(
+                f"'{op}' cannot compare a field that holds many values — use `contains` to "
+                f"test whether one of them matches")
+        return _compile_membership(res, val, ci)
 
     if op in ("eq", "neq"):
         want = (op == "eq")
@@ -349,6 +391,14 @@ def _compile_cmp(node, res):
             v = res(e)
             if v is None:
                 return False
+            if isinstance(v, (list, tuple)):
+                # Belt to `_compile_membership`'s braces. A list reaching the substring
+                # branch would be `str()`-ed and searched as its repr — which returns the
+                # right answer often enough to look correct, and the wrong one exactly
+                # where it matters: `ambientadditions:leaf_frog` is a prefix of
+                # `ambientadditions:leaf_frog_tadpole`, and Leaf Frog is one of the three
+                # organisms this whole feature exists for.
+                return _equal_any(v, val, ci)
             s = v if isinstance(v, str) else str(v)
             needle = str(val)
             return (needle.lower() in s.lower()) if ci else (needle in s)
