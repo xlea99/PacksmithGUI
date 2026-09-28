@@ -16,6 +16,7 @@ The convention that breaks for 77% of this pack is `block id -> texture id`, whi
 exactly why the dump carries the answer instead of deriving it. Once you *have* the texture
 id, the file follows.
 """
+import json
 import struct
 import tempfile
 import zipfile
@@ -169,6 +170,54 @@ class GeneratedPacks:
         return None, None
 
 
+class AssetObjects:
+    """Vanilla's own assets, which are not in the client jar.
+
+    **The jar does not contain the sounds.** Since 1.6 the launcher keeps `sounds.json`,
+    every `.ogg`, the language files and a few icons in a content-addressed store beside
+    the jar — `assets/objects/<h[:2]>/<hash>` — with `assets/indexes/<id>.json` mapping the
+    familiar paths onto hashes. So "play `minecraft:block.stone.step`" cannot be answered
+    by any source in the list above; the file is real and lives nowhere a member path can
+    reach without this lookup.
+
+    Presented as a source with the same `assets/<ns>/...` addressing as everything else,
+    because the difference is where the bytes are kept, not what they are. The index is
+    loaded on first use: it is a ~1 MB JSON of 3,600 entries and most sessions never ask.
+    """
+
+    def __init__(self, objects_dir, index_path):
+        self.objects = Path(objects_dir)
+        self.index_path = Path(index_path)
+        self._map = None
+
+    def _load(self):
+        if self._map is None:
+            try:
+                self._map = json.loads(self.index_path.read_text("utf-8")).get("objects", {})
+            except (OSError, ValueError):
+                self._map = {}
+        return self._map
+
+    def namespaces(self) -> set:
+        # Every key is `<namespace>/<path>`; in practice one namespace, but reading it out
+        # costs nothing and keeps this honest if a launcher ever ships more.
+        return {key.split("/", 1)[0] for key in self._load() if "/" in key}
+
+    def find(self, member: str):
+        """``(bytes, the objects directory)`` or ``(None, None)``."""
+        if not member.startswith("assets/"):
+            return None, None
+        entry = self._load().get(member[len("assets/"):])
+        digest = entry.get("hash") if isinstance(entry, dict) else None
+        if not digest:
+            return None, None
+        candidate = self.objects / digest[:2] / digest
+        try:
+            return candidate.read_bytes(), self.objects
+        except OSError:
+            return None, None
+
+
 class TextureIndex:
     """Which of the pack's files holds a given texture, searched in resolution order.
 
@@ -257,6 +306,33 @@ class TextureIndex:
             if data is not None:
                 return data, source
         return None, None
+
+    def find_all(self, member: str) -> list:
+        """Every copy of `member`, as ``[(bytes, source), ...]`` in resolution order.
+
+        `find` answers "which file wins", which is the right question for a texture — a
+        PNG shadows the one beneath it completely. A `sounds.json` is not shadowed but
+        **merged**: the game reads every pack's copy and combines them per event, so the
+        pack that wins for one sound can be a bystander for the next. That needs all of
+        them, most-specific first so a caller can walk them in either direction.
+        """
+        if not member:
+            return []
+        parts = member.split("/")
+        namespace = parts[1] if len(parts) > 2 and parts[0] == "assets" else None
+        if namespace is None:
+            return []
+        found = []
+        for source in self.sources_for(namespace):
+            if hasattr(source, "find"):
+                data, where = source.find(member)
+                if data is not None:
+                    found.append((data, where))
+                continue
+            data = self._read(source, member)
+            if data is not None:
+                found.append((data, source))
+        return found
 
     @staticmethod
     def _read(source: Path, member: str):

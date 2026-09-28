@@ -465,6 +465,7 @@ class BlueprintEditorTab(QWidget):
         # Set by the window that owns this tab; None means the texture verbs are simply not
         # offered, which is what a tab built in isolation gets.
         self.texture_menu = None
+        self.sound_menu = None
         self._slots = []
         self._instances = []
         self._loading = False
@@ -1640,13 +1641,15 @@ class BlueprintEditorTab(QWidget):
         that resolves to no target and drops out on its own, without this needing to know
         what dangling means.
         """
-        if self.texture_menu is None:
+        providers = [p for p in (self.texture_menu, self.sound_menu) if p is not None]
+        if not providers:
             return
         slot = self.slot_for_column(column)
         item = self._grid.item(row, column)
         if slot is None or item is None or not item.text():
             return
-        self.texture_menu.extend(menu, slot.registry_type, item.text())
+        for provider in providers:
+            provider.extend(menu, slot.registry_type, item.text())
 
     def _rename_instance(self, instance):
         name, ok = _ask(self, "Rename Instance", "New name", instance)

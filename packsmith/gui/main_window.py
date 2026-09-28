@@ -7,6 +7,7 @@ services to the shell and owns the actions that span tabs (run an action, author
 undo/redo).
 """
 import dataclasses
+import random
 import re
 import time
 from datetime import datetime
@@ -17,7 +18,7 @@ from PySide6.QtWidgets import (
     QHeaderView, QSplitter, QInputDialog, QMessageBox, QApplication, QMenu,
 )
 from PySide6.QtCore import Qt, QEvent, QTimer, QMimeData, QUrl
-from PySide6.QtGui import QShortcut, QKeySequence, QFont, QImage
+from PySide6.QtGui import QShortcut, QKeySequence, QFont, QImage, QDesktopServices
 
 from packsmith.common.setup import (
     GLOBAL_PATHS, load_state, load_ui_state, save_state, save_ui_state)
@@ -29,7 +30,7 @@ from packsmith.core.archives import ArchiveError, read_member
 from packsmith.core.capabilities import (
     CapabilityError, DATAPACKS_WRITE, PACK_LOADER_SETTING, RESOURCEPACKS_WRITE,
     PackTargets, override_kind, pack_format_for, resolve)
-from packsmith.core.launchers import locate_for
+from packsmith.core.launchers import asset_store_for, locate_for
 from packsmith.core.packdiff import summarise_diff, tags_at_risk
 from packsmith.integrations import PACK_LOADERS
 from packsmith.core.packdump import (
@@ -102,9 +103,11 @@ from packsmith.gui.action_editor import (
 )
 from packsmith.gui.image_viewer import ImageViewerTab
 from packsmith.gui.override_dialog import OverrideTargetDialog
+from packsmith.gui.sound_menu import SoundMenu
 from packsmith.gui.texture_menu import TextureMenu
+from packsmith.core.sounds import SoundCatalog, choose
 from packsmith.core.textures import (
-    GeneratedPacks, TextureIndex, blank_png, staged_copy)
+    AssetObjects, GeneratedPacks, TextureIndex, blank_png, staged_copy)
 from packsmith.gui.packdump_diff import PackdumpDiffTab
 from packsmith.gui.jar_viewer import JarViewerTab
 from packsmith.gui.nbt_viewer import NbtViewerTab
@@ -397,7 +400,11 @@ class MainWindow(QMainWindow):
         self._texture_menu = TextureMenu(lambda: self._packdump,
                                          self._view_texture, self._write_texture,
                                          self._copy_texture)
+        # The edge from a sound event to its audio, same shape and same staleness rule.
+        self._sound_menu = SoundMenu(lambda: self._sounds(), self._play_sound, self._open_sound)
         self._texture_index = None       # built on first use — see `_texture_sources`
+        self._sound_catalog = None       # built over the index; dropped with it
+        self._player = None              # QMediaPlayer, kept alive while a sound plays
         active_loader = self._loaders.provider_for(DATAPACKS_WRITE)
         self._files_panel = FilesPanel(self._file_store, loader=active_loader,
                                        roots=self._roots)
@@ -710,6 +717,7 @@ class MainWindow(QMainWindow):
                                      self._schema_change_impact(q.scope.name, projected,
                                                                 mutation))
         tab.texture_menu = self._texture_menu
+        tab.sound_menu = self._sound_menu
         tab.changed.connect(self._after_blueprint_change)
         tab.status.connect(self._set_status)
         tab.save_requested.connect(lambda t=tab: self._save_blueprint_view(t))
@@ -1381,6 +1389,7 @@ class MainWindow(QMainWindow):
         # changing is exactly when a mod jar or resource pack appeared or went away. A
         # stale index would keep answering out of a jar that is no longer installed.
         self._texture_index = None
+        self._sound_catalog = None
         if getattr(self, "_files_panel", None) is not None:
             self._files_panel.set_loader(self._loaders.provider_for(DATAPACKS_WRITE))
         self._refresh_header()
@@ -1686,6 +1695,7 @@ class MainWindow(QMainWindow):
 
         table = RegistryTableView()
         table.texture_menu = self._texture_menu
+        table.sound_menu = self._sound_menu
         # The model sorts itself, so there is no proxy: a QSortFilterProxyModel compares
         # pairwise through Python, which measured 2.2s per sort on an 18,638-row registry
         # against 3ms for a key sort in the model. It was doing nothing else — filtering
@@ -2329,6 +2339,11 @@ class MainWindow(QMainWindow):
             sources.extend(sorted(mods.glob("*.jar")))
         if self._client_jar is not None:
             sources.append(Path(self._client_jar.path))
+            # Vanilla's sounds (and its sounds.json) are not in the jar but in the
+            # launcher's hashed store beside it. Last, like the jar: it is the floor.
+            store = asset_store_for(self._client_jar)
+            if store is not None:
+                sources.append(AssetObjects(*store))
         return sources
 
     def _textures(self) -> TextureIndex:
@@ -2341,6 +2356,59 @@ class MainWindow(QMainWindow):
         if self._texture_index is None:
             self._texture_index = TextureIndex(self._texture_sources())
         return self._texture_index
+
+    def _sounds(self) -> SoundCatalog:
+        """The sound catalog over the same index; rebuilt whenever the index is."""
+        index = self._textures()
+        if self._sound_catalog is None or self._sound_catalog.index is not index:
+            self._sound_catalog = SoundCatalog(index)
+        return self._sound_catalog
+
+    def _play_sound(self, target):
+        """Play one of an event's files, chosen the way the game chooses (weighted)."""
+        from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
+        sound = choose(list(target.files), random)
+        data, source = self._sounds().read(sound)
+        if data is None:
+            QMessageBox.information(
+                self, "Nothing to play",
+                f"{target.event_id} names {sound.member}, but no pack, mod or launcher "
+                f"asset store ships that file.")
+            return None
+        # Staged to disk because QMediaPlayer wants a URL; the same directory and the same
+        # overwrite-in-place rule as texture copies, so this never accumulates.
+        staged = staged_copy(sound.name, data)
+        if self._player is None:
+            self._player = QMediaPlayer(self)
+            self._player.setAudioOutput(QAudioOutput(self))
+        player = self._player
+        player.stop()
+        player.audioOutput().setVolume(max(0.0, min(1.0, sound.volume)))
+        player.setPlaybackRate(max(0.5, min(2.0, sound.pitch)))   # the game's own clamp
+        player.setSource(QUrl.fromLocalFile(str(staged)))
+        player.play()
+        which = f" ({target.files.index(sound) + 1} of {target.count})" if target.count > 1 else ""
+        self._set_status(f"Playing {sound.name}{which} — from {Path(source).name}")
+        return sound
+
+    def _open_sound(self, target, sound):
+        """Hand one file to whatever the OS opens .ogg with.
+
+        Staged rather than pointed at inside the jar, because there is no URL for a zip
+        member the shell understands. With no association Windows asks how to open it,
+        which is the right outcome — that dialog is the OS's, not something to rebuild.
+        """
+        data, source = self._sounds().read(sound)
+        if data is None:
+            QMessageBox.information(
+                self, "Nothing to open",
+                f"{target.event_id} names {sound.member}, but no pack, mod or launcher "
+                f"asset store ships that file.")
+            return None
+        staged = staged_copy(sound.name, data)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(staged)))
+        self._set_status(f"Opened {sound.name} — from {Path(source).name}")
+        return staged
 
     def _view_texture(self, target):
         """Open the PNG a block renders with (design 6.5, reached from a cell)."""

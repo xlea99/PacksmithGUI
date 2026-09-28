@@ -161,6 +161,34 @@ def locate(instance_path, version: str, *, override=None) -> LocatedJar | None:
     return None
 
 
+def asset_store_for(jar) -> tuple[Path, Path] | None:
+    """``(objects_dir, index_path)`` for the launcher's hashed asset store, or None.
+
+    The store sits under an `assets/` beside whichever tree holds the jar, and the index
+    id is not the game version — 1.20.1 uses index `5` — so it is read from the version
+    JSON next to the jar, falling back to a file named after the version for launchers
+    that keep no such JSON.
+    """
+    path = Path(getattr(jar, "path", jar))
+    index_id = None
+    try:
+        index_id = json.loads(path.with_suffix(".json").read_text("utf-8")).get("assets")
+    except (OSError, ValueError, AttributeError):
+        pass
+    candidates = [index_id, getattr(jar, "version", None), path.stem]
+    for depth in (2, 3):
+        if len(path.parents) <= depth:
+            continue
+        assets = path.parents[depth] / "assets"
+        objects = assets / "objects"
+        if not objects.is_dir():
+            continue
+        for name in candidates:
+            if name and (assets / "indexes" / f"{name}.json").is_file():
+                return objects, assets / "indexes" / f"{name}.json"
+    return None
+
+
 def locate_for(profile) -> LocatedJar | None:
     """The client jar for a profile, honouring its override setting."""
     if not profile.mc_path or not profile.mc_version:

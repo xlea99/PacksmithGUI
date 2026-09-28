@@ -25,6 +25,7 @@ class RegistryTableView(QTableView):
         # built without one simply offers no texture actions, which is what every test
         # constructing a bare view gets.
         self.texture_menu = None
+        self.sound_menu = None
 
     def _on_context_menu(self, pos):
         index = self.indexAt(pos)
@@ -75,13 +76,17 @@ class RegistryTableView(QTableView):
         the actions had silently stopped appearing.
         """
         model = self.model()
-        if self.texture_menu is None or model is None:
+        providers = [p for p in (self.texture_menu, self.sound_menu) if p is not None]
+        if not providers or model is None:
             return
         entry_id = model.entry_at_row(index.row())
         if not entry_id:
             return
         separator = menu.addSeparator()
-        if not self.texture_menu.extend(menu, model.registry_type, entry_id):
+        # A list, not `any(...)`: every provider gets asked, since a registry could in
+        # principle have both kinds of action (none does today).
+        added = [p.extend(menu, model.registry_type, entry_id) for p in providers]
+        if not any(added):
             menu.removeAction(separator)
 
     @staticmethod
