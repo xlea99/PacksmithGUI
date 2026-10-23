@@ -19,6 +19,17 @@ A pack may be a folder or a zip. Packsmith writes folders — a zip would have t
 rebuilt on every edit, and the whole point of an override is that you can go and look at
 it — but both are listed, because the user's packs contain both.
 
+**Where order comes from**, read from the jars of 4.0 (1.20.1 Forge) and 5.1.3 (1.21.1
+NeoForge), which agree: Paxi takes vanilla's enabled list, pulls out the packs its order file
+names, and puts them back on top in file order. So the game reads, lowest priority first:
+mods, then the packs the file does *not* name (alphabetically), then the named ones in file
+order — the last name in the file wins. Unnamed packs therefore lose to every named one.
+
+**5.x also loads the instance's own `datapacks/` folder** (`config/paxi-neoforge-1_21.toml`,
+on by default — CurseForge installs datapacks there), and looks an order-file name up there
+*before* its own folder. Packsmith neither lists nor writes those packs, but it must not drop
+their names from the order file when it saves one.
+
 **The directories appear lazily.** On a fresh install that has only reached the main menu,
 `config/paxi/` holds `resourcepacks/` and its order file and nothing else; `datapacks/`
 turns up once a world has been loaded. So a missing folder means "not yet", never "this
@@ -79,8 +90,9 @@ class PaxiProvider(PackLoaderProvider):
         found = sorted(child.name for child in root.iterdir()
                        if child.is_dir() or child.suffix.lower() in PACK_SUFFIXES)
         ordered = [name for name in self.load_order(instance_root, kind) if name in found]
-        # Anything not named in the order file loads after, in Paxi's own default order.
-        return ordered + [name for name in found if name not in ordered]
+        # Anything not named in the order file loads BEFORE the named ones, so every named
+        # pack overrides it (see the module notes). Listing it after would claim it wins.
+        return [name for name in found if name not in ordered] + ordered
 
     def _order_path(self, instance_root, kind: str) -> Path:
         singular = kind.rstrip("s")
@@ -99,6 +111,19 @@ class PaxiProvider(PackLoaderProvider):
         return [str(name) for name in order] if isinstance(order, list) else []
 
     def set_load_order(self, instance_root, order, kind="datapacks") -> None:
+        order = list(order)
+        # Names already in the file for packs Packsmith does not list — the instance's own
+        # `datapacks/` folder, which Paxi 5 orders too — keep their place after whatever
+        # name preceded them. The caller never saw them, so leaving them out is not a
+        # choice it made, and dropping one would quietly demote that pack. A pack it DID
+        # list and left out is unordered on purpose.
+        root = self._root_for(instance_root, kind)
+        listed = set(self.packs(instance_root, kind)) if root.is_dir() else set()
+        previous = None
+        for name in self.load_order(instance_root, kind):
+            if name not in order and name not in listed:
+                order.insert(order.index(previous) + 1 if previous in order else 0, name)
+            previous = name
         path = self._order_path(instance_root, kind)
         path.parent.mkdir(parents=True, exist_ok=True)
         # Paxi's own formatting: two-space indent, one key. Matching it keeps the file

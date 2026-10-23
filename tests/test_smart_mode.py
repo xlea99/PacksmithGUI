@@ -130,9 +130,10 @@ def test_packs_appear_under_their_category(panel):
 
 def test_packs_are_listed_in_load_order(panel):
     """With Paxi the order is a thing the user controls, so showing them alphabetically
-    would show something the game disagrees with."""
+    would show something the game disagrees with. Only `rei_removals` is named in the
+    order file, so `tweaks_create` loads first and `rei_removals` overrides it."""
     view, _, _ = panel
-    assert labels(categories(view)[0]) == ["rei_removals", "tweaks_create"]
+    assert labels(categories(view)[0]) == ["tweaks_create", "rei_removals"]
 
 
 def test_an_empty_category_says_how_to_fill_it(panel):

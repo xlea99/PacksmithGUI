@@ -111,7 +111,7 @@ id ~ galena ore</pre>
 <h2>Lists</h2>
 
 <pre>t:tier IN ("early", "mid")
-mod NOT IN ("minecraft", "forge")</pre>
+mod NOT IN ("minecraft", "forge", "neoforge")</pre>
 
 <h2>Has it been decided at all?</h2>
 

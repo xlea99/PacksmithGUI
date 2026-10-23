@@ -770,7 +770,8 @@ class _PackNamespace:
 
         `pack` is the pack's name, which comes from a `kind = "pack"` mapping the user
         bound to this step — never a literal (design 3.3, principle 5). `namespace` and
-        `path` are Minecraft's own, e.g. "minecraft" and "recipes/stone.json"."""
+        `path` are Minecraft's own, e.g. "minecraft" and "recipe/stone.json" — 1.21 made
+        the folder names singular (`recipes/` on 1.20.1), and the path is passed through as is."""
         if self._staging is None:
             raise CapabilityError(
                 f"{self._kind} capability is not available for this step (no file store)")

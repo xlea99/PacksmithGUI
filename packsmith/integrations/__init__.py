@@ -14,9 +14,12 @@ the four are documented wrongly upstream (Paxi's page describes a newer `config/
 layout, and Open Loader's own README points at the instance root rather than `config/`), so
 the docs were not a usable source. Mod ids come from each jar's `mods.toml`.
 
-**This set is explicitly for Minecraft 1.20.1.** Loaders move their own paths between game
-versions — Paxi already has — so a later version needs this re-verified, not assumed. Doing
-that properly means per-version layouts; today it means: check before trusting.
+**Re-verified on Minecraft 1.21.1 NeoForge (2026-10-23)** the same way, with Paxi 5.1.3,
+Open Loader 21.1.5, Moonlight 3.7.2 and Global Packs 21.0.6: each pack Packsmith created was
+confirmed loaded in-game, not just written. Paxi, Moonlight and Global Packs kept their
+1.20.1 layouts; Open Loader rewrote itself, and carries both layouts (see its module).
+Loaders move their own paths between game versions, so a further version needs this
+re-verified, not assumed.
 """
 from packsmith.integrations.globalpacks import GlobalPacksProvider
 from packsmith.integrations.moonlight import MoonlightProvider

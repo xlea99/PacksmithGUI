@@ -339,12 +339,16 @@ def resolve(packdump, *, loaders=(), preferred=None, instance_root=None) -> Reso
 # tool is plausibly used with are listed, and anything else falls back to the newest known
 # rather than guessing a number that would be wrong in a specific way.
 _PACK_FORMATS = {
-    "1.20.5": (41, 32), "1.20.4": (26, 22), "1.20.3": (26, 22),
+    "1.21.4": (61, 46), "1.21.3": (57, 42), "1.21.2": (57, 42),
+    "1.21.1": (48, 34), "1.21": (48, 34),
+    "1.20.6": (41, 32), "1.20.5": (41, 32), "1.20.4": (26, 22), "1.20.3": (26, 22),
     "1.20.2": (18, 18), "1.20.1": (15, 15), "1.20": (15, 15),
     "1.19.4": (12, 13), "1.19.3": (10, 12), "1.19": (10, 9),
     "1.18.2": (9, 8), "1.18": (8, 8),
 }
-_NEWEST_KNOWN = (15, 15)
+# Derived, not written: this used to be a literal that stayed at 1.20.1's numbers while
+# the table above grew, so every version newer than the table fell back to a 1.20.1 pack.
+_NEWEST_KNOWN = max(_PACK_FORMATS.values())
 
 
 def pack_format_for(mc_version: str, kind: str = "datapacks", *, client_jar=None) -> int:

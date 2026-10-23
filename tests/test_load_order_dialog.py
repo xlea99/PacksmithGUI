@@ -151,8 +151,8 @@ def test_both_kinds_are_saved_even_though_only_one_is_on_screen(world):
 
 
 def test_a_pack_added_outside_packsmith_still_appears(world):
-    """`packs()` returns the order file's entries first and everything else after, so a
-    folder dropped in by hand is listed rather than invisible."""
+    """A folder dropped in by hand is listed rather than invisible — first, because Paxi
+    loads every pack its order file does not name underneath the ones it does."""
     paxi, root = world
     paxi.create_pack(root, "delta")
-    assert rows(dialog_for(paxi, root)) == ["gamma", "alpha", "beta", "delta"]
+    assert rows(dialog_for(paxi, root)) == ["delta", "gamma", "alpha", "beta"]

@@ -140,12 +140,25 @@ def test_the_roots_are_where_paxi_actually_puts_things(instance):
 def test_packs_are_listed_in_load_order(instance):
     """Paxi's distinguishing feature is that order matters, so listing alphabetically
     would show something the game disagrees with."""
+    assert PaxiProvider().packs(instance, "datapacks") == ["tweaks_create", "rei_removals"]
+
+
+def test_packs_not_named_in_the_order_file_load_first(instance):
+    """Paxi puts the named packs back on top of everything else, so an unnamed pack loses
+    to every named one — in 4.0 and 5.1.3 alike. Listed after them, the load order dialog
+    ("later packs override earlier ones") and the texture search would both say it wins."""
+    PaxiProvider().set_load_order(instance, ["tweaks_create"], "datapacks")
     assert PaxiProvider().packs(instance, "datapacks") == ["rei_removals", "tweaks_create"]
 
 
-def test_packs_not_named_in_the_order_file_come_after(instance):
-    PaxiProvider().set_load_order(instance, ["tweaks_create"], "datapacks")
-    assert PaxiProvider().packs(instance, "datapacks") == ["tweaks_create", "rei_removals"]
+def test_saving_an_order_keeps_names_packsmith_does_not_list(instance):
+    """Paxi 5 also orders packs from the instance's own `datapacks/` folder, which
+    Packsmith does not list. Saving the order it does show must not drop those names."""
+    paxi = PaxiProvider()
+    paxi.set_load_order(instance, ["from_base", "rei_removals", "also_base"], "datapacks")
+    paxi.set_load_order(instance, ["tweaks_create", "rei_removals"], "datapacks")
+    assert paxi.load_order(instance, "datapacks") == [
+        "from_base", "tweaks_create", "rei_removals", "also_base"]
 
 
 def test_zips_count_as_packs(instance):

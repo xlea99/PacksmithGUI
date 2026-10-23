@@ -32,11 +32,10 @@ provider that cannot deliver it, which is precisely the silent-wrong-result the 
 split exists to prevent. A richer integration could register each pack as its own config
 entry and earn the capability honestly; that is a bigger change than this is worth today.
 
-**One thing still unverified:** whether a `required` entry names a pack *directly* or a
-folder *containing* packs. Every other loader means the latter, the mod is described as
-"a folder into which you can add all the datapacks you want", and the generated folders are
-empty containers — so that is the reading implemented here. Worth two minutes in-game to
-confirm before anyone relies on it.
+**A `required` entry names a folder *containing* packs**, not a pack. Confirmed in-game on
+1.21.1 (Global Packs 21.0.6, which generates the same toml and folders as 1.20.1): a pack
+created inside `global_packs/required_data/` loaded, and its registry entries appeared in
+the packdump.
 """
 import json
 import tomllib

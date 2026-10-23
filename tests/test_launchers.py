@@ -146,7 +146,8 @@ def test_the_jar_overrules_the_table(tmp_path):
     jar = make_jar(tmp_path / "j.jar", version="1.99", data=77, resource=66)
     assert pack_format_for("1.99", "datapacks", client_jar=jar) == 77
     assert pack_format_for("1.99", "resourcepacks", client_jar=jar) == 66
-    assert pack_format_for("1.99", "datapacks") == 15, "the table's fallback, unaided"
+    assert pack_format_for("1.99", "datapacks") == 61, "the table's newest, unaided"
+    assert pack_format_for("1.21.1", "datapacks") == 48
 
 
 def test_an_older_single_number_format_is_understood(tmp_path):

@@ -2,7 +2,8 @@
 
 Minecraft has no vanilla global datapack mechanism, so every override workflow runs through
 one of these mods. All four layouts here were **verified by installing the mods on a real
-1.20.1 Forge instance** and reading the folders and configs they generated. That mattered:
+1.20.1 Forge instance** and reading the folders and configs they generated, then again on
+1.21.1 NeoForge, where Open Loader turned out to have rewritten its layout entirely. That mattered:
 two of the four are documented wrongly upstream — Paxi's CurseForge page describes a newer
 `config/_paxi_/`, and Open Loader's own README on the 1.20.1 branch points at the instance
 root rather than `config/`. Building from either would have written into a directory the
@@ -72,7 +73,7 @@ def test_detection_survives_a_pack_with_no_loader_at_all():
 
 @pytest.mark.parametrize("provider, expected", [
     (PaxiProvider(), "config/paxi/datapacks"),
-    (OpenLoaderProvider(), "config/openloader/data"),
+    (OpenLoaderProvider(), "config/openloader/packs"),
     (GlobalPacksProvider(), "global_packs/required_data"),
 ])
 def test_datapack_roots_match_the_installed_mods(tmp_path, provider, expected):
@@ -81,7 +82,7 @@ def test_datapack_roots_match_the_installed_mods(tmp_path, provider, expected):
 
 @pytest.mark.parametrize("provider, expected", [
     (PaxiProvider(), "config/paxi/resourcepacks"),
-    (OpenLoaderProvider(), "config/openloader/resources"),
+    (OpenLoaderProvider(), "config/openloader/packs"),
     (GlobalPacksProvider(), "global_packs/required_resources"),
 ])
 def test_resourcepack_roots_match_the_installed_mods(tmp_path, provider, expected):
@@ -118,9 +119,9 @@ def test_moonlight_has_no_resource_packs_at_all(tmp_path):
 
 
 def test_open_loader_can_have_one_kind_switched_off(tmp_path):
-    """`advanced_options.json` toggles data and resource packs independently, so "installed"
-    is not the same fact as "available" — and the granularity is per capability, which is
-    what §7.1 argues for."""
+    """`advanced_options.json` (19.x) toggles data and resource packs independently, so
+    "installed" is not the same fact as "available" — and the granularity is per capability,
+    which is what §7.1 argues for."""
     options = tmp_path / "config" / "openloader"
     options.mkdir(parents=True)
     (options / "advanced_options.json").write_text(json.dumps({
@@ -130,6 +131,66 @@ def test_open_loader_can_have_one_kind_switched_off(tmp_path):
     offered = OpenLoaderProvider().available_capabilities(tmp_path)
     assert DATAPACKS_WRITE in offered
     assert RESOURCEPACKS_WRITE not in offered
+
+
+def test_open_loader_21_switches_kinds_off_in_its_own_options_file(tmp_path):
+    """21.x renamed the file and every key in it. Reading the old keys from the new file
+    would find nothing and report both kinds on, whatever the user set."""
+    options = tmp_path / "config" / "openloader"
+    options.mkdir(parents=True)
+    (options / "options.json").write_text(json.dumps({
+        "load_data_packs": {"value": False}, "load_resource_packs": {"value": True}}),
+        encoding="utf-8")
+
+    offered = OpenLoaderProvider().available_capabilities(tmp_path)
+    assert DATAPACKS_WRITE not in offered
+    assert RESOURCEPACKS_WRITE in offered
+
+
+def test_open_loader_layout_follows_the_files_the_mod_generated(tmp_path):
+    """19.x reads `data/` and `resources/`; 21.x reads one `packs/`. Writing into the other
+    version's folder succeeds and is never loaded. An instance carried forward from 1.20.1
+    keeps its old folders beside the new ones, and only the new ones load."""
+    loader = OpenLoaderProvider()
+    root = tmp_path / "config" / "openloader"
+    (root / "data").mkdir(parents=True)
+    (root / "advanced_options.json").write_text("{}", encoding="utf-8")
+    assert loader.datapack_root(tmp_path) == root / "data"
+    assert loader.resourcepack_root(tmp_path) == root / "resources"
+
+    (root / "options.json").write_text("{}", encoding="utf-8")
+    assert loader.datapack_root(tmp_path) == root / "packs"
+    assert loader.resourcepack_root(tmp_path) == root / "packs"
+
+
+def test_open_loader_21_lists_a_pack_under_the_kinds_its_contents_make_it(tmp_path):
+    """One folder holds both kinds, and the mod decides by what a pack carries. Listing every
+    folder under both would offer a datapack as a resource pack to write into — a write the
+    game reads as nothing, since nothing in it is `assets/`."""
+    import zipfile
+    loader = OpenLoaderProvider()
+    packs = loader.datapack_root(tmp_path)
+    (packs / "only_data" / "data").mkdir(parents=True)
+    (packs / "only_assets" / "assets").mkdir(parents=True)
+    (packs / "both" / "data").mkdir(parents=True)
+    (packs / "both" / "assets").mkdir(parents=True)
+    with zipfile.ZipFile(packs / "zipped.zip", "w") as archive:
+        archive.writestr("pack.mcmeta", "{}")
+        archive.writestr("assets/x/lang/en_us.json", "{}")
+
+    assert loader.packs(tmp_path, "datapacks") == ["both", "only_data"]
+    assert loader.packs(tmp_path, "resourcepacks") == ["both", "only_assets", "zipped.zip"]
+
+
+def test_open_loader_21_adding_the_other_half_keeps_the_first_manifest(tmp_path):
+    """A resource pack and a datapack of one name are one folder in 21.x. Creating the
+    second must not rewrite the manifest the first was made with."""
+    loader = OpenLoaderProvider()
+    folder = loader.create_pack(tmp_path, "shared", "datapacks", pack_format=48)
+    loader.create_pack(tmp_path, "shared", "resourcepacks", pack_format=34)
+    manifest = json.loads((folder / "pack.mcmeta").read_text(encoding="utf-8"))
+    assert manifest["pack"]["pack_format"] == 48
+    assert (folder / "data").is_dir() and (folder / "assets").is_dir()
 
 
 def test_open_loader_with_no_config_yet_assumes_its_defaults(tmp_path):
