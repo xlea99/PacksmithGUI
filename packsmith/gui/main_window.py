@@ -3057,6 +3057,9 @@ class MainWindow(QMainWindow):
         Views panel and is untouched."""
         self._tab_models.pop(widget, None)
         self._tab_views.pop(widget, None)
+        self._tab_bars.pop(widget, None)
+        self._tab_base_queries.pop(widget, None)
+        self._tab_totals.pop(widget, None)
         # A closed tab is owed nothing, and a deleted widget left in the set would keep it
         # growing for the life of the session.
         self._stale_tabs.discard(widget)
@@ -3072,36 +3075,86 @@ class MainWindow(QMainWindow):
                 del self._open_tabs[key]
 
     def _edit_view(self, view):
-        """Edit a saved View's query, from the Views panel's context menu.
+        """Edit a saved View — name, columns and filter — from the Views panel.
 
         Keyed on the **View**, not on an open tab: editing a View is something you do to
         the View, and it should not require having opened it first. If it happens to be
-        open, the tab is re-run in place so you are not looking at a stale table.
+        open, the tab follows: a filter-only edit re-runs in place, keeping your scroll;
+        a column edit rebuilds the tab where it sits, because the columns are what the
+        table, its delegates and its header were all built from.
 
         This replaced a ⚙ beside the open table's filter bar, which was genuinely
         misleading — the two sat inches apart, both were about queries, and only one of
         them changed what the saved View *is*.
         """
-        dlg = QueryConstructorDialog(self._tags, view.query.scope.type,
-                                     query=view.query, parent=self)
+        dlg = QueryConstructorDialog(
+            self._tags, query=view.query, view_store=self._views, parent=self,
+            packdump=self._packdump, view_name=view.name, view_id=view.id,
+            create_tag=self._tag_from_view_dialog)
         if not dlg.exec():
             return
-        updated = dataclasses.replace(view.query, filter=dlg.result_filter)
+        updated = dlg.result_query
+        if dlg.result_name and dlg.result_name != view.name:
+            try:
+                self._views.rename(view.id, dlg.result_name)
+            except ValueError as e:
+                QMessageBox.warning(self, "Can't rename view", str(e))
+                return
         self._views.update_query(view.id, updated)
         self._reload_views()
+        fresh = self._views.get(view.id)
 
         tab = self._open_tabs.get(("view", view.id))
+        if tab is not None and fresh.name != view.name:
+            self._workspace.set_tab_title(tab, fresh.name)
         model = self._tab_models.get(tab) if tab is not None else None
-        if model is not None:
+        if model is None and tab is not None and updated == view.query:
+            self._tab_views[tab] = fresh           # renamed at most; nothing to rebuild
+            self._bottom.set_status(f"Edited '{fresh.name}'")
+        elif tab is not None and (model is None
+                                  or list(updated.select) != list(view.query.select)):
+            self._reopen_view_tab(fresh)
+            self._bottom.set_status(f"Edited '{fresh.name}'")
+        elif model is not None:
+            self._tab_views[tab] = fresh
             model.set_filter(dlg.result_filter)
             self._tab_base_queries[tab] = updated
             self._tab_totals[tab] = model.rowCount()
             bar = self._tab_bars.get(tab)
             if bar is not None:
                 bar.report(model.rowCount(), model.rowCount())
-            self._bottom.set_status(f"{view.name} — {model.rowCount():,} rows")
+            self._bottom.set_status(f"{fresh.name} — {model.rowCount():,} rows")
         else:
-            self._bottom.set_status(f"Edited '{view.name}'")
+            self._bottom.set_status(f"Edited '{fresh.name}'")
+
+    def _reopen_view_tab(self, view):
+        """Rebuild an open View's tab in place — same position, same focus.
+
+        Closed through the workspace so every per-tab map is cleaned up by the one handler
+        that already does it, then opened the ordinary way, which restores the filter bar,
+        widths and sort from their name-keyed stores. A column that was removed simply has
+        no width to restore.
+        """
+        key = ("view", view.id)
+        old = self._open_tabs.get(key)
+        if old is None:
+            return None
+        index = self._workspace.index_of(old)
+        current = self._workspace.current_widget()
+        self._workspace.close_widget(old)
+        if self._open_tabs.get(key) is old:
+            return None                         # the close was refused (unsaved work)
+        tab = self._open_view(view)
+        self._workspace.move_widget(tab, index)
+        if current is not old and current is not None:
+            self._workspace.focus_widget(current)
+        return tab
+
+    def _tag_from_view_dialog(self, registry, suggested):
+        """The View dialog's "＋ New tag": the ordinary wizard, pinned to the View's
+        registry — a column can only show a tag on the registry it lists."""
+        return self._define_tag(registry, suggested,
+                                parent=QApplication.activeModalWidget(), lock_registry=True)
 
     def _new_view(self):
         """Author a new View: saved to the database, filed in the Views panel, opened."""
@@ -3109,7 +3162,8 @@ class MainWindow(QMainWindow):
         dlg = QueryConstructorDialog(
             self._tags, "minecraft:item" if "minecraft:item" in registries
             else (registries[0] if registries else "minecraft:item"),
-            new_view=True, view_store=self._views, parent=self, registries=registries)
+            new_view=True, view_store=self._views, parent=self, registries=registries,
+            packdump=self._packdump, create_tag=self._tag_from_view_dialog)
         if not dlg.exec():
             return
         try:
@@ -3186,20 +3240,31 @@ class MainWindow(QMainWindow):
     def _new_tag(self):
         """Create a tag definition — the user's vocabulary (§3.2.1). Creation only:
         rename and retype are governed by rules whose ceremony isn't built yet."""
+        self._define_tag("minecraft:item")
+
+    def _define_tag(self, registry, name="", *, parent=None, lock_registry=False):
+        """Run the tag wizard and define what it returns. The tag's name, or None.
+
+        One path for every place a tag can be born — the Tags panel and the View dialog's
+        "＋ New tag" — so a tag made mid-view is exactly the tag the panel would have made,
+        with the same collision check and the same status line.
+        """
         registries = sorted(self._packdump.registry.keys())
-        dlg = TagCreateDialog(registries, tag_store=self._tags,
-                              preferred_registry="minecraft:item", parent=self)
+        dlg = TagCreateDialog(registries, tag_store=self._tags, preferred_registry=registry,
+                              name=name, lock_registry=lock_registry,
+                              parent=parent or self)
         if not dlg.exec():
-            return
+            return None
         try:
             self._tags.define(dlg.result_registry, dlg.result_name, dlg.result_type,
                               enum_values=dlg.result_enum_values, default=dlg.result_default)
         except ValueError as e:
-            QMessageBox.warning(self, "Can't create tag", str(e))
-            return
+            QMessageBox.warning(parent or self, "Can't create tag", str(e))
+            return None
         self._tags_panel.refresh()
         self._bottom.set_status(
             f"Created tag '{dlg.result_name}' ({dlg.result_type}) on {dlg.result_registry}")
+        return dlg.result_name
 
     def _edit_enum_values(self, registry_type, tag_name):
         """Add / remove / reorder an enum tag's values (§3.2.1). The dialog owns the

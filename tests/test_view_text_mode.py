@@ -85,8 +85,8 @@ def test_the_tag_column_rides_along(tags, qapp):
     dlg = dialog(tags)
     dlg._toggle_mode()
     dlg._text_edit.setText(LEFTOVERS)
-    for label, check in dlg._col_checks.items():
-        check.setChecked(label in ("id", "remove"))
+    dlg._columns.remove("a:localization")
+    assert dlg.add_column("t:remove")
     dlg.accept()
 
     assert [getattr(f, "name", "id") for f in dlg.result_query.select] == ["id", "remove"]

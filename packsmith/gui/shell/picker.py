@@ -113,10 +113,18 @@ class _TwoLineDelegate(QStyledItemDelegate):
         # different thoughts. (The plain single-line list still elides ids in the middle,
         # where both ends carry meaning.)
         painter.setFont(option.font)
-        painter.setPen(QColor("#ffffff" if selected else style.TEXT))
-        top = box.adjusted(0, 0, 0, -box.height() // 2)
+        # A row may carry its own colour (the picker's "＋ New …" row does); selection wins.
+        own = index.data(Qt.ForegroundRole)
+        painter.setPen(QColor("#ffffff") if selected
+                       else own.color() if own is not None else QColor(style.TEXT))
+        # A row with no second line is centred in the whole row, not left hanging in the top
+        # half over an empty strip.
+        top = box.adjusted(0, 0, 0, -box.height() // 2) if detail else box
         painter.drawText(top, Qt.AlignLeft | Qt.AlignVCenter,
                          option.fontMetrics.elidedText(label, Qt.ElideRight, top.width()))
+        if not detail:
+            painter.restore()
+            return
 
         # Measured with the font it is DRAWN in. `option.fontMetrics` describes the default
         # font, and this line is a point smaller — measured on a real row, the same string
@@ -157,9 +165,14 @@ class PickerPopup(QFrame):
     # waits for deferred deletion — so an owner clearing its reference on that alone
     # keeps pointing at a retired picker for an unpredictable number of event turns.
     dismissed = Signal()
+    # The typed text, when the trailing "＋ New …" row is picked (see `create`). A separate
+    # signal rather than a sentinel through `chosen`: a listener wired for values would
+    # otherwise receive a name that is not one of them and do something plausible with it.
+    create_requested = Signal(str)
 
     def __init__(self, items, *, header="", placeholder="type to narrow", parent=None,
-                 match=None, attach=None, dock=None, inline=None):
+                 match=None, attach=None, dock=None, inline=None, create=None,
+                 searchable=None):
         # Two different windows, decided here rather than flipped later: changing the flags
         # afterwards recreates the native window, and this frame should never spend even one
         # moment being an ordinary decorated window.
@@ -212,6 +225,11 @@ class PickerPopup(QFrame):
         self._choices = [_as_choice(t) for t in items]
         self._attached = None      # a text box driving this list, in attached mode
         self._done = False         # itemActivated and itemClicked can both fire on one click
+        # `create` is a noun ("tag"): when given, the list always ends in "＋ New tag …",
+        # carrying whatever was typed. The search you just ran is the best guess at the
+        # name of the thing you found missing, so it becomes the name rather than making
+        # you type it a second time in the dialog that follows.
+        self._create = create
         self.setFrameShape(QFrame.NoFrame if self._inline else QFrame.StyledPanel)
         if not self._inline:
             # Inline, the cap is wrong twice over: it stops the list filling its panel, and
@@ -251,7 +269,11 @@ class PickerPopup(QFrame):
         # except inline, where the panel exists TO be typed into and a box that comes and
         # goes with the list length reads as a bug.
         # Ordered after addWidget deliberately: see the note above.
-        self._filter.setVisible(self._inline or len(items) >= _FILTER_THRESHOLD)
+        # `searchable` overrides the threshold either way, and creating always needs the box:
+        # the typed text IS the new thing's name.
+        if searchable is None:
+            searchable = self._inline or len(items) >= _FILTER_THRESHOLD
+        self._filter.setVisible(bool(searchable or create))
 
         self._list = QListWidget(self)
         self._list.setTextElideMode(Qt.ElideMiddle)
@@ -387,19 +409,49 @@ class PickerPopup(QFrame):
             item.setToolTip("\n".join(filter(None, (choice.label, choice.detail)))
                             or choice.label)   # elided in the row, whole in the tooltip
             self._list.addItem(item)
+        if self._create:
+            self._add_create_row(text.strip(), matched)
         if self._list.count():
             self._list.setCurrentRow(0)
 
         if not matched:
-            self._footer.setText("nothing matches")
+            self._footer.setText("nothing matches" if not self._create
+                                 else f"no {self._create} by that name yet")
         elif len(matched) > _MAX_ROWS:
             self._footer.setText(
                 f"showing {_MAX_ROWS} of {len(matched):,} — keep typing")
         else:
             self._footer.setText(f"{len(matched):,}")
 
+    _CREATE_ROLE = Qt.UserRole + 4
+
+    def _add_create_row(self, text: str, matched):
+        """The trailing "＋ New …" row. Last, so the top match keeps Enter — you asked for
+        something that exists far more often than for something that doesn't. When nothing
+        matches it is the ONLY row, so Enter creates, which is exactly what a search that
+        came up empty is asking for.
+
+        Omitted when the text already names a row exactly: offering to create a thing that
+        is right there invites a duplicate the next dialog would only refuse.
+        """
+        if text and any(c.label == text for c in matched):
+            return
+        label = f"＋  New {self._create} “{text}”…" if text else f"＋  New {self._create}…"
+        item = QListWidgetItem(label)
+        item.setData(self._CREATE_ROLE, text)
+        item.setData(Qt.UserRole + 2, "")
+        item.setForeground(QColor(style.ACCENT_EDGE))
+        self._list.addItem(item)
+
     def _pick(self, item):
         if item is None or item.isHidden() or self._done:
+            return
+        created = item.data(self._CREATE_ROLE)
+        if created is not None:
+            self._done = True
+            if not self._inline:
+                self.close()
+            self.create_requested.emit(created)
             return
         self._done = True
         # Closed before the signal: a listener that writes the chosen value back into the

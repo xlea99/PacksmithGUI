@@ -278,6 +278,18 @@ class Workspace(QWidget):
         self._tabs.setCurrentIndex(idx)
         return True
 
+    def index_of(self, widget) -> int:
+        return self._tabs.indexOf(widget)
+
+    def move_widget(self, widget, index: int):
+        """Put an open tab at `index` — how a rebuilt tab goes back where it was."""
+        current = self._tabs.indexOf(widget)
+        if current < 0 or index < 0:
+            return
+        index = min(index, self._tabs.count() - 1)
+        if current != index:
+            self._tabs.tabBar().moveTab(current, index)
+
     def set_tab_icon(self, widget, icon):
         idx = self._tabs.indexOf(widget)
         if idx >= 0:

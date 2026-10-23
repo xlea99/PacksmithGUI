@@ -208,7 +208,7 @@ class TagCreateDialog(QDialog):
     """Create a tag definition. On accept, the ``result_*`` attributes hold the inputs."""
 
     def __init__(self, registries: list[str], *, tag_store=None, preferred_registry=None,
-                 parent=None):
+                 name="", lock_registry=False, parent=None):
         super().__init__(parent)
         self.setWindowTitle("New Tag")
         self.setMinimumWidth(460)
@@ -231,9 +231,12 @@ class TagCreateDialog(QDialog):
         self._registry.addItems(registries)
         if preferred_registry in registries:
             self._registry.setCurrentText(preferred_registry)
+        # Locked when the caller is building something on one registry already — a View's
+        # column can only ever show a tag on the registry that View lists.
+        self._registry.setEnabled(not lock_registry)
         form.addRow("Registry", self._registry)
 
-        self._name = QLineEdit()
+        self._name = QLineEdit(name or "")
         self._name.setPlaceholderText("remove")
         form.addRow("Name", self._name)
 
