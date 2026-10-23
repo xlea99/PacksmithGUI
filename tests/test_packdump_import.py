@@ -51,7 +51,7 @@ def profile(tmp_path):
 
 @pytest.fixture
 def source(tmp_path):
-    return write_dump(tmp_path / "instance" / "packsmith")
+    return write_dump(tmp_path / "instance" / "packdump")
 
 
 def test_first_import_adopts_the_dump(profile, source):
@@ -150,10 +150,25 @@ def test_check_does_not_mutate_anything(profile, source):
 
 
 def test_a_missing_dump_is_reported_not_raised(profile, tmp_path):
-    """The instance may simply never have had the Forge mod run in it."""
+    """The instance may simply never have had the mod run in it."""
     result = import_packdump(profile)
     assert result.status == "missing"
-    assert "packsmith" in result.reason
+    assert str(profile.mc_path / "packdump") in result.reason
+
+
+def test_the_renamed_folder_wins_and_the_old_one_still_reads(profile, tmp_path):
+    """The mod wrote to `packsmith/` before it was renamed packdump. An instance that ran
+    both builds has the stale old folder beside the fresh one, and reading the old one
+    would quietly roll the profile back to an outdated registry."""
+    instance = tmp_path / "instance"
+    write_dump(instance / "packsmith", items=("minecraft:stone",))
+    assert import_packdump(profile).status == "imported"
+    assert current_packdump(profile).registry["minecraft:item"]["count"] == 1
+
+    write_dump(instance / "packdump", items=("minecraft:stone", "minecraft:dirt"),
+               generated="2026-08-09T13:00:00+00:00")
+    assert import_packdump(profile).status == "imported"
+    assert current_packdump(profile).registry["minecraft:item"]["count"] == 2
 
 
 def test_a_corrupt_dump_is_unreadable_not_missing(profile, source):

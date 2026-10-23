@@ -184,10 +184,10 @@ def test_the_gui_accepts_the_version_the_mod_stamps():
     Read out of the Java source rather than restated here, because a copy of the number is
     a third place for it to drift.
     """
-    java = (Path.home() / "IdeaProjects" / "Packsmith" / "src" / "main" / "java" /
-            "net" / "xlea99" / "packsmith" / "dump" / "DumpSchema.java")
+    java = (Path.home() / "IdeaProjects" / "packdump" / "src" / "main" / "java" /
+            "net" / "xlea99" / "packdump" / "dump" / "DumpSchema.java")
     if not java.is_file():
-        pytest.skip("the Forge mod repo is not checked out beside this one")
+        pytest.skip("the packdump mod repo is not checked out beside this one")
 
     stamped = int(re.search(r"VERSION\s*=\s*(\d+)", java.read_text(encoding="utf-8")).group(1))
     assert stamped in _VALID_SCHEMAS, (

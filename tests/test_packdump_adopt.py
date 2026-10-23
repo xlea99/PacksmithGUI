@@ -41,7 +41,7 @@ def qapp():
 
 def write_dump(path, *, items=("minecraft:stone", "minecraft:dirt"), mods=("alpha",),
                generated="2026-08-09T12:00:00+00:00"):
-    """A packdump on disk, as the Forge mod would leave it."""
+    """A packdump on disk, as the mod would leave it."""
     (path / "registries").mkdir(parents=True, exist_ok=True)
     (path / "attributes").mkdir(parents=True, exist_ok=True)
     (path / "meta.json").write_text(json.dumps({
@@ -69,8 +69,8 @@ def window():
     from packsmith.gui.main_window import MainWindow
 
     instance = pathlib.Path(tempfile.mkdtemp()) / "instance"
-    (instance / "packsmith").mkdir(parents=True)
-    write_dump(instance / "packsmith")
+    (instance / "packdump").mkdir(parents=True)
+    write_dump(instance / "packdump")
     try:
         delete_profile(PROFILE)
     except Exception:
@@ -101,7 +101,7 @@ def new_dump_arrives(win, *, adopted=True, **kwargs):
     kwargs.setdefault("items", ("minecraft:stone", "minecraft:dirt", "minecraft:glass"))
     kwargs.setdefault("generated", "2026-08-09T13:00:00+00:00")
     before = win._packdump
-    write_dump(win._instance_path / "packsmith", **kwargs)
+    write_dump(win._instance_path / "packdump", **kwargs)
     win._check_for_new_packdump()
     if adopted:
         assert win._packdump is not before, "no import happened; the test proves nothing"

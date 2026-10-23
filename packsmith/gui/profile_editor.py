@@ -6,7 +6,7 @@ is a different world, which is why the window rebuilds around it.
 
 The one piece of real cleverness here is that **New Profile reads the instance's packdump
 to fill in its own contract**. The loader and version aren't trivia the user should have to
-recite; they are facts about the folder they just picked, and the Forge mod already wrote
+recite; they are facts about the folder they just picked, and the packdump mod already wrote
 them down. Asking would only create an opportunity to get it wrong.
 """
 import json
@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
     QTreeWidgetItem,
 )
 
+from packsmith.core.packdump import instance_dump_dir
 from packsmith.core.profile import MC_VERSION_POLICIES, list_profiles, Profile
 from packsmith.gui.shell import style
 from packsmith.gui.shell.tree import PanelTree
@@ -43,7 +44,7 @@ def read_instance_contract(mc_path) -> dict:
     this runs while the user is still typing a path, and a half-written or unreadable dump
     should leave the fields blank, not raise at them.
     """
-    meta_path = Path(mc_path) / "packsmith" / "meta.json"
+    meta_path = instance_dump_dir(mc_path) / "meta.json"
     if not meta_path.is_file():
         return {}
     try:

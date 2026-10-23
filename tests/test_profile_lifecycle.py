@@ -61,7 +61,7 @@ def with_packdump(instance):
     Without one `MainWindow` stops at the gated shell (§3.1) and never reaches the code
     that used to seed — so a seed test without this would pass for the wrong reason.
     """
-    dump = instance / "packsmith"
+    dump = instance / "packdump"
     (dump / "registries").mkdir(parents=True, exist_ok=True)
     (dump / "attributes").mkdir(parents=True, exist_ok=True)
     (dump / "meta.json").write_text(json.dumps({

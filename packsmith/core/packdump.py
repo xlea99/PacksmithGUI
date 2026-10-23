@@ -831,10 +831,26 @@ class ImportResult:
         return len(mods.get("only_in_other", [])), len(mods.get("only_in_self", []))
 
 
+def instance_dump_dir(mc_path) -> Path:
+    """The folder in an instance the mod writes its dump to.
+
+    ``packdump/``, or ``packsmith/`` from builds of the mod before it was renamed packdump
+    (2026-10). The new name wins when both are present: an instance that has run both
+    builds has a stale ``packsmith/`` beside the fresh dump, and importing it would quietly
+    roll the profile back. With neither, the new name, so "missing" points where a dump
+    will appear.
+    """
+    mc_path = Path(mc_path)
+    current, legacy = mc_path / "packdump", mc_path / "packsmith"
+    if not (current / "meta.json").exists() and (legacy / "meta.json").exists():
+        return legacy
+    return current
+
+
 def check_packdump(profile: Profile, source_path: Path = None) -> ImportResult:
     """Look at what's on disk without adopting it. Same decision as ``import_packdump``
     makes, minus the side effects — used to poll on window focus without importing."""
-    source_path = source_path or (profile.mc_path / "packsmith")
+    source_path = source_path or instance_dump_dir(profile.mc_path)
     current = current_packdump(profile)
     if not (source_path / "meta.json").exists():
         return ImportResult("missing", current,
@@ -843,7 +859,7 @@ def check_packdump(profile: Profile, source_path: Path = None) -> ImportResult:
         incoming = Packdump.load(source_path)
     except Exception as e:
         # "unreadable", not "missing" — a corrupt or half-written dump is a different
-        # problem from an instance the Forge mod has never run in, and conflating them
+        # problem from an instance the mod has never run in, and conflating them
         # would send the user looking in the wrong place.
         return ImportResult("unreadable", current, reason=str(e))
 
@@ -874,7 +890,7 @@ def import_packdump(profile: Profile, source_path: Path = None, *, force: bool =
     theirs. ``force`` overrides, and exists only because a check we got wrong shouldn't be
     a dead end.
     """
-    source_path = source_path or (profile.mc_path / "packsmith")
+    source_path = source_path or instance_dump_dir(profile.mc_path)
     checked = check_packdump(profile, source_path)
     if checked.status in ("unchanged", "missing", "unreadable"):
         return checked

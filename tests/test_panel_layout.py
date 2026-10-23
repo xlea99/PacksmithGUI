@@ -144,7 +144,7 @@ def window(state_dir, monkeypatch):
 
     name = "panel_layout_probe"
     instance = pathlib.Path(tempfile.mkdtemp()) / "instance"
-    dump = instance / "packsmith"
+    dump = instance / "packdump"
     (dump / "registries").mkdir(parents=True)
     (dump / "attributes").mkdir(parents=True)
     (dump / "meta.json").write_text(jsonlib.dumps({
