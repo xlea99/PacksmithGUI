@@ -520,6 +520,10 @@ class MainWindow(QMainWindow):
                                                      f"{key}\n\n{why}"))
             self._editor_host.edit_blocked.connect(self._offer_unlock)
             self._editor_host.unlocked.connect(self._on_unlocked)
+            self._editor_host.disk_reloaded.connect(self._on_disk_reloaded)
+            self._editor_host.disk_conflict.connect(self._on_disk_conflict)
+            self._editor_host.disk_resolved.connect(self._on_disk_resolved)
+            self._editor_host.compare_ready.connect(self._open_disk_compare)
         else:
             self._editor_host.rebind(sources)
 
@@ -2062,6 +2066,9 @@ class MainWindow(QMainWindow):
             self._set_status(f"{Path(path).name} — can't be opened as text ({e})")
             return tab
         tab.unlock_requested.connect(self._request_unlock)
+        tab.reload_requested.connect(self._editor_host.reload_from_disk)
+        tab.compare_requested.connect(self._editor_host.request_compare)
+        tab.keep_requested.connect(self._editor_host.keep_mine)
         self._workspace.add_tab(tab, Path(path).name, icon=self._tab_icon(source, path))
         self._open_tabs[("doc", key)] = tab
         tab.activate()
@@ -2935,6 +2942,49 @@ class MainWindow(QMainWindow):
             # §6.2: "editing is the gesture that tracks it" — the first keystroke claims
             # the file, so the tab turns yours now rather than waiting for a save.
             self._refresh_tab_icons()
+
+    # --- the disk, changing under open documents (design 6.3) ------------------------
+
+    def _on_disk_reloaded(self, key):
+        tab = self._open_tabs.get(("doc", key))
+        if tab is None:
+            return
+        tab.clear_disk_change()
+        # Said for the tab in front only: a background tab quietly catching up is the
+        # point, and a status line for every config the game rewrites on exit is noise.
+        if self._workspace.current_widget() is tab:
+            self._set_status(f"Reloaded {Path(tab.path).name} — it changed on disk")
+
+    def _on_disk_conflict(self, key, deleted):
+        tab = self._open_tabs.get(("doc", key))
+        if tab is None:
+            return
+        tab.show_disk_change(deleted)
+        what = "was deleted on disk" if deleted else "changed on disk under your unsaved edits"
+        self._set_status(f"{Path(tab.path).name} {what}")
+
+    def _on_disk_resolved(self, key):
+        tab = self._open_tabs.get(("doc", key))
+        if tab is not None:
+            tab.clear_disk_change()
+
+    def _open_disk_compare(self, key, disk_text, buffer_text):
+        """The disk's version beside the unsaved buffer — what the game changed, against
+        what you were about to save. Replaced rather than focused when already open: the
+        point is the current state of both sides, and an old pair would answer the wrong
+        question."""
+        _source, path = self._editor_host.split_key(key)
+        tab_key = ("diskdiff", key)
+        existing = self._open_tabs.pop(tab_key, None)
+        if existing is not None:
+            self._workspace.close_widget(existing)
+        tab = DiffTab(self._editor_host, f"diskdiff:{key}", path,
+                      left="on disk now", right="your unsaved edits",
+                      original=disk_text, modified=buffer_text)
+        self._workspace.add_tab(tab, f"Disk vs edits: {Path(path).name}",
+                                icon=icons.file_icon(Path(path).name, colour=style.WARNING))
+        self._open_tabs[tab_key] = tab
+        return tab
 
     def _on_document_saved(self, key):
         source, path = self._editor_host.split_key(key)

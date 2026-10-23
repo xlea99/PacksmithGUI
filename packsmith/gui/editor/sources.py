@@ -41,6 +41,11 @@ class DocumentSource:
         """Why this document can't be edited, or None if it can."""
         return None
 
+    def disk_path(self, path: str):
+        """The file on disk this document IS, or None when it has none to watch — a member
+        of a jar, say. The editor watches it for changes made outside Packsmith."""
+        return None
+
     def can_unlock(self, path: str) -> bool:
         """True when the user is *allowed* to lift the lock (and we should offer to)."""
         return False
@@ -64,6 +69,9 @@ class InstanceFileSource(DocumentSource):
 
     def read(self, path):
         return self._files.read(path)
+
+    def disk_path(self, path):
+        return Path(self._files.root) / path
 
     def write(self, path, content):
         """Save — refusing if an action has taken the file since this buffer was read.
@@ -139,6 +147,9 @@ class PackageFileSource(DocumentSource):
     def read(self, path):
         target = self._abs(path)
         return target.read_text(encoding="utf-8") if target.is_file() else None
+
+    def disk_path(self, path):
+        return self._abs(path)
 
     def write(self, path, content):
         target = self._abs(path)

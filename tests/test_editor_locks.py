@@ -25,6 +25,7 @@ def host(tags, tmp_path):
     host._sources = {"instance": InstanceFileSource(files)}
     host._opened = {"instance:cfg.json"}
     host._locked = set()
+    host._followers = {}
     host.js = []
     host._js = host.js.append
     return host, files

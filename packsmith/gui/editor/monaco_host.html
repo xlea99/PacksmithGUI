@@ -108,7 +108,7 @@
 
     function reportDirty(key) {
         const entry = models[key];
-        if (!entry) return;
+        if (!entry || entry.quiet) return;
         const dirty = entry.model.getAlternativeVersionId() !== entry.baseline;
         if (dirty !== entry.wasDirty) {
             entry.wasDirty = dirty;
@@ -144,14 +144,117 @@
         // Coming back from a diff: put the normal editor in front again.
         document.getElementById('diff').style.display = 'none';
         document.getElementById('editor').style.display = 'block';
-        if (current && models[current]) models[current].viewState = editor.saveViewState();
+        if (current && models[current]) {
+            models[current].viewState = editor.saveViewState();
+            models[current].atBottom = atBottom();
+        }
         current = key;
         const entry = models[key];
         editor.setModel(entry.model);
         editor.updateOptions({ readOnly: entry.readOnly });
         if (entry.viewState) editor.restoreViewState(entry.viewState);
+        // A followed log that grew while its tab was in the background: if you left it at
+        // the bottom, you come back to the bottom, like a terminal.
+        if (entry.following && entry.atBottom !== false) editor.revealLine(entry.model.getLineCount());
         editor.focus();
         return true;
+    }
+
+    // --- changes made on disk, outside Packsmith (design 6.3) ---------------------------
+    //
+    // Text that arrives from the disk is not an edit. `quiet` keeps the change listener from
+    // reporting it as one — a reload that briefly reads as dirty would claim the file for the
+    // user (§6.2's "editing is the gesture that tracks it") without them having touched it.
+
+    function atBottom() {
+        if (!editor || !editor.getModel()) return true;
+        const ranges = editor.getVisibleRanges();
+        if (!ranges.length) return true;
+        return ranges[ranges.length - 1].endLineNumber >= editor.getModel().getLineCount() - 1;
+    }
+
+    // Replace a buffer with what is on disk now, keeping where you were in it.
+    //
+    // Refused for a buffer holding unsaved edits unless `force`: the host asks first and
+    // only forces when the user chose Reload. Refusals go back over the bridge rather than
+    // through a return value because Python's dirty state can lag a keystroke behind, and
+    // this side is the one that actually knows.
+    //
+    // Pushed as an undoable edit on purpose: Ctrl+Z after a reload brings back what the
+    // buffer held before, which is how an edit the game reverted on close is recovered.
+    function reloadModel(key, text, force) {
+        const entry = models[key];
+        if (!entry) return false;
+        if (!force && isDirty(key)) {
+            bridgeCall('reloadRefused', key);
+            return false;
+        }
+        const isCurrent = current === key;
+        const state = isCurrent ? editor.saveViewState() : entry.viewState;
+        const model = entry.model;
+        entry.quiet = true;
+        try {
+            const wantsCrlf = text.indexOf('\r\n') >= 0;
+            if (wantsCrlf !== (model.getEOL() === '\r\n')) {
+                model.pushEOL(wantsCrlf ? monaco.editor.EndOfLineSequence.CRLF
+                                        : monaco.editor.EndOfLineSequence.LF);
+            }
+            model.pushEditOperations([], [{ range: model.getFullModelRange(), text: text }],
+                                     function () { return null; });
+        } finally {
+            entry.quiet = false;
+        }
+        entry.baseline = model.getAlternativeVersionId();
+        if (isCurrent && state) editor.restoreViewState(state);
+        else entry.viewState = state;
+        if (entry.following && (isCurrent ? true : entry.atBottom !== false)) {
+            if (isCurrent) editor.revealLine(model.getLineCount());
+        }
+        reportDirty(key);
+        return true;
+    }
+
+    // Add what a log grew by. Not undoable (a log open for an afternoon would otherwise
+    // carry its whole history twice), and trimmed from the top past `maxChars` so a buffer
+    // left following all day stays the size of what anyone reads.
+    function appendModel(key, text, maxChars) {
+        const entry = models[key];
+        if (!entry || !text) return false;
+        const model = entry.model;
+        const isCurrent = current === key;
+        const follow = isCurrent ? atBottom() : entry.atBottom !== false;
+        entry.quiet = true;
+        try {
+            const last = model.getLineCount();
+            const col = model.getLineMaxColumn(last);
+            model.applyEdits([{ range: new monaco.Range(last, col, last, col), text: text }]);
+            if (maxChars && model.getValueLength() > maxChars) {
+                const cut = model.getPositionAt(model.getValueLength() - Math.floor(maxChars / 2));
+                model.applyEdits([{ range: new monaco.Range(1, 1, cut.lineNumber, 1), text: '' }]);
+            }
+        } finally {
+            entry.quiet = false;
+        }
+        entry.baseline = model.getAlternativeVersionId();
+        if (isCurrent && follow) editor.revealLine(model.getLineCount());
+        if (!isCurrent) entry.atBottom = follow;
+        return true;
+    }
+
+    function setFollowing(key, flag) {
+        const entry = models[key];
+        if (!entry) return false;
+        entry.following = !!flag;
+        entry.atBottom = true;
+        if (current === key && flag) editor.revealLine(entry.model.getLineCount());
+        return true;
+    }
+
+    // The buffer, handed back for a disk-vs-buffer comparison.
+    function sendForCompare(key) {
+        const entry = models[key];
+        if (entry) bridgeCall('compareValue', key, entry.model.getValue());
+        return !!entry;
     }
 
     function closeModel(key) {

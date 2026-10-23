@@ -18,7 +18,7 @@ hold hundreds of jars.
 import os
 from pathlib import Path
 
-from PySide6.QtCore import Qt, Signal, QUrl
+from PySide6.QtCore import Qt, QTimer, Signal, QUrl
 from PySide6.QtGui import QColor, QDesktopServices, QIcon, QPixmap, QPainter
 from PySide6.QtWidgets import (
     QApplication, QTreeWidget, QTreeWidgetItem, QWidget, QHBoxLayout, QLabel, QMenu,
@@ -41,6 +41,8 @@ from packsmith.gui.shell.dropdown import DropDown
 # of paths, and building a tree item for each would hang the panel for seconds to show a
 # list nobody can read. The count line says what was left out; refining is the answer.
 _MAX_RESULTS = 300
+# How often the panel looks for files added or removed under the folders it shows.
+DISK_POLL_MS = 1500
 
 _DOT_CACHE = {}
 
@@ -259,6 +261,11 @@ class FileBrowser(Panel):
         # while a real tree is showing.
         if not self._searching:
             self._expanded = self._expanded_paths()
+        # Where you were, so a rebuild — which now also happens when the game adds or
+        # removes a file under an open folder — does not throw you back to the top.
+        scroll = self._tree.verticalScrollBar().value()
+        current = self._tree.currentItem()
+        selected = current.data(0, _ROLE_PATH) if current is not None else None
         self._searching = bool(needle)
         self._tree.clear()
         if needle:
@@ -270,6 +277,49 @@ class FileBrowser(Panel):
         else:
             self._populate(None, self._files.root, "")
         self._restore_expanded(self._expanded)
+        if selected:
+            item = self._item_at(selected)
+            if item is not None:
+                self._tree.setCurrentItem(item)
+        self._tree.verticalScrollBar().setValue(scroll)
+
+    def _item_at(self, rel):
+        """The row for a path among the rows already built, or None. Unlike `select` this
+        expands nothing — it is for putting things back, not for going somewhere."""
+        stack = [self._tree.invisibleRootItem()]
+        while stack:
+            item = stack.pop()
+            for i in range(item.childCount()):
+                child = item.child(i)
+                if child.data(0, _ROLE_PATH) == rel:
+                    return child
+                stack.append(child)
+        return None
+
+    def displayed_dirs(self) -> list:
+        """The folders whose listing is on screen: the root (Basic), every open folder, and
+        Smart Mode's category roots. Nothing while searching — a result list is a snapshot
+        of a query, not a view of folders."""
+        if self._searching:
+            return []
+        dirs = {path for path in self._expanded_paths() if path}
+        if not self._smart:
+            dirs.add("")
+        return sorted(dirs)
+
+    def disk_signature(self) -> tuple:
+        """What those folders look like on disk, cheaply: each one's mtime, which moves when
+        an entry is added, removed or renamed — exactly what changes a listing — and not
+        when a file inside is merely written, so a game writing logs does not rebuild the
+        tree every second."""
+        root = Path(self._files.root)
+        signature = []
+        for rel in self.displayed_dirs():
+            try:
+                signature.append((rel, (root / rel).stat().st_mtime_ns))
+            except OSError:
+                signature.append((rel, None))
+        return tuple(signature)
 
     def _populate_smart(self):
         """§6.2 Smart Mode: files grouped by purpose rather than by where they sit.
@@ -858,6 +908,29 @@ class FilesPanel(Panel):
         if self.folders is not None:
             self.folders.roots_changed.connect(self.basic.reload_roots)
             self.folders.root_activated.connect(self.show_root)
+
+        # The tree follows the disk while you look at it (design 6.2): a file the game
+        # creates under an open folder appears without a click. Polled rather than watched
+        # — a handful of folder stats every second and a half, only while the panel is on
+        # screen, is cheaper and more certain than a native watch per open folder.
+        self._signatures = {}
+        self._disk_timer = QTimer(self)
+        self._disk_timer.setInterval(DISK_POLL_MS)
+        self._disk_timer.timeout.connect(self.check_disk)
+        self._disk_timer.start()
+
+    def check_disk(self):
+        """Rebuild whichever visible browser's folders changed on disk since last look."""
+        if not self.isVisible():
+            return
+        for browser in (self.basic, self.smart):
+            if not browser.isVisible():
+                continue
+            signature = browser.disk_signature()
+            previous = self._signatures.get(browser)
+            self._signatures[browser] = signature
+            if previous is not None and previous != signature:
+                browser.refresh()
 
     def _child(self, key):
         return {"basic": self.basic, "smart": self.smart, "folders": self.folders}[key]

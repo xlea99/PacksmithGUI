@@ -11,6 +11,13 @@ per-model undo history, so sharing costs nothing in responsiveness.
 package sources answer to provenance. The host doesn't know either rule — it asks the
 document's source and renders the answer.
 
+**The disk moves; the buffer keeps up** (see :mod:`packsmith.gui.editor.watch`). An open
+instance file is watched. A buffer with no unsaved edits takes the disk's version in place,
+keeping its scroll and cursor; one WITH unsaved edits is never overwritten — its tab says
+the file changed and offers Reload / Compare / Keep mine, and Ctrl+S refuses until one is
+chosen, because saving there would put a stale copy over whatever wrote the file. Logs are
+followed rather than reloaded (:mod:`packsmith.gui.editor.follow`).
+
 **Locked, not warned.** A document its owner won't share opens read-only. The instant the
 user types, Monaco's ``onDidAttemptReadOnlyEdit`` fires and we ask whether they mean to
 take it. That keeps cause and effect in the same second; a warning at edit time whose
@@ -25,9 +32,15 @@ from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushBu
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWebChannel import QWebChannel
 
+from packsmith.gui.editor.follow import TAIL_BYTES, LogFollower, is_followed
+from packsmith.gui.editor.watch import FileWatch
 from packsmith.gui.shell import style
 
 _HTML_PATH = Path(__file__).with_name("monaco_host.html")
+
+# How much of a followed log a buffer keeps before trimming from the top. Twice what is
+# loaded on open, so a fresh tab never trims and an all-day one stays bounded.
+LOG_MAX_CHARS = 2 * TAIL_BYTES
 
 # Monaco has no Starlark grammar, but Starlark *is* a Python dialect — the highlighting is
 # correct for everything an action can legally contain.
@@ -58,6 +71,8 @@ class _Bridge(QObject):
     save = Signal(str, str)      # key, content
     dirty = Signal(str, bool)    # key, is_dirty
     attempted = Signal(str)      # key — typed into a locked buffer
+    refused = Signal(str)        # key — a reload found unsaved edits and backed off
+    compared = Signal(str, str)  # key, buffer text
 
     @Slot()
     def editorReady(self):
@@ -75,6 +90,14 @@ class _Bridge(QObject):
     def readOnlyEditAttempted(self, key):
         self.attempted.emit(key)
 
+    @Slot(str)
+    def reloadRefused(self, key):
+        self.refused.emit(key)
+
+    @Slot(str, str)
+    def compareValue(self, key, content):
+        self.compared.emit(key, content)
+
 
 class EditorHost(QObject):
     """Owns the one web view and brokers models for every editor tab."""
@@ -84,6 +107,11 @@ class EditorHost(QObject):
     save_failed = Signal(str, str)      # key, reason
     unlocked = Signal(str)              # key
     edit_blocked = Signal(str, str)     # key, lock reason
+    # The disk, moving under an open document.
+    disk_reloaded = Signal(str)         # key — a clean buffer took the disk's version
+    disk_conflict = Signal(str, bool)   # key, deleted — changed (or gone) under unsaved edits
+    disk_resolved = Signal(str)         # key — the conflict was settled one way or the other
+    compare_ready = Signal(str, str, str)   # key, disk text, buffer text
 
     def __init__(self, sources: dict, container: QWidget, parent=None):
         super().__init__(parent)
@@ -99,6 +127,16 @@ class EditorHost(QObject):
         self._pending = []          # calls queued until Monaco finishes loading
         self._locked = set()
         self._opened = set()        # keys Monaco holds a model for, so rebind can drop them
+        self._dirty = set()         # keys with unsaved edits, as Monaco last reported
+        # What each watched document's file held when last seen — the line between "the
+        # disk changed" and "the disk was touched", and what a save is checked against.
+        self._known = {}
+        self._conflicts = {}        # key -> the disk's text, while unsaved edits await a choice
+        self._deleted = set()       # keys whose file disappeared while open
+        self._followers = {}        # key -> LogFollower, for logs
+
+        self._watch = FileWatch(self)
+        self._watch.changed.connect(self._on_disk_changed)
 
         # Focus is handed to the view a turn AFTER a tab activates — see `focus_editor`.
         # Parented to self so it dies with the host rather than firing into a deleted C++
@@ -113,6 +151,8 @@ class EditorHost(QObject):
         self._bridge.save.connect(self._on_save)
         self._bridge.dirty.connect(self._on_dirty)
         self._bridge.attempted.connect(self._on_edit_attempted)
+        self._bridge.refused.connect(self._on_reload_refused)
+        self._bridge.compared.connect(self._on_compare_value)
 
         self._channel = QWebChannel()
         self._channel.registerObject("bridge", self._bridge)
@@ -198,14 +238,31 @@ class EditorHost(QObject):
     def open_document(self, source_name: str, path: str, *, read_only: bool = False) -> str:
         key = self.key_for(source_name, path)
         source = self._sources[source_name]
-        content = source.read(path) or ""
-        read_only = bool(read_only or source.read_only_reason(path))
+        disk = source.disk_path(path)
+        if disk is not None and is_followed(path):
+            # A log: read from its end, followed as it grows, never edited.
+            follower = LogFollower(disk)
+            content = follower.open()
+            self._followers[key] = follower
+            read_only = True
+        else:
+            content = source.read(path) or ""
+            read_only = bool(read_only or source.read_only_reason(path))
         self._opened.add(key)
         if read_only:
             self._locked.add(key)
         self._js(f"openModel({self._quote(key)}, {self._quote(content)}, "
                  f"{self._quote(language_for(path))}, {str(read_only).lower()})")
+        if key in self._followers:
+            self._js(f"setFollowing({self._quote(key)}, true)")
+        elif disk is not None:
+            self._known[key] = content
+        if disk is not None:
+            self._watch.add(key, disk)
         return key
+
+    def is_following(self, key: str) -> bool:
+        return key in self._followers
 
     def show_document(self, key: str):
         self._js(f"showModel({self._quote(key)})")
@@ -213,7 +270,16 @@ class EditorHost(QObject):
     def close_document(self, key: str):
         self._locked.discard(key)
         self._opened.discard(key)
+        self._forget_disk(key)
         self._js(f"closeModel({self._quote(key)})")
+
+    def _forget_disk(self, key):
+        self._watch.remove(key)
+        self._known.pop(key, None)
+        self._conflicts.pop(key, None)
+        self._deleted.discard(key)
+        self._followers.pop(key, None)
+        self._dirty.discard(key)
 
     def rebind(self, sources: dict):
         """Point the host at a different profile's documents, keeping the web view alive.
@@ -254,6 +320,8 @@ class EditorHost(QObject):
         """
         changed = []
         for key in sorted(self._opened):
+            if key in self._followers:
+                continue                    # a log is read-only by nature, not by ownership
             try:
                 source, path = self._source_of(key)
             except (KeyError, ValueError):
@@ -268,6 +336,106 @@ class EditorHost(QObject):
             self._js(f"setReadOnly({self._quote(key)}, {str(locked_now).lower()})")
             changed.append(key)
         return changed
+
+    # --- the disk, changing under open documents ------------------------------------
+
+    def check_disk(self):
+        """Look at every watched file now rather than at the next tick."""
+        self._watch.scan()
+
+    def has_disk_conflict(self, key: str) -> bool:
+        return key in self._conflicts
+
+    def is_deleted_on_disk(self, key: str) -> bool:
+        return key in self._deleted
+
+    def _on_disk_changed(self, key):
+        if key not in self._opened:
+            return
+        follower = self._followers.get(key)
+        if follower is not None:
+            kind, text = follower.poll()
+            if kind == "append":
+                self._js(f"appendModel({self._quote(key)}, {self._quote(text)}, "
+                         f"{LOG_MAX_CHARS})")
+            elif kind == "reset":
+                self._js(f"reloadModel({self._quote(key)}, {self._quote(text)}, true)")
+            return
+        source, path = self._source_of(key)
+        try:
+            text = source.read(path)
+        except (OSError, ValueError):
+            return
+        if isinstance(text, bytes):
+            return          # no longer text; leave the buffer alone rather than show garbage
+        if text == self._known.get(key) and key not in self._deleted:
+            return          # touched, not changed
+        self._known[key] = text
+        if text is None:
+            # Gone. Nothing to reload; the buffer is now the only copy, and saving it puts
+            # the file back. Said, because a config that vanished is worth knowing about.
+            self._deleted.add(key)
+            self.disk_conflict.emit(key, True)
+            return
+        was_deleted = key in self._deleted
+        self._deleted.discard(key)
+        if key in self._dirty:
+            self._conflicts[key] = text
+            self.disk_conflict.emit(key, False)
+            return
+        self._conflicts.pop(key, None)
+        self._js(f"reloadModel({self._quote(key)}, {self._quote(text)}, false)")
+        if was_deleted:
+            self.disk_resolved.emit(key)
+        self.disk_reloaded.emit(key)
+
+    def _on_reload_refused(self, key):
+        """The buffer had unsaved edits after all — Python's view of dirtiness can trail a
+        keystroke. Same outcome as if it had known: a conflict, not an overwrite."""
+        if key in self._opened and self._known.get(key) is not None:
+            self._conflicts[key] = self._known[key]
+            self.disk_conflict.emit(key, False)
+
+    def reload_from_disk(self, key: str):
+        """Replace the buffer with the disk's version, unsaved edits and all. Ctrl+Z in the
+        buffer brings them back."""
+        text = self._conflicts.pop(key, self._known.get(key))
+        if text is None:
+            return
+        self._known[key] = text
+        self._js(f"reloadModel({self._quote(key)}, {self._quote(text)}, true)")
+        self.disk_resolved.emit(key)
+
+    def keep_mine(self, key: str):
+        """Keep the buffer; the next save overwrites the disk's version on purpose."""
+        if key in self._conflicts:
+            self._known[key] = self._conflicts.pop(key)
+        self._deleted.discard(key)
+        self.disk_resolved.emit(key)
+
+    def request_compare(self, key: str):
+        """Ask for the buffer, answered through `compare_ready` with the disk's text."""
+        self._js(f"sendForCompare({self._quote(key)})")
+
+    def _on_compare_value(self, key, buffer_text):
+        disk = self._conflicts.get(key, self._known.get(key))
+        self.compare_ready.emit(key, disk or "", buffer_text)
+
+    def _disk_moved_under(self, key, source, path, content) -> bool:
+        """Has the file changed since we last saw it, in a way the watch has not reported
+        yet? Checked at save time so a save racing the poll still cannot overwrite blind."""
+        if self._known.get(key) is None:
+            return False
+        try:
+            now = source.read(path)
+        except (OSError, ValueError):
+            return False
+        if now is None or isinstance(now, bytes) or now == self._known[key] or now == content:
+            return False
+        self._known[key] = now
+        self._conflicts[key] = now
+        self.disk_conflict.emit(key, False)
+        return True
 
     # --- diffs ---------------------------------------------------------------
 
@@ -355,11 +523,16 @@ class EditorHost(QObject):
 
     def _on_dirty(self, key, is_dirty):
         if is_dirty:
+            self._dirty.add(key)
             source, path = self._source_of(key)
             source.on_first_edit(path)
+        else:
+            self._dirty.discard(key)
         self.dirty_changed.emit(key, is_dirty)
 
     def _on_save(self, key, content):
+        if key in self._followers:
+            return              # a log has nothing to save; Ctrl+S in one is a stray reflex
         if key in self._locked:
             # §6.3: Ctrl+S is a no-op when locked — but a *silent* no-op reads as a bug,
             # so say why, the same way a blocked keystroke does.
@@ -367,11 +540,27 @@ class EditorHost(QObject):
             self.edit_blocked.emit(key, source.read_only_reason(path) or "locked")
             return
         source, path = self._source_of(key)
+        if key in self._conflicts or self._disk_moved_under(key, source, path, content):
+            # §6.1, never silent overwrites. The tab is already showing the choice.
+            self.save_failed.emit(
+                key, "The file changed on disk after you started editing, so saving would "
+                     "put your copy over it unseen. Choose Reload, Compare or Keep mine in "
+                     "the bar above the editor first.")
+            return
         try:
             source.write(path, content)
         except Exception as e:                       # escaped root, permissions, disk full…
             self.save_failed.emit(key, f"{type(e).__name__}: {e}")
             return
+        if key in self._known:
+            # Ours, so not news. Re-read rather than assumed: a source may translate line
+            # endings on the way out, and the comparison has to be against what is on disk.
+            try:
+                self._known[key] = source.read(path)
+            except (OSError, ValueError):
+                self._known[key] = content
+            self._deleted.discard(key)
+            self._watch.acknowledge(key)
         self._js(f"markSaved({self._quote(key)})")
         self.file_saved.emit(key)
 
@@ -381,6 +570,10 @@ class EditorTab(QWidget):
     lock banner and status strip."""
 
     unlock_requested = Signal(str)   # key
+    # The disk bar's three answers (see EditorHost: the disk, changing under documents).
+    reload_requested = Signal(str)   # key
+    compare_requested = Signal(str)  # key
+    keep_requested = Signal(str)     # key
 
     def __init__(self, host: EditorHost, source_name: str, path: str, *, parent=None):
         super().__init__(parent)
@@ -419,6 +612,34 @@ class EditorTab(QWidget):
             f"background: {style.BG_PANEL}; border-bottom: 1px solid {style.BORDER};")
         layout.addWidget(self._banner)
 
+        # The disk moved under unsaved edits (or the file vanished). Its own bar rather than
+        # the lock banner's: the two are independent, and a locked file can change on disk
+        # too. Shown only while there is a choice to make.
+        self._disk_bar = QWidget()
+        disk_row = QHBoxLayout(self._disk_bar)
+        disk_row.setContentsMargins(8, 2, 8, 2)
+        self._disk_text = QLabel()
+        self._disk_text.setStyleSheet(f"color: {style.WARNING}; font-size: 11px;")
+        disk_row.addWidget(self._disk_text)
+        disk_row.addStretch()
+        self._disk_buttons = {}
+        for label, signal in (("Reload", self.reload_requested),
+                              ("Compare", self.compare_requested),
+                              ("Keep mine", self.keep_requested)):
+            button = QPushButton(label)
+            button.setFixedHeight(18)
+            button.setCursor(Qt.PointingHandCursor)
+            button.setStyleSheet(
+                f"QPushButton {{ background: {style.BG_CHROME}; color: {style.TEXT};"
+                f" border: 1px solid {style.WARNING}; font-size: 10px; padding: 0 8px; }}")
+            button.clicked.connect(lambda _=False, s=signal: s.emit(self.key))
+            disk_row.addWidget(button)
+            self._disk_buttons[label] = button
+        self._disk_bar.setStyleSheet(
+            f"background: {style.BG_PANEL}; border-bottom: 1px solid {style.BORDER};")
+        self._disk_bar.hide()
+        layout.addWidget(self._disk_bar)
+
         self.slot = QWidget()
         self.slot.setAutoFillBackground(True)
         self.slot.setStyleSheet(f"background: {style.BG_DEEP};")
@@ -433,7 +654,9 @@ class EditorTab(QWidget):
         layout.addWidget(self._status)
 
         host.open_document(source_name, path)
+        self._following = host.is_following(self.key)
         self.sync_lock()
+        self.set_dirty(False)
 
     # --- state ---------------------------------------------------------------
 
@@ -455,8 +678,30 @@ class EditorTab(QWidget):
         self._unlock_btn.setVisible(self._host.can_unlock(self.key))
         self._banner.show()
 
+    def show_disk_change(self, deleted: bool):
+        """Changed on disk under unsaved edits — or gone — and a choice is owed."""
+        if deleted:
+            self._disk_text.setText("Deleted on disk — this tab is now the only copy; "
+                                    "saving puts the file back.")
+        else:
+            self._disk_text.setText("Changed on disk while you were editing — your edits "
+                                    "are not saved over it until you choose.")
+        self._disk_buttons["Reload"].setVisible(not deleted)
+        self._disk_buttons["Compare"].setVisible(not deleted)
+        self._disk_buttons["Keep mine"].setText("Dismiss" if deleted else "Keep mine")
+        self._disk_bar.show()
+
+    def clear_disk_change(self):
+        self._disk_bar.hide()
+
+    @property
+    def disk_change_shown(self) -> bool:
+        return not self._disk_bar.isHidden()
+
     def set_dirty(self, is_dirty: bool):
         mark = " •  unsaved" if is_dirty else ""
+        if getattr(self, "_following", False):
+            mark = " •  following — live, read-only"
         self._status.setText(f"{self.path}{mark}")
         self._status.setStyleSheet(
             f"color: {'#cc8844' if is_dirty else style.TEXT_FAINT}; font-size: 11px;"
